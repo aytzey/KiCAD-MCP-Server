@@ -591,20 +591,26 @@ class ConnectionManager:
                     }
                     netlist["components"].append(component_info)
 
-            # Gather all nets from labels
+            # Gather all nets from both local and global labels.
+            # Power symbols resolve through global labels in many KiCad schematics,
+            # so looking at local labels only drops real board nets.
+            net_names = set()
             if hasattr(schematic, "label"):
-                net_names = set()
                 for label in schematic.label:
                     if hasattr(label, "value"):
                         net_names.add(label.value)
+            if hasattr(schematic, "global_label"):
+                for label in schematic.global_label:
+                    if hasattr(label, "value"):
+                        net_names.add(label.value)
 
-                # For each net, get connections
-                for net_name in net_names:
-                    connections = ConnectionManager.get_net_connections(
-                        schematic, net_name, schematic_path
-                    )
-                    if connections:
-                        netlist["nets"].append({"name": net_name, "connections": connections})
+            # For each net, get connections
+            for net_name in sorted(net_names):
+                connections = ConnectionManager.get_net_connections(
+                    schematic, net_name, schematic_path
+                )
+                if connections:
+                    netlist["nets"].append({"name": net_name, "connections": connections})
 
             logger.info(
                 f"Generated netlist with {len(netlist['nets'])} nets and {len(netlist['components'])} components"

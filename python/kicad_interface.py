@@ -2665,6 +2665,10 @@ class KiCADInterface:
                 return {"success": False, "message": "Failed to load schematic"}
 
             netlist = ConnectionManager.generate_netlist(schematic, schematic_path=schematic_path)
+            if not netlist.get("nets"):
+                fallback = self._handle_list_schematic_nets({"schematicPath": schematic_path})
+                if fallback.get("success"):
+                    netlist["nets"] = fallback.get("nets", [])
             return {"success": True, "netlist": netlist}
         except Exception as e:
             logger.error(f"Error generating netlist: {str(e)}")
@@ -2720,6 +2724,10 @@ class KiCADInterface:
                 return {"success": False, "message": "Failed to load schematic"}
 
             netlist = ConnectionManager.generate_netlist(schematic, schematic_path=schematic_path)
+            if not netlist.get("nets"):
+                fallback = self._handle_list_schematic_nets({"schematicPath": schematic_path})
+                if fallback.get("success"):
+                    netlist["nets"] = fallback.get("nets", [])
 
             # Build (reference, pad_number) -> net_name map
             pad_net_map = {}  # {(ref, pin_str): net_name}
