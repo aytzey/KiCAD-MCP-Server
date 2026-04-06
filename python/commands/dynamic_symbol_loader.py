@@ -22,6 +22,30 @@ def _snap_schematic_coordinate(value: float, grid: float = 1.27) -> float:
     return round(round(float(value) / grid) * grid, 4)
 
 
+def _project_instance_name(schematic_path: Path, project_path: Optional[Path] = None) -> str:
+    """Infer the KiCad project name used in symbol instance metadata."""
+    schematic_path = Path(schematic_path)
+
+    if project_path:
+        project_path = Path(project_path)
+        if project_path.suffix == ".kicad_pro":
+            return project_path.stem
+        if project_path.is_dir():
+            project_files = sorted(project_path.glob("*.kicad_pro"))
+            if len(project_files) == 1:
+                return project_files[0].stem
+
+    stem = schematic_path.stem
+    return stem or "project"
+
+
+def _symbol_board_flags(library_name: str, reference: str) -> Tuple[str, str]:
+    """Return KiCad in_bom/on_board flags for the placed symbol."""
+    if library_name == "power" or reference.startswith("#"):
+        return "no", "no"
+    return "yes", "yes"
+
+
 class DynamicSymbolLoader:
     """
     Dynamically loads symbols from KiCad library files and injects them into schematics.
@@ -438,9 +462,11 @@ class DynamicSymbolLoader:
 
         full_lib_id = f"{library_name}:{symbol_name}"
         new_uuid = str(uuid.uuid4())
+        project_name = _project_instance_name(schematic_path, self.project_path)
+        in_bom, on_board = _symbol_board_flags(library_name, reference)
 
         instance_block = f"""  (symbol (lib_id "{full_lib_id}") (at {x} {y} 0) (unit 1)
-    (in_bom yes) (on_board yes) (dnp no)
+    (in_bom {in_bom}) (on_board {on_board}) (dnp no)
     (uuid "{new_uuid}")
     (property "Reference" "{reference}" (at {x} {y - 2.54} 0)
       (effects (font (size 1.27 1.27)))
@@ -455,7 +481,7 @@ class DynamicSymbolLoader:
       (effects (font (size 1.27 1.27)) (hide yes))
     )
     (instances
-      (project "project"
+      (project "{project_name}"
         (path "/"
           (reference "{reference}")
           (unit 1)
