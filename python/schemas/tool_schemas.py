@@ -1063,7 +1063,11 @@ AUTOROUTE_TOOLS = [
                 "profiles": {"type": "array", "items": {"type": "string"}},
                 "interfaces": {"type": "array", "items": {"type": "string"}},
                 "criticalClasses": {"type": "array", "items": {"type": "string"}},
-                "excludeFromFreeRouting": {"type": "array", "items": {"type": "string"}},
+                "excludeFromFreeRouting": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Net names to keep out of the bulk router. Pass [] to exclude nothing explicitly.",
+                },
                 "freeroutingJar": {"type": "string", "description": "Path to freerouting.jar"},
                 "maxPasses": {"type": "integer", "minimum": 1},
                 "timeout": {"type": "integer", "minimum": 1},
@@ -1087,7 +1091,11 @@ AUTOROUTE_TOOLS = [
                 "profiles": {"type": "array", "items": {"type": "string"}},
                 "interfaces": {"type": "array", "items": {"type": "string"}},
                 "criticalClasses": {"type": "array", "items": {"type": "string"}},
-                "excludeFromFreeRouting": {"type": "array", "items": {"type": "string"}},
+                "excludeFromFreeRouting": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Net names to keep out of the bulk router. Pass [] to exclude nothing explicitly.",
+                },
                 "freeroutingJar": {"type": "string"},
                 "orthorouteExecutable": {"type": "string"},
             },
@@ -1133,7 +1141,11 @@ AUTOROUTE_TOOLS = [
                 "profiles": {"type": "array", "items": {"type": "string"}},
                 "interfaces": {"type": "array", "items": {"type": "string"}},
                 "criticalClasses": {"type": "array", "items": {"type": "string"}},
-                "excludeFromFreeRouting": {"type": "array", "items": {"type": "string"}},
+                "excludeFromFreeRouting": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Net names to keep out of the bulk router. Pass [] to exclude nothing explicitly.",
+                },
                 "outputPath": {"type": "string"},
             },
         },
@@ -1727,7 +1739,7 @@ SCHEMATIC_TOOLS = [
     {
         "name": "sync_schematic_to_board",
         "title": "Sync Schematic to PCB (F8)",
-        "description": "Reads net connections from the schematic and assigns them to matching component pads in the PCB board file. Equivalent to KiCAD Pcbnew F8 'Update PCB from Schematic'. Must be called after placing components and before routing traces, so that pad-to-net assignments are correct.",
+        "description": "Reads net connections from the schematic and assigns them to matching component pads in the PCB board file. Equivalent to KiCAD Pcbnew F8 'Update PCB from Schematic'. On a blank PCB it can auto-place missing footprints from the schematic before assigning nets, so fresh projects do not require a separate manual placement step just to get a routable board.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1738,6 +1750,10 @@ SCHEMATIC_TOOLS = [
                 "boardPath": {
                     "type": "string",
                     "description": "Path to .kicad_pcb file. If omitted, uses currently loaded board.",
+                },
+                "autoPlaceMissingFootprints": {
+                    "type": "boolean",
+                    "description": "If true, auto-place schematic footprints missing from the PCB using a deterministic grid. Defaults to true only when the board is blank.",
                 },
             },
         },

@@ -157,6 +157,31 @@ def test_generate_constraints_clamps_power_rule_to_existing_board_width(tmp_path
     assert power_rule["min"] == 0.5
 
 
+def test_generate_constraints_respects_explicit_empty_exclusion_list(tmp_path):
+    commands = AutorouteCFHACommands()
+    result = commands.generate_routing_constraints(
+        {
+            "excludeFromFreeRouting": [],
+            "intentResult": {
+                "success": True,
+                "boardPath": str(tmp_path / "demo.kicad_pcb"),
+                "profiles": ["generic_2layer"],
+                "interfaces": [],
+                "analysisSummary": {"copperLayers": ["F.Cu", "B.Cu"]},
+                "byIntent": {"POWER_DC": ["VIN"], "GROUND": ["GND"]},
+                "intents": [
+                    {"net_name": "VIN", "intent": "POWER_DC", "track_length_mm": 2.0},
+                    {"net_name": "GND", "intent": "GROUND", "track_length_mm": 0.0},
+                ],
+                "netInventory": {},
+            },
+        }
+    )
+
+    assert result["success"] is True
+    assert result["constraints"]["excludeFromFreeRouting"] == []
+
+
 def test_autoroute_default_pipeline_returns_artifacts(monkeypatch, tmp_path):
     board = MagicMock()
     board.GetFileName.return_value = str(tmp_path / "demo.kicad_pcb")

@@ -730,14 +730,15 @@ class AutorouteCFHACommands:
         intents = intents_result["intents"]
         inventory = intents_result.get("netInventory", {})
         seed = int(params.get("seed", 42))
-        exclude_from_freerouting = list(
-            dict.fromkeys(
-                params.get("excludeFromFreeRouting")
-                or by_intent.get("GROUND", [])
+        if "excludeFromFreeRouting" in params and params.get("excludeFromFreeRouting") is not None:
+            exclude_candidates = params.get("excludeFromFreeRouting") or []
+        else:
+            exclude_candidates = (
+                by_intent.get("GROUND", [])
                 + by_intent.get("POWER_DC", [])
                 + by_intent.get("POWER_SWITCHING", [])
             )
-        )
+        exclude_from_freerouting = list(dict.fromkeys(exclude_candidates))
 
         power_target_width_mm = float(merged_defaults["power_min_width_mm"])
         observed_power_widths = [

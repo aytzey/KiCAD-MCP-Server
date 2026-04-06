@@ -12,7 +12,7 @@ import logging
 import os
 import sys
 import traceback
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from resources.resource_definitions import RESOURCE_DEFINITIONS, handle_resource_read
 
@@ -2674,6 +2674,127 @@ class KiCADInterface:
             logger.error(f"Error generating netlist: {str(e)}")
             return {"success": False, "message": str(e)}
 
+    def _should_auto_place_missing_footprints(
+        self, params: Dict[str, Any], existing_footprint_count: int
+    ) -> bool:
+        """Default to auto-placement only for blank boards unless explicitly overridden."""
+        if "autoPlaceMissingFootprints" in params and params.get("autoPlaceMissingFootprints") is not None:
+            return bool(params.get("autoPlaceMissingFootprints"))
+        return existing_footprint_count == 0
+
+    def _collect_schematic_footprint_components(self, schematic) -> List[Dict[str, str]]:
+        """Extract placeable schematic components with stable ordering."""
+        components: List[Dict[str, str]] = []
+        for symbol in getattr(schematic, "symbol", []):
+            properties = getattr(symbol, "property", None)
+            if not properties or not hasattr(properties, "Reference"):
+                continue
+
+            reference = properties.Reference.value
+            if not reference or reference.startswith("_TEMPLATE"):
+                continue
+
+            components.append(
+                {
+                    "reference": reference,
+                    "value": properties.Value.value if hasattr(properties, "Value") else "",
+                    "footprint": properties.Footprint.value if hasattr(properties, "Footprint") else "",
+                }
+            )
+
+        components.sort(key=lambda item: item["reference"])
+        return components
+
+    def _build_auto_place_plan(
+        self,
+        schematic_components: List[Dict[str, str]],
+        existing_refs: set,
+        params: Dict[str, Any],
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        """Build a deterministic grid placement plan for schematic components missing on the PCB."""
+        start_x = float(params.get("placementStartXmm", 25.0))
+        start_y = float(params.get("placementStartYmm", 25.0))
+        pitch_x = float(params.get("placementPitchXmm", 20.0))
+        pitch_y = float(params.get("placementPitchYmm", 15.0))
+        columns = max(1, int(params.get("placementColumns", 6)))
+
+        placements: List[Dict[str, Any]] = []
+        skipped: List[Dict[str, str]] = []
+
+        for component in schematic_components:
+            reference = component["reference"]
+            if reference in existing_refs:
+                continue
+
+            footprint = component.get("footprint", "")
+            if not footprint:
+                skipped.append(
+                    {
+                        "reference": reference,
+                        "reason": "missing Footprint property in schematic",
+                    }
+                )
+                continue
+
+            slot = len(placements)
+            column = slot % columns
+            row = slot // columns
+            placements.append(
+                {
+                    "reference": reference,
+                    "value": component.get("value", ""),
+                    "footprint": footprint,
+                    "position": {
+                        "x": round(start_x + column * pitch_x, 4),
+                        "y": round(start_y + row * pitch_y, 4),
+                        "unit": "mm",
+                    },
+                    "rotation": 0,
+                    "layer": "F.Cu",
+                }
+            )
+
+        return {"placements": placements, "skipped": skipped}
+
+    def _auto_place_missing_footprints(self, schematic, board_path: str, board, params: Dict[str, Any]):
+        """Place schematic footprints that are missing from the PCB so sync can assign nets."""
+        existing_refs = {fp.GetReference() for fp in board.GetFootprints()}
+        schematic_components = self._collect_schematic_footprint_components(schematic)
+        plan = self._build_auto_place_plan(schematic_components, existing_refs, params)
+
+        placed: List[Dict[str, Any]] = []
+        errors: List[Dict[str, str]] = []
+
+        for placement in plan["placements"]:
+            result = self._handle_place_component(
+                {
+                    "boardPath": board_path,
+                    "componentId": placement["footprint"],
+                    "footprint": placement["footprint"],
+                    "reference": placement["reference"],
+                    "value": placement["value"],
+                    "position": placement["position"],
+                    "rotation": placement["rotation"],
+                    "layer": placement["layer"],
+                }
+            )
+            if result.get("success"):
+                placed.append(placement)
+            else:
+                errors.append(
+                    {
+                        "reference": placement["reference"],
+                        "footprint": placement["footprint"],
+                        "message": result.get("errorDetails") or result.get("message", "Unknown error"),
+                    }
+                )
+
+        return {
+            "placed": placed,
+            "skipped": plan["skipped"],
+            "errors": errors,
+        }
+
     def _handle_sync_schematic_to_board(self, params):
         """Sync schematic netlist to PCB board (equivalent to KiCAD F8 'Update PCB from Schematic').
         Reads net connections from the schematic and assigns them to the matching pads in the PCB.
@@ -2700,6 +2821,9 @@ class KiCADInterface:
 
             if not board_path:
                 board_path = board.GetFileName()
+
+            self.board = board
+            self._update_command_handlers()
 
             # Determine schematic path if not provided
             if not schematic_path:
@@ -2728,6 +2852,16 @@ class KiCADInterface:
                 fallback = self._handle_list_schematic_nets({"schematicPath": schematic_path})
                 if fallback.get("success"):
                     netlist["nets"] = fallback.get("nets", [])
+
+            existing_footprint_count = sum(1 for _ in board.GetFootprints())
+            auto_place_enabled = self._should_auto_place_missing_footprints(
+                params, existing_footprint_count
+            )
+            auto_place_result = {"placed": [], "skipped": [], "errors": []}
+            if auto_place_enabled:
+                auto_place_result = self._auto_place_missing_footprints(
+                    schematic, board_path, board, params
+                )
 
             # Build (reference, pad_number) -> net_name map
             pad_net_map = {}  # {(ref, pin_str): net_name}
@@ -2773,21 +2907,28 @@ class KiCADInterface:
 
             board.Save(board_path)
 
-            # If board was loaded fresh, update internal reference
-            if params.get("boardPath"):
-                self.board = board
-                self._update_command_handlers()
-
             logger.info(
-                f"sync_schematic_to_board: {len(added_nets)} nets added, {assigned_pads} pads assigned"
+                "sync_schematic_to_board: %s nets added, %s pads assigned, %s footprints auto-placed",
+                len(added_nets),
+                assigned_pads,
+                len(auto_place_result["placed"]),
             )
             return {
                 "success": True,
-                "message": f"PCB nets synced from schematic: {len(added_nets)} nets added, {assigned_pads} pads assigned",
+                "message": (
+                    "PCB nets synced from schematic: "
+                    f"{len(added_nets)} nets added, "
+                    f"{assigned_pads} pads assigned, "
+                    f"{len(auto_place_result['placed'])} footprints auto-placed"
+                ),
                 "nets_added": added_nets,
                 "nets_total": len(net_names),
                 "pads_assigned": assigned_pads,
                 "unmatched_pads_sample": unmatched[:10],
+                "auto_place_triggered": auto_place_enabled,
+                "auto_placed_references": [item["reference"] for item in auto_place_result["placed"]],
+                "auto_place_skipped": auto_place_result["skipped"],
+                "auto_place_errors": auto_place_result["errors"],
             }
 
         except Exception as e:

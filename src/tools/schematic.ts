@@ -1135,12 +1135,26 @@ Note: operates on .kicad_sch files only. To modify a PCB footprint use edit_comp
   // Sync schematic to PCB board (equivalent to KiCAD F8 / "Update PCB from Schematic")
   server.tool(
     "sync_schematic_to_board",
-    "Import the schematic netlist into the PCB board — equivalent to pressing F8 in KiCAD (Tools → Update PCB from Schematic). MUST be called after the schematic is complete and before placing or routing components on the PCB. Without this step, the board has no footprints and no net assignments — place_component and route_pad_to_pad will produce an empty, unroutable board.",
+    "Import the schematic netlist into the PCB board — equivalent to pressing F8 in KiCAD (Tools → Update PCB from Schematic). On blank boards this can auto-place missing footprints from the schematic before assigning nets; on existing boards it syncs net assignments to the footprints already on the PCB.",
     {
-      schematicPath: z.string().describe("Absolute path to the .kicad_sch schematic file"),
-      boardPath: z.string().describe("Absolute path to the .kicad_pcb board file"),
+      schematicPath: z
+        .string()
+        .optional()
+        .describe("Absolute path to the .kicad_sch schematic file. If omitted, inferred from the board path when possible."),
+      boardPath: z
+        .string()
+        .optional()
+        .describe("Absolute path to the .kicad_pcb board file. If omitted, uses the currently loaded board."),
+      autoPlaceMissingFootprints: z
+        .boolean()
+        .optional()
+        .describe("If true, auto-place schematic footprints missing from the PCB using a deterministic grid. Defaults to true only when the board is blank."),
     },
-    async (args: { schematicPath: string; boardPath: string }) => {
+    async (args: {
+      schematicPath?: string;
+      boardPath?: string;
+      autoPlaceMissingFootprints?: boolean;
+    }) => {
       const result = await callKicadScript("sync_schematic_to_board", args);
       return {
         content: [{ type: "text", text: JSON.stringify(result, null, 2) }],

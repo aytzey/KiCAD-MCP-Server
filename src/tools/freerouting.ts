@@ -21,7 +21,7 @@ export function registerFreeroutingTools(server: McpServer, callKicadScript: Fun
     excludeFromFreeRouting: z
       .array(z.string())
       .optional()
-      .describe("Net names that bulk routing should leave untouched"),
+      .describe("Net names that bulk routing should leave untouched. Pass [] to exclude nothing explicitly."),
     profiles: z
       .array(z.string())
       .optional()
