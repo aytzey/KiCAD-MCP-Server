@@ -13,7 +13,6 @@ from commands.orthogonal_router import (
     inflate_rect,
     manhattan_path_length,
     normalize_rect,
-    pick_escape_point,
     plan_orthogonal_path,
 )
 
@@ -139,6 +138,47 @@ class RoutingCommands:
         except Exception:
             return None
 
+    def _get_pad_escape_point(
+        self,
+        pad,
+        footprint,
+        target_point: Tuple[float, float],
+        clearance_margin: float,
+    ) -> Tuple[float, float]:
+        """
+        Escape from a pad to the nearest outside edge of its footprint keepout.
+
+        This avoids routing through neighbouring pads on dense PTH headers where
+        a target-biased escape can otherwise run inside the footprint envelope.
+        """
+        pad_pos = pad.GetPosition()
+        pad_point = (pad_pos.x / 1000000, pad_pos.y / 1000000)
+        rect = self._get_footprint_pad_rect(footprint)
+        if rect is None:
+            return pad_point
+
+        min_x, min_y, max_x, max_y = rect
+        candidates = [
+            (min_x - clearance_margin, pad_point[1]),
+            (max_x + clearance_margin, pad_point[1]),
+            (pad_point[0], min_y - clearance_margin),
+            (pad_point[0], max_y + clearance_margin),
+        ]
+        distances = [
+            abs(pad_point[0] - min_x),
+            abs(max_x - pad_point[0]),
+            abs(pad_point[1] - min_y),
+            abs(max_y - pad_point[1]),
+        ]
+        best = min(
+            zip(distances, candidates),
+            key=lambda item: (
+                round(item[0], 6),
+                abs(item[1][0] - target_point[0]) + abs(item[1][1] - target_point[1]),
+            ),
+        )[1]
+        return (round(best[0], 6), round(best[1], 6))
+
     def _collect_routing_obstacles(
         self,
         layer: str,
@@ -164,7 +204,7 @@ class RoutingCommands:
             if rect is not None:
                 obstacles.append(inflate_rect(rect, keepout_margin))
 
-        for item in self.board.Tracks():
+        for item in self.board.GetTracks():
             try:
                 item_net = item.GetNetname()
             except Exception:
@@ -375,17 +415,17 @@ class RoutingCommands:
             fp_end = footprints[to_ref]
             start_layer = self.board.GetLayerName(fp_start.GetLayer())
             end_layer = self.board.GetLayerName(fp_end.GetLayer())
-            start_rect = self._get_footprint_pad_rect(fp_start)
-            end_rect = self._get_footprint_pad_rect(fp_end)
-            start_escape = (
-                pick_escape_point(start_point_mm, start_rect, keepout_margin, end_point_mm)
-                if start_rect
-                else start_point_mm
+            start_escape = self._get_pad_escape_point(
+                start_pad,
+                fp_start,
+                end_point_mm,
+                keepout_margin,
             )
-            end_escape = (
-                pick_escape_point(end_point_mm, end_rect, keepout_margin, start_point_mm)
-                if end_rect
-                else end_point_mm
+            end_escape = self._get_pad_escape_point(
+                end_pad,
+                fp_end,
+                start_point_mm,
+                keepout_margin,
             )
             copper_layers = {"F.Cu", "B.Cu"}
             needs_via = (
@@ -769,7 +809,7 @@ class RoutingCommands:
             # Delete by net name (bulk delete)
             if net_name:
                 tracks_to_remove = []
-                for track in list(self.board.Tracks()):
+                for track in list(self.board.GetTracks()):
                     if track.GetNetname() != net_name:
                         continue
 
@@ -801,7 +841,7 @@ class RoutingCommands:
             # Find track by UUID
             if trace_uuid:
                 track = None
-                for item in list(self.board.Tracks()):
+                for item in list(self.board.GetTracks()):
                     if item.m_Uuid.AsString() == trace_uuid:
                         track = item
                         break
@@ -836,7 +876,7 @@ class RoutingCommands:
                 # Find closest track
                 closest_track = None
                 min_distance = float("inf")
-                for track in list(self.board.Tracks()):
+                for track in list(self.board.GetTracks()):
                     dist = self._point_to_track_distance(point, track)
                     if dist < min_distance:
                         min_distance = dist
@@ -924,7 +964,7 @@ class RoutingCommands:
             vias = []
 
             # Process tracks
-            for track in list(self.board.Tracks()):
+            for track in list(self.board.GetTracks()):
                 try:
                     # Check if it's a via
                     is_via = track.Type() == pcbnew.PCB_VIA_T
@@ -1059,7 +1099,7 @@ class RoutingCommands:
             track = None
 
             if trace_uuid:
-                for item in list(self.board.Tracks()):
+                for item in list(self.board.GetTracks()):
                     if item.m_Uuid.AsString() == trace_uuid:
                         track = item
                         break
@@ -1072,7 +1112,7 @@ class RoutingCommands:
 
                 # Find closest track
                 min_distance = float("inf")
-                for item in list(self.board.Tracks()):
+                for item in list(self.board.GetTracks()):
                     dist = self._point_to_track_distance(point, item)
                     if dist < min_distance:
                         min_distance = dist
@@ -1241,7 +1281,7 @@ class RoutingCommands:
             traces_to_copy = []
             vias_to_copy = []
 
-            for track in list(self.board.Tracks()):
+            for track in list(self.board.GetTracks()):
                 is_via = track.Type() == pcbnew.PCB_VIA_T
 
                 if use_net_filter:
