@@ -123,8 +123,22 @@ export const toolCategories: ToolCategory[] = [
   },
   {
     name: "autoroute",
-    description: "Freerouting autorouter: automatic PCB routing via Specctra DSN/SES",
-    tools: ["autoroute", "export_dsn", "import_ses", "check_freerouting"],
+    description: "Constraint-first hybrid autorouting plus Freerouting DSN/SES backend tools",
+    tools: [
+      "autoroute",
+      "autoroute_cfha",
+      "analyze_board_routing_context",
+      "extract_routing_intents",
+      "generate_routing_constraints",
+      "generate_kicad_dru",
+      "route_critical_nets",
+      "run_freerouting",
+      "post_tune_routes",
+      "verify_routing_qor",
+      "export_dsn",
+      "import_ses",
+      "check_freerouting",
+    ],
   },
 ];
 
@@ -145,6 +159,7 @@ export const directToolNames = [
   "move_component",
   "add_net",
   "route_trace",
+  "autoroute_cfha",
   "get_board_info",
   "set_board_size",
 

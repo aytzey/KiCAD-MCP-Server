@@ -212,6 +212,7 @@ try:
     from commands.design_rules import DesignRuleCommands
     from commands.export import ExportCommands
     from commands.footprint import FootprintCreator
+    from commands.autoroute_cfha import AutorouteCFHACommands
     from commands.freerouting import FreeroutingCommands
     from commands.jlcpcb import JLCPCBClient, test_jlcpcb_connection
     from commands.jlcpcb_parts import JLCPCBPartsManager
@@ -271,6 +272,13 @@ class KiCADInterface:
         self.routing_commands = RoutingCommands(self.board)
         self.freerouting_commands = FreeroutingCommands(self.board)
         self.design_rule_commands = DesignRuleCommands(self.board)
+        self.autoroute_cfha_commands = AutorouteCFHACommands(
+            self.board,
+            self.routing_commands,
+            self.freerouting_commands,
+            self.design_rule_commands,
+            self.ipc_board_api,
+        )
         self.export_commands = ExportCommands(self.board)
         self.library_commands = LibraryCommands(self.footprint_library)
         self._current_project_path: Optional[Path] = None  # set when boardPath is known
@@ -336,6 +344,15 @@ class KiCADInterface:
             "add_copper_pour": self.routing_commands.add_copper_pour,
             "route_differential_pair": self.routing_commands.route_differential_pair,
             "refill_zones": self._handle_refill_zones,
+            # Hybrid autorouting commands
+            "analyze_board_routing_context": self._handle_analyze_board_routing_context,
+            "extract_routing_intents": self._handle_extract_routing_intents,
+            "generate_routing_constraints": self._handle_generate_routing_constraints,
+            "generate_kicad_dru": self._handle_generate_kicad_dru,
+            "route_critical_nets": self._handle_route_critical_nets,
+            "run_freerouting": self._handle_run_freerouting,
+            "post_tune_routes": self._handle_post_tune_routes,
+            "verify_routing_qor": self._handle_verify_routing_qor,
             # Design rule commands
             "set_design_rules": self.design_rule_commands.set_design_rules,
             "get_design_rules": self.design_rule_commands.get_design_rules,
@@ -426,7 +443,8 @@ class KiCADInterface:
             "list_symbols_in_library": self._handle_list_symbols_in_library,
             "register_symbol_library": self._handle_register_symbol_library,
             # Freerouting autoroute commands
-            "autoroute": self.freerouting_commands.autoroute,
+            "autoroute": self._handle_autoroute_default,
+            "autoroute_cfha": self._handle_autoroute_cfha,
             "export_dsn": self.freerouting_commands.export_dsn,
             "import_ses": self.freerouting_commands.import_ses,
             "check_freerouting": self.freerouting_commands.check_freerouting,
@@ -555,6 +573,11 @@ class KiCADInterface:
         "add_board_text",
         "add_copper_pour",
         "refill_zones",
+        "route_critical_nets",
+        "run_freerouting",
+        "post_tune_routes",
+        "autoroute",
+        "autoroute_cfha",
         "import_svg_logo",
         "sync_schematic_to_board",
         "connect_passthrough",
@@ -584,6 +607,70 @@ class KiCADInterface:
         self.design_rule_commands.board = self.board
         self.export_commands.board = self.board
         self.freerouting_commands.board = self.board
+        self.autoroute_cfha_commands.set_board(self.board)
+        self.autoroute_cfha_commands.set_ipc_board_api(self.ipc_board_api)
+
+    def _reload_board_if_needed(self, board_path: Optional[str]):
+        """Reload the active board if a command targets a different file."""
+        from pathlib import Path
+
+        if not board_path:
+            return None
+
+        target = str(Path(board_path).resolve())
+        current = str(Path(self.board.GetFileName()).resolve()) if self.board and self.board.GetFileName() else ""
+        if target == current:
+            return None
+
+        logger.info(f"Reloading board from boardPath for hybrid routing command: {board_path}")
+        try:
+            self.board = pcbnew.LoadBoard(board_path)
+            self._update_command_handlers()
+            return None
+        except Exception as e:
+            logger.error(f"Failed to reload board from boardPath: {e}")
+            return {
+                "success": False,
+                "message": f"Could not load board from boardPath: {board_path}",
+                "errorDetails": str(e),
+            }
+
+    def _handle_cfha_command(self, params, method_name: str):
+        reload_error = self._reload_board_if_needed(params.get("boardPath"))
+        if reload_error:
+            return reload_error
+        handler = getattr(self.autoroute_cfha_commands, method_name)
+        return handler(params)
+
+    def _handle_analyze_board_routing_context(self, params):
+        return self._handle_cfha_command(params, "analyze_board_routing_context")
+
+    def _handle_extract_routing_intents(self, params):
+        return self._handle_cfha_command(params, "extract_routing_intents")
+
+    def _handle_generate_routing_constraints(self, params):
+        return self._handle_cfha_command(params, "generate_routing_constraints")
+
+    def _handle_generate_kicad_dru(self, params):
+        return self._handle_cfha_command(params, "generate_kicad_dru")
+
+    def _handle_route_critical_nets(self, params):
+        return self._handle_cfha_command(params, "route_critical_nets")
+
+    def _handle_run_freerouting(self, params):
+        return self._handle_cfha_command(params, "run_freerouting")
+
+    def _handle_post_tune_routes(self, params):
+        return self._handle_cfha_command(params, "post_tune_routes")
+
+    def _handle_verify_routing_qor(self, params):
+        return self._handle_cfha_command(params, "verify_routing_qor")
+
+    def _handle_autoroute_cfha(self, params):
+        return self._handle_cfha_command(params, "autoroute_cfha")
+
+    def _handle_autoroute_default(self, params):
+        return self._handle_cfha_command(params, "autoroute_default")
 
     # Schematic command handlers
     def _handle_create_schematic(self, params):

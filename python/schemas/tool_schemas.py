@@ -1042,6 +1042,174 @@ ROUTING_TOOLS = [
 ]
 
 # =============================================================================
+# AUTOROUTE / HYBRID ROUTING TOOLS
+# =============================================================================
+
+AUTOROUTE_TOOLS = [
+    {
+        "name": "autoroute",
+        "title": "Default Hybrid Autoroute",
+        "description": "Runs the constraint-first hybrid autorouting orchestrator. This is the default autoroute entrypoint and no longer maps directly to bare Freerouting.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "boardPath": {"type": "string", "description": "Path to .kicad_pcb file"},
+                "strategy": {
+                    "type": "string",
+                    "enum": ["hybrid", "critical_only", "analysis_only"],
+                    "description": "Routing strategy",
+                },
+                "seed": {"type": "number", "description": "Deterministic seed"},
+                "profiles": {"type": "array", "items": {"type": "string"}},
+                "interfaces": {"type": "array", "items": {"type": "string"}},
+                "criticalClasses": {"type": "array", "items": {"type": "string"}},
+                "excludeFromFreeRouting": {"type": "array", "items": {"type": "string"}},
+                "freeroutingJar": {"type": "string", "description": "Path to freerouting.jar"},
+                "maxPasses": {"type": "integer", "minimum": 1},
+                "timeout": {"type": "integer", "minimum": 1},
+                "orthorouteExecutable": {"type": "string", "description": "Optional external OrthoRoute executable"},
+            },
+        },
+    },
+    {
+        "name": "autoroute_cfha",
+        "title": "Constraint-First Hybrid Autoroute",
+        "description": "Explicit entrypoint for the full CFHA orchestration pipeline.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "boardPath": {"type": "string", "description": "Path to .kicad_pcb file"},
+                "strategy": {
+                    "type": "string",
+                    "enum": ["hybrid", "critical_only", "analysis_only"],
+                },
+                "seed": {"type": "number"},
+                "profiles": {"type": "array", "items": {"type": "string"}},
+                "interfaces": {"type": "array", "items": {"type": "string"}},
+                "criticalClasses": {"type": "array", "items": {"type": "string"}},
+                "excludeFromFreeRouting": {"type": "array", "items": {"type": "string"}},
+                "freeroutingJar": {"type": "string"},
+                "orthorouteExecutable": {"type": "string"},
+            },
+        },
+    },
+    {
+        "name": "analyze_board_routing_context",
+        "title": "Analyze Routing Context",
+        "description": "Runs preflight board analysis for stackup, density, plane continuity, split-risk, and backend readiness.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "boardPath": {"type": "string", "description": "Path to .kicad_pcb file"},
+                "profiles": {"type": "array", "items": {"type": "string"}},
+                "interfaces": {"type": "array", "items": {"type": "string"}},
+            },
+        },
+    },
+    {
+        "name": "extract_routing_intents",
+        "title": "Extract Routing Intents",
+        "description": "Classifies nets into routing intents such as RF, HS_DIFF, POWER_SWITCHING, and GENERIC.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "boardPath": {"type": "string"},
+                "intentOverrides": {
+                    "type": "object",
+                    "description": "Explicit net-to-intent mapping overrides",
+                    "additionalProperties": {"type": "string"},
+                },
+            },
+        },
+    },
+    {
+        "name": "generate_routing_constraints",
+        "title": "Generate Canonical Routing Constraints",
+        "description": "Builds and writes the canonical JSON routing constraint schema.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "boardPath": {"type": "string"},
+                "profiles": {"type": "array", "items": {"type": "string"}},
+                "interfaces": {"type": "array", "items": {"type": "string"}},
+                "criticalClasses": {"type": "array", "items": {"type": "string"}},
+                "excludeFromFreeRouting": {"type": "array", "items": {"type": "string"}},
+                "outputPath": {"type": "string"},
+            },
+        },
+    },
+    {
+        "name": "generate_kicad_dru",
+        "title": "Generate KiCad DRU Rules",
+        "description": "Compiles routing constraints into a .kicad_dru custom-rules artifact.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "boardPath": {"type": "string"},
+                "outputPath": {"type": "string"},
+            },
+        },
+    },
+    {
+        "name": "route_critical_nets",
+        "title": "Route Critical Nets",
+        "description": "Routes only critical nets using the embedded constraint-aware critical router.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "boardPath": {"type": "string"},
+                "criticalClasses": {"type": "array", "items": {"type": "string"}},
+                "criticalLayer": {"type": "string"},
+                "criticalWidthMm": {"type": "number"},
+            },
+        },
+    },
+    {
+        "name": "run_freerouting",
+        "title": "Run Freerouting Bulk Router",
+        "description": "Runs Freerouting as the bulk-routing stage after critical nets have been reserved or completed.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "boardPath": {"type": "string"},
+                "freeroutingJar": {"type": "string"},
+                "maxPasses": {"type": "integer", "minimum": 1},
+                "timeout": {"type": "integer", "minimum": 1},
+                "seed": {"type": "number"},
+                "excludeNets": {"type": "array", "items": {"type": "string"}},
+                "dsnPath": {"type": "string"},
+                "sesPath": {"type": "string"},
+            },
+        },
+    },
+    {
+        "name": "post_tune_routes",
+        "title": "Post Tune Routes",
+        "description": "Runs post-route cleanup hooks such as connectivity rebuild and optional zone refill.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "boardPath": {"type": "string"},
+                "refillZones": {"type": "boolean"},
+            },
+        },
+    },
+    {
+        "name": "verify_routing_qor",
+        "title": "Verify Routing QoR",
+        "description": "Runs DRC and generates routing quality metrics and risk flags.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "boardPath": {"type": "string"},
+                "reportPath": {"type": "string"},
+                "qorReportPath": {"type": "string"},
+            },
+        },
+    },
+]
+
+# =============================================================================
 # LIBRARY TOOLS
 # =============================================================================
 
@@ -1808,6 +1976,7 @@ for tool in (
     + BOARD_TOOLS
     + COMPONENT_TOOLS
     + ROUTING_TOOLS
+    + AUTOROUTE_TOOLS
     + LIBRARY_TOOLS
     + DESIGN_RULE_TOOLS
     + EXPORT_TOOLS
