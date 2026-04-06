@@ -20,13 +20,18 @@ PROJECT_TOOLS = [
     {
         "name": "create_project",
         "title": "Create New KiCAD Project",
-        "description": "Creates a new KiCAD project with PCB board file and optional project configuration. Automatically creates project directory and initializes board with default settings.",
+        "description": "Creates a new KiCAD project with PCB board file and optional project configuration. Blank projects default to a 100x100 mm, 2-layer board so routing and placement tools start from a usable canvas immediately.",
         "inputSchema": {
             "type": "object",
             "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Preferred project name parameter used by the MCP server",
+                    "minLength": 1,
+                },
                 "projectName": {
                     "type": "string",
-                    "description": "Name of the project (used for file naming)",
+                    "description": "Legacy alias for the project name (used for file naming)",
                     "minLength": 1,
                 },
                 "path": {
@@ -37,8 +42,26 @@ PROJECT_TOOLS = [
                     "type": "string",
                     "description": "Optional path to template board file to copy settings from",
                 },
+                "boardWidthMm": {
+                    "type": "number",
+                    "description": "Default board width in millimeters for blank projects (default: 100)",
+                },
+                "boardHeightMm": {
+                    "type": "number",
+                    "description": "Default board height in millimeters for blank projects (default: 100)",
+                },
+                "boardUnit": {
+                    "type": "string",
+                    "enum": ["mm", "inch"],
+                    "description": "Unit used by boardWidthMm/boardHeightMm (default: mm)",
+                },
+                "copperLayers": {
+                    "type": "integer",
+                    "minimum": 2,
+                    "description": "Copper layer count for blank projects. Must be an even number (default: 2)",
+                },
             },
-            "required": ["projectName"],
+            "anyOf": [{"required": ["name"]}, {"required": ["projectName"]}],
         },
     },
     {

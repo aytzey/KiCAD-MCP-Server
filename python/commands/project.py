@@ -11,6 +11,10 @@ import pcbnew  # type: ignore
 
 logger = logging.getLogger("kicad_interface")
 
+DEFAULT_BOARD_WIDTH_MM = 100.0
+DEFAULT_BOARD_HEIGHT_MM = 100.0
+DEFAULT_COPPER_LAYERS = 2
+
 
 class ProjectCommands:
     """Handles project-related KiCAD operations"""
@@ -26,6 +30,35 @@ class ProjectCommands:
             project_name = params.get("name") or params.get("projectName", "New_Project")
             path = params.get("path", os.getcwd())
             template = params.get("template")
+            board_width_mm = float(params.get("boardWidthMm", DEFAULT_BOARD_WIDTH_MM))
+            board_height_mm = float(params.get("boardHeightMm", DEFAULT_BOARD_HEIGHT_MM))
+            board_unit = params.get("boardUnit", "mm")
+            requested_copper_layers = params.get("copperLayers")
+
+            if board_width_mm <= 0 or board_height_mm <= 0:
+                return {
+                    "success": False,
+                    "message": "Invalid board dimensions",
+                    "errorDetails": "boardWidthMm and boardHeightMm must be positive numbers",
+                }
+            if board_unit not in {"mm", "inch"}:
+                return {
+                    "success": False,
+                    "message": "Invalid board unit",
+                    "errorDetails": "boardUnit must be 'mm' or 'inch'",
+                }
+
+            if requested_copper_layers is None:
+                copper_layers = DEFAULT_COPPER_LAYERS
+            else:
+                copper_layers = int(requested_copper_layers)
+
+            if copper_layers < 2 or copper_layers % 2 != 0:
+                return {
+                    "success": False,
+                    "message": "Invalid copper layer count",
+                    "errorDetails": "copperLayers must be an even number greater than or equal to 2",
+                }
 
             # Generate the full project path
             project_path = os.path.join(path, project_name)
@@ -55,6 +88,29 @@ class ProjectCommands:
                     # Copy settings from template
                     board.SetDesignSettings(template_board.GetDesignSettings())
                     board.SetLayerStack(template_board.GetLayerStack())
+
+            # For blank projects, give LLM sessions a routable default workspace.
+            if not template or requested_copper_layers is not None:
+                board.SetCopperLayerCount(copper_layers)
+
+            if not template:
+                from commands.board.outline import BoardOutlineCommands
+
+                outline_commands = BoardOutlineCommands(board)
+                outline_result = outline_commands.add_board_outline(
+                    {
+                        "shape": "rectangle",
+                        "params": {
+                            "x": 0,
+                            "y": 0,
+                            "width": board_width_mm,
+                            "height": board_height_mm,
+                            "unit": board_unit,
+                        },
+                    }
+                )
+                if not outline_result.get("success"):
+                    return outline_result
 
             # Save the board
             board_path = project_path.replace(".kicad_pro", ".kicad_pcb")
@@ -128,6 +184,12 @@ class ProjectCommands:
                     "path": project_path,
                     "boardPath": board_path,
                     "schematicPath": schematic_path,
+                    "defaults": {
+                        "boardWidthMm": board_width_mm,
+                        "boardHeightMm": board_height_mm,
+                        "boardUnit": board_unit,
+                        "copperLayers": copper_layers if not template or requested_copper_layers is not None else None,
+                    },
                 },
             }
 

@@ -9,12 +9,23 @@ export function registerProjectTools(server: McpServer, callKicadScript: Functio
   // Create project tool
   server.tool(
     "create_project",
-    "Create a new KiCAD project",
+    "Create a new KiCAD project. Blank projects default to a 100x100 mm, 2-layer board so routing tools have a usable starting canvas immediately.",
     {
       path: z.string().describe("Project directory path"),
       name: z.string().describe("Project name"),
+      boardWidthMm: z.number().optional().describe("Default board width in mm for blank projects (default: 100)"),
+      boardHeightMm: z.number().optional().describe("Default board height in mm for blank projects (default: 100)"),
+      boardUnit: z.enum(["mm", "inch"]).optional().describe("Board size unit for blank projects (default: mm)"),
+      copperLayers: z.number().int().optional().describe("Copper layer count for blank projects (default: 2)"),
     },
-    async (args: { path: string; name: string }) => {
+    async (args: {
+      path: string;
+      name: string;
+      boardWidthMm?: number;
+      boardHeightMm?: number;
+      boardUnit?: "mm" | "inch";
+      copperLayers?: number;
+    }) => {
       const result = await callKicadScript("create_project", args);
       return {
         content: [
