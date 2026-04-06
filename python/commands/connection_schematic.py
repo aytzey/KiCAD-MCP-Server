@@ -1,7 +1,7 @@
 import logging
 import os
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional, Tuple
 
 from skip import Schematic
 
@@ -10,6 +10,14 @@ logger = logging.getLogger(__name__)
 # Import new wire and pin managers
 try:
     from commands.pin_locator import PinLocator
+    from commands.orthogonal_router import (
+        compress_path,
+        manhattan_path_length,
+        plan_orthogonal_path,
+        segment_direction,
+        segment_intersects_rect,
+        segments_conflict,
+    )
     from commands.wire_manager import WireManager
 
     WIRE_MANAGER_AVAILABLE = True
@@ -57,6 +65,86 @@ class ConnectionManager:
             return None
 
     @staticmethod
+    def _direction_from_angle(angle_degrees: float) -> Tuple[int, int]:
+        """Convert KiCad pin angle to a schematic axis vector."""
+        angle = int(round(angle_degrees / 90.0)) % 4
+        mapping = {
+            0: (1, 0),
+            1: (0, -1),
+            2: (-1, 0),
+            3: (0, 1),
+        }
+        return mapping[angle]
+
+    @staticmethod
+    def _perpendicular(direction: Tuple[int, int]) -> Tuple[int, int]:
+        """Return a right-handed perpendicular for an axis-aligned direction."""
+        dx, dy = direction
+        return (-dy, dx)
+
+    @staticmethod
+    def _exit_point_from_bbox(
+        pin_loc: List[float],
+        direction: Tuple[int, int],
+        bbox: Optional[Tuple[float, float, float, float]],
+        margin: float,
+    ) -> Tuple[float, float]:
+        """Return a point just outside the symbol bbox in the pin's outward direction."""
+        if not bbox:
+            return (
+                round(pin_loc[0] + direction[0] * margin, 4),
+                round(pin_loc[1] + direction[1] * margin, 4),
+            )
+
+        min_x, min_y, max_x, max_y = bbox
+        if direction == (1, 0):
+            return (round(max_x + margin, 4), round(pin_loc[1], 4))
+        if direction == (-1, 0):
+            return (round(min_x - margin, 4), round(pin_loc[1], 4))
+        if direction == (0, -1):
+            return (round(pin_loc[0], 4), round(min_y - margin, 4))
+        return (round(pin_loc[0], 4), round(max_y + margin, 4))
+
+    @staticmethod
+    def _point_near_labels(
+        point: Tuple[float, float],
+        labels: List[dict],
+        minimum_spacing: float = 1.5,
+    ) -> bool:
+        """Return True if the candidate label point is too close to an existing label."""
+        for label in labels:
+            dx = point[0] - label["x"]
+            dy = point[1] - label["y"]
+            if (dx * dx + dy * dy) ** 0.5 < minimum_spacing:
+                return True
+        return False
+
+    @staticmethod
+    def _path_crosses_wires(path_points: List[Tuple[float, float]], wires: List[dict]) -> bool:
+        """Reject paths that would create wire-wire crossings or overlaps."""
+        for index in range(len(path_points) - 1):
+            seg_start = path_points[index]
+            seg_end = path_points[index + 1]
+            for wire in wires:
+                if segments_conflict(seg_start, seg_end, wire["start"], wire["end"]):
+                    return True
+        return False
+
+    @staticmethod
+    def _path_hits_symbol_bboxes(
+        path_points: List[Tuple[float, float]],
+        bboxes: List[Tuple[float, float, float, float]],
+    ) -> bool:
+        """Return True if any segment passes through another symbol body."""
+        for index in range(len(path_points) - 1):
+            seg_start = path_points[index]
+            seg_end = path_points[index + 1]
+            for bbox in bboxes:
+                if segment_intersects_rect(seg_start, seg_end, bbox, strict=True):
+                    return True
+        return False
+
+    @staticmethod
     def connect_to_net(schematic_path: Path, component_ref: str, pin_name: str, net_name: str):
         """
         Connect a component pin to a named net using a wire stub and label
@@ -86,30 +174,131 @@ class ConnectionManager:
                 logger.error(f"Could not locate pin {component_ref}/{pin_name}")
                 return False
 
-            # Add a small wire stub from the pin (2.54mm = 0.1 inch, standard grid spacing)
-            # Stub direction follows the pin's outward angle from the PinLocator
             pin_angle_deg = getattr(locator, "_last_pin_angle", 0)
             try:
                 pin_angle_deg = locator.get_pin_angle(schematic_path, component_ref, pin_name) or 0
             except Exception:
                 pin_angle_deg = 0
-            import math as _math
 
-            angle_rad = _math.radians(pin_angle_deg)
-            stub_end = [
-                round(pin_loc[0] + 2.54 * _math.cos(angle_rad), 4),
-                round(pin_loc[1] - 2.54 * _math.sin(angle_rad), 4),
+            from commands.schematic_analysis import (
+                _compute_symbol_bbox_direct,
+                _extract_lib_symbols,
+                _load_sexp,
+                _parse_labels,
+                _parse_symbols,
+                _parse_wires,
+            )
+
+            sexp_data = _load_sexp(schematic_path)
+            labels = _parse_labels(sexp_data)
+            wires = _parse_wires(sexp_data)
+            symbols = _parse_symbols(sexp_data)
+            lib_defs = _extract_lib_symbols(sexp_data)
+
+            symbol_bboxes = {}
+            for symbol in symbols:
+                reference = symbol.get("reference", "")
+                if not reference or reference.startswith("_TEMPLATE"):
+                    continue
+                lib_data = lib_defs.get(symbol.get("lib_id", ""), {})
+                pin_defs = lib_data.get("pins", {})
+                graphics_points = lib_data.get("graphics_points", [])
+                if not pin_defs:
+                    continue
+                bbox = _compute_symbol_bbox_direct(
+                    symbol,
+                    pin_defs,
+                    graphics_points=graphics_points,
+                )
+                if bbox is not None:
+                    symbol_bboxes[reference] = bbox
+
+            direction = ConnectionManager._direction_from_angle(pin_angle_deg)
+            perpendicular = ConnectionManager._perpendicular(direction)
+            own_bbox = symbol_bboxes.get(component_ref)
+            other_bboxes = [
+                bbox for reference, bbox in symbol_bboxes.items() if reference != component_ref
             ]
+            grid = 2.54
+            escape_point = ConnectionManager._exit_point_from_bbox(
+                pin_loc,
+                direction,
+                own_bbox,
+                margin=1.27,
+            )
 
-            # Create wire stub using WireManager
-            wire_success = WireManager.add_wire(schematic_path, pin_loc, stub_end)
+            candidates = []
+            for distance_steps in (1, 2, 3):
+                forward_point = (
+                    round(escape_point[0] + direction[0] * grid * distance_steps, 4),
+                    round(escape_point[1] + direction[1] * grid * distance_steps, 4),
+                )
+                for offset_steps in (0, 1, -1, 2, -2):
+                    label_point = (
+                        round(forward_point[0] + perpendicular[0] * grid * offset_steps, 4),
+                        round(forward_point[1] + perpendicular[1] * grid * offset_steps, 4),
+                    )
+                    if ConnectionManager._point_near_labels(label_point, labels):
+                        continue
+
+                    tail_path = plan_orthogonal_path(
+                        escape_point,
+                        label_point,
+                        other_bboxes,
+                        bend_penalty=1.0,
+                    )
+                    if not tail_path:
+                        continue
+
+                    full_path = compress_path([tuple(pin_loc), escape_point] + tail_path[1:])
+                    if ConnectionManager._path_hits_symbol_bboxes(full_path, other_bboxes):
+                        continue
+                    if ConnectionManager._path_crosses_wires(full_path, wires):
+                        continue
+
+                    candidates.append(
+                        (
+                            manhattan_path_length(full_path)
+                            + max(len(full_path) - 2, 0)
+                            + abs(offset_steps) * 0.5,
+                            full_path,
+                            label_point,
+                        )
+                    )
+
+            if candidates:
+                _, chosen_path, label_point = min(candidates, key=lambda item: item[0])
+            else:
+                # Conservative fallback: preserve the old simple outward stub.
+                label_point = (
+                    round(pin_loc[0] + direction[0] * grid, 4),
+                    round(pin_loc[1] + direction[1] * grid, 4),
+                )
+                chosen_path = [tuple(pin_loc), label_point]
+
+            wire_success = (
+                WireManager.add_polyline_wire(schematic_path, [[p[0], p[1]] for p in chosen_path])
+                if len(chosen_path) > 2
+                else WireManager.add_wire(
+                    schematic_path,
+                    [chosen_path[0][0], chosen_path[0][1]],
+                    [chosen_path[-1][0], chosen_path[-1][1]],
+                )
+            )
             if not wire_success:
-                logger.error(f"Failed to create wire stub for net connection")
+                logger.error("Failed to create wire stub for net connection")
                 return False
 
-            # Add label at the end of the stub using WireManager
+            last_direction = (
+                segment_direction(chosen_path[-2], chosen_path[-1]) if len(chosen_path) >= 2 else "H"
+            )
+            label_orientation = 90 if last_direction == "V" else 0
             label_success = WireManager.add_label(
-                schematic_path, net_name, stub_end, label_type="label"
+                schematic_path,
+                net_name,
+                [label_point[0], label_point[1]],
+                label_type="label",
+                orientation=label_orientation,
             )
             if not label_success:
                 logger.error(f"Failed to add net label '{net_name}'")

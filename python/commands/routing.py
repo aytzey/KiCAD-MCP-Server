@@ -8,6 +8,14 @@ import os
 from typing import Any, Dict, List, Optional, Tuple
 
 import pcbnew
+from commands.orthogonal_router import (
+    compress_path,
+    inflate_rect,
+    manhattan_path_length,
+    normalize_rect,
+    pick_escape_point,
+    plan_orthogonal_path,
+)
 
 logger = logging.getLogger("kicad_interface")
 
@@ -18,6 +26,216 @@ class RoutingCommands:
     def __init__(self, board: Optional[pcbnew.BOARD] = None):
         """Initialize with optional board instance"""
         self.board = board
+
+    @staticmethod
+    def _bbox_to_rect_mm(bbox) -> Tuple[float, float, float, float]:
+        """Convert a KiCad bounding box object to a normalized mm rectangle."""
+        return normalize_rect(
+            (
+                bbox.GetLeft() / 1000000,
+                bbox.GetTop() / 1000000,
+                bbox.GetRight() / 1000000,
+                bbox.GetBottom() / 1000000,
+            )
+        )
+
+    @staticmethod
+    def _union_rects(
+        rects: List[Tuple[float, float, float, float]],
+    ) -> Optional[Tuple[float, float, float, float]]:
+        """Return the union of rects, or None for an empty list."""
+        if not rects:
+            return None
+        min_x = min(rect[0] for rect in rects)
+        min_y = min(rect[1] for rect in rects)
+        max_x = max(rect[2] for rect in rects)
+        max_y = max(rect[3] for rect in rects)
+        return (min_x, min_y, max_x, max_y)
+
+    def _get_track_width_mm(self, width: Optional[float]) -> float:
+        """Resolve the effective trace width in mm."""
+        if width:
+            return float(width)
+        return self.board.GetDesignSettings().GetCurrentTrackWidth() / 1000000
+
+    def _get_clearance_mm(self) -> float:
+        """Return board minimum copper clearance in mm."""
+        design_settings = self.board.GetDesignSettings()
+        clearance_nm = getattr(design_settings, "m_MinClearance", 0) or 0
+        if clearance_nm:
+            return clearance_nm / 1000000
+        return 0.2
+
+    def _find_best_via_position(
+        self,
+        start_point: Tuple[float, float],
+        end_point: Tuple[float, float],
+        start_layer: str,
+        end_layer: str,
+        keepout_margin: float,
+        ignored_refs: List[str],
+        net: Optional[str],
+    ) -> Tuple[float, float]:
+        """
+        Pick a via location that is outside both layers' keepouts.
+
+        This uses a small candidate set rather than a full multilayer search,
+        but it avoids the worst "drop a via inside an obstacle" behaviour.
+        """
+        mid_x = round((start_point[0] + end_point[0]) / 2, 6)
+        mid_y = round((start_point[1] + end_point[1]) / 2, 6)
+        candidate_points = [
+            (start_point[0], mid_y),
+            (end_point[0], mid_y),
+            (mid_x, start_point[1]),
+            (mid_x, end_point[1]),
+            (mid_x, mid_y),
+        ]
+
+        start_obstacles = self._collect_routing_obstacles(
+            start_layer,
+            keepout_margin,
+            ignored_refs=ignored_refs,
+            net=net,
+        )
+        end_obstacles = self._collect_routing_obstacles(
+            end_layer,
+            keepout_margin,
+            ignored_refs=ignored_refs,
+            net=net,
+        )
+
+        viable = []
+        for point in candidate_points:
+            blocked = any(
+                rect[0] < point[0] < rect[2] and rect[1] < point[1] < rect[3]
+                for rect in start_obstacles + end_obstacles
+            )
+            if not blocked:
+                viable.append(point)
+
+        if viable:
+            return min(
+                viable,
+                key=lambda point: abs(point[0] - mid_x) + abs(point[1] - mid_y),
+            )
+
+        return (start_point[0], mid_y)
+
+    def _get_footprint_pad_rect(
+        self, footprint
+    ) -> Optional[Tuple[float, float, float, float]]:
+        """Return the union of all pad bounding boxes for a footprint."""
+        pad_rects = []
+        for pad in footprint.Pads():
+            try:
+                pad_rects.append(self._bbox_to_rect_mm(pad.GetBoundingBox()))
+            except Exception:
+                continue
+        if pad_rects:
+            return self._union_rects(pad_rects)
+        try:
+            return self._bbox_to_rect_mm(footprint.GetBoundingBox())
+        except Exception:
+            return None
+
+    def _collect_routing_obstacles(
+        self,
+        layer: str,
+        keepout_margin: float,
+        *,
+        ignored_refs: Optional[List[str]] = None,
+        net: Optional[str] = None,
+    ) -> List[Tuple[float, float, float, float]]:
+        """
+        Collect inflated copper keepouts for simple obstacle-aware routing.
+
+        Footprints are approximated by the union of their pad bboxes. Tracks and
+        vias on other nets become obstacles as well.
+        """
+        ignored = set(ignored_refs or [])
+        obstacles: List[Tuple[float, float, float, float]] = []
+        layer_id = self.board.GetLayerID(layer)
+
+        for footprint in self.board.GetFootprints():
+            if footprint.GetReference() in ignored:
+                continue
+            rect = self._get_footprint_pad_rect(footprint)
+            if rect is not None:
+                obstacles.append(inflate_rect(rect, keepout_margin))
+
+        for item in self.board.Tracks():
+            try:
+                item_net = item.GetNetname()
+            except Exception:
+                item_net = ""
+            if net and item_net == net:
+                continue
+
+            is_via = item.Type() == pcbnew.PCB_VIA_T
+            if not is_via and item.GetLayer() != layer_id:
+                continue
+
+            try:
+                rect = self._bbox_to_rect_mm(item.GetBoundingBox())
+                obstacles.append(inflate_rect(rect, keepout_margin))
+            except Exception:
+                continue
+
+        return obstacles
+
+    def _plan_trace_points(
+        self,
+        start_point: Tuple[float, float],
+        end_point: Tuple[float, float],
+        layer: str,
+        width_mm: float,
+        *,
+        net: Optional[str] = None,
+        ignored_refs: Optional[List[str]] = None,
+    ) -> Optional[List[Tuple[float, float]]]:
+        """Plan a simple orthogonal route around inflated board obstacles."""
+        keepout_margin = self._get_clearance_mm() + width_mm / 2
+        obstacles = self._collect_routing_obstacles(
+            layer,
+            keepout_margin,
+            ignored_refs=ignored_refs,
+            net=net,
+        )
+
+        route = plan_orthogonal_path(
+            start_point,
+            end_point,
+            obstacles,
+            bend_penalty=max(keepout_margin * 2, 1.0),
+        )
+        if route:
+            return compress_path(route)
+        return None
+
+    def _add_track_segment(
+        self,
+        start_point: pcbnew.VECTOR2I,
+        end_point: pcbnew.VECTOR2I,
+        layer_id: int,
+        width_mm: float,
+        net: Optional[str],
+    ) -> pcbnew.PCB_TRACK:
+        """Add a single already-planned segment to the board."""
+        track = pcbnew.PCB_TRACK(self.board)
+        track.SetStart(start_point)
+        track.SetEnd(end_point)
+        track.SetLayer(layer_id)
+        track.SetWidth(int(width_mm * 1000000))
+
+        if net:
+            netinfo = self.board.GetNetInfo()
+            nets_map = netinfo.NetsByName()
+            if nets_map.has_key(net):
+                track.SetNet(nets_map[net])
+
+        self.board.Add(track)
+        return track
 
     def add_net(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Add a new net to the PCB"""
@@ -140,6 +358,10 @@ class RoutingCommands:
 
             start_pos = start_pad.GetPosition()
             end_pos = end_pad.GetPosition()
+            start_point_mm = (start_pos.x / scale, start_pos.y / scale)
+            end_point_mm = (end_pos.x / scale, end_pos.y / scale)
+            width_mm = self._get_track_width_mm(width)
+            keepout_margin = self._get_clearance_mm() + width_mm / 2
 
             # Use net from start pad if not overridden
             if not net:
@@ -153,6 +375,18 @@ class RoutingCommands:
             fp_end = footprints[to_ref]
             start_layer = self.board.GetLayerName(fp_start.GetLayer())
             end_layer = self.board.GetLayerName(fp_end.GetLayer())
+            start_rect = self._get_footprint_pad_rect(fp_start)
+            end_rect = self._get_footprint_pad_rect(fp_end)
+            start_escape = (
+                pick_escape_point(start_point_mm, start_rect, keepout_margin, end_point_mm)
+                if start_rect
+                else start_point_mm
+            )
+            end_escape = (
+                pick_escape_point(end_point_mm, end_rect, keepout_margin, start_point_mm)
+                if end_rect
+                else end_point_mm
+            )
             copper_layers = {"F.Cu", "B.Cu"}
             needs_via = (
                 start_layer in copper_layers
@@ -161,25 +395,45 @@ class RoutingCommands:
             )
 
             if needs_via:
-                # Place via directly below the start pad (same X).
-                # Using the geometric midpoint X causes all vias to stack at
-                # the same X when pads are back-to-back mirrored (e.g. J1/J2
-                # on F.Cu/B.Cu): midpoint is always the board center.
-                via_x = start_pos.x / scale
-                via_y = (start_pos.y + end_pos.y) / 2 / scale
+                via_x, via_y = self._find_best_via_position(
+                    start_escape,
+                    end_escape,
+                    start_layer,
+                    end_layer,
+                    keepout_margin,
+                    [from_ref, to_ref],
+                    net,
+                )
+                start_route = self._plan_trace_points(
+                    start_escape,
+                    (via_x, via_y),
+                    start_layer,
+                    width_mm,
+                    net=net,
+                    ignored_refs=[from_ref],
+                ) or [start_escape, (via_x, via_y)]
+                end_route = self._plan_trace_points(
+                    (via_x, via_y),
+                    end_escape,
+                    end_layer,
+                    width_mm,
+                    net=net,
+                    ignored_refs=[to_ref],
+                ) or [(via_x, via_y), end_escape]
 
                 # Trace on start layer: start_pad → via
                 r1 = self.route_trace(
                     {
-                        "start": {"x": start_pos.x / scale, "y": start_pos.y / scale, "unit": "mm"},
+                        "start": {"x": start_point_mm[0], "y": start_point_mm[1], "unit": "mm"},
                         "end": {"x": via_x, "y": via_y, "unit": "mm"},
                         "layer": start_layer,
-                        "width": width,
+                        "width": width_mm,
                         "net": net,
+                        "waypoints": [{"x": p[0], "y": p[1], "unit": "mm"} for p in start_route[1:-1]],
                     }
                 )
                 # Via connecting both layers
-                self.add_via(
+                via_result = self.add_via(
                     {
                         "position": {"x": via_x, "y": via_y, "unit": "mm"},
                         "net": net,
@@ -191,13 +445,14 @@ class RoutingCommands:
                 r2 = self.route_trace(
                     {
                         "start": {"x": via_x, "y": via_y, "unit": "mm"},
-                        "end": {"x": end_pos.x / scale, "y": end_pos.y / scale, "unit": "mm"},
+                        "end": {"x": end_point_mm[0], "y": end_point_mm[1], "unit": "mm"},
                         "layer": end_layer,
-                        "width": width,
+                        "width": width_mm,
                         "net": net,
+                        "waypoints": [{"x": p[0], "y": p[1], "unit": "mm"} for p in end_route[1:-1]],
                     }
                 )
-                success = r1.get("success") and r2.get("success")
+                success = r1.get("success") and r2.get("success") and via_result.get("success")
                 result = {
                     "success": success,
                     "message": f"Routed {from_ref}.{from_pad} → via → {to_ref}.{to_pad} (net: {net}, via at {via_x:.2f},{via_y:.2f})",
@@ -205,14 +460,27 @@ class RoutingCommands:
                     "via_position": {"x": via_x, "y": via_y},
                 }
             else:
-                # Same layer — direct trace
+                middle_route = self._plan_trace_points(
+                    start_escape,
+                    end_escape,
+                    layer if layer else start_layer,
+                    width_mm,
+                    net=net,
+                    ignored_refs=[from_ref, to_ref],
+                )
+                full_route = compress_path(
+                    [start_point_mm]
+                    + (middle_route if middle_route else [start_escape, end_escape])
+                    + [end_point_mm]
+                )
                 result = self.route_trace(
                     {
-                        "start": {"x": start_pos.x / scale, "y": start_pos.y / scale, "unit": "mm"},
-                        "end": {"x": end_pos.x / scale, "y": end_pos.y / scale, "unit": "mm"},
+                        "start": {"x": start_point_mm[0], "y": start_point_mm[1], "unit": "mm"},
+                        "end": {"x": end_point_mm[0], "y": end_point_mm[1], "unit": "mm"},
                         "layer": layer if layer else start_layer,
-                        "width": width,
+                        "width": width_mm,
                         "net": net,
+                        "waypoints": [{"x": p[0], "y": p[1], "unit": "mm"} for p in full_route[1:-1]],
                     }
                 )
 
@@ -256,6 +524,8 @@ class RoutingCommands:
             width = params.get("width")
             net = params.get("net")
             via = params.get("via", False)
+            waypoints = params.get("waypoints") or []
+            ignored_refs = params.get("ignoreRefs") or []
 
             if not start or not end:
                 return {
@@ -276,29 +546,54 @@ class RoutingCommands:
             # Get start point
             start_point = self._get_point(start)
             end_point = self._get_point(end)
+            width_mm = self._get_track_width_mm(width)
 
-            # Create track segment
-            track = pcbnew.PCB_TRACK(self.board)
-            track.SetStart(start_point)
-            track.SetEnd(end_point)
-            track.SetLayer(layer_id)
+            def _coerce_waypoint(point_spec: Any) -> Tuple[float, float]:
+                if isinstance(point_spec, dict):
+                    return (float(point_spec["x"]), float(point_spec["y"]))
+                if isinstance(point_spec, (list, tuple)) and len(point_spec) >= 2:
+                    return (float(point_spec[0]), float(point_spec[1]))
+                raise ValueError(f"Invalid waypoint: {point_spec}")
 
-            # Set width (default to board's current track width)
-            if width:
-                track.SetWidth(int(width * 1000000))  # Convert mm to nm
+            start_mm = (start_point.x / 1000000, start_point.y / 1000000)
+            end_mm = (end_point.x / 1000000, end_point.y / 1000000)
+            if waypoints:
+                path_points = compress_path(
+                    [start_mm] + [_coerce_waypoint(point) for point in waypoints] + [end_mm]
+                )
             else:
-                track.SetWidth(self.board.GetDesignSettings().GetCurrentTrackWidth())
+                planned_points = self._plan_trace_points(
+                    start_mm,
+                    end_mm,
+                    layer,
+                    width_mm,
+                    net=net,
+                    ignored_refs=ignored_refs,
+                )
+                path_points = compress_path(planned_points or [start_mm, end_mm])
 
-            # Set net if provided
-            if net:
-                netinfo = self.board.GetNetInfo()
-                nets_map = netinfo.NetsByName()
-                if nets_map.has_key(net):
-                    net_obj = nets_map[net]
-                    track.SetNet(net_obj)
+            tracks = []
+            for index in range(len(path_points) - 1):
+                seg_start = path_points[index]
+                seg_end = path_points[index + 1]
+                if seg_start == seg_end:
+                    continue
+                tracks.append(
+                    self._add_track_segment(
+                        pcbnew.VECTOR2I(int(seg_start[0] * 1000000), int(seg_start[1] * 1000000)),
+                        pcbnew.VECTOR2I(int(seg_end[0] * 1000000), int(seg_end[1] * 1000000)),
+                        layer_id,
+                        width_mm,
+                        net,
+                    )
+                )
 
-            # Add track to board
-            self.board.Add(track)
+            if not tracks:
+                return {
+                    "success": False,
+                    "message": "Failed to route trace",
+                    "errorDetails": "Planner produced no segments",
+                }
 
             # Add via if requested and net is specified
             if via and net:
@@ -314,9 +609,16 @@ class RoutingCommands:
                     }
                 )
 
+            self.board.SetModified()
+            if hasattr(self.board, "BuildConnectivity"):
+                try:
+                    self.board.BuildConnectivity()
+                except Exception:
+                    logger.debug("BuildConnectivity failed after route_trace", exc_info=True)
+
             return {
                 "success": True,
-                "message": "Added trace",
+                "message": f"Added trace using {len(tracks)} segment(s)",
                 "trace": {
                     "start": {
                         "x": start_point.x / 1000000,
@@ -329,8 +631,16 @@ class RoutingCommands:
                         "unit": "mm",
                     },
                     "layer": layer,
-                    "width": track.GetWidth() / 1000000,
+                    "width": width_mm,
                     "net": net,
+                    "segments": [
+                        {
+                            "start": {"x": seg_start[0], "y": seg_start[1], "unit": "mm"},
+                            "end": {"x": seg_end[0], "y": seg_end[1], "unit": "mm"},
+                        }
+                        for seg_start, seg_end in zip(path_points, path_points[1:])
+                    ],
+                    "length": manhattan_path_length(path_points),
                 },
             }
 
@@ -401,6 +711,12 @@ class RoutingCommands:
 
             # Add via to board
             self.board.Add(via)
+            self.board.SetModified()
+            if hasattr(self.board, "BuildConnectivity"):
+                try:
+                    self.board.BuildConnectivity()
+                except Exception:
+                    logger.debug("BuildConnectivity failed after add_via", exc_info=True)
 
             return {
                 "success": True,
