@@ -345,25 +345,8 @@ def _transform_local_point(
     mirror_x: bool,
     mirror_y: bool,
 ) -> Tuple[float, float]:
-    """
-    Transform a point from local symbol coordinates to absolute schematic
-    coordinates using KiCad's transform order:
-    negate-y (lib y-up → schematic y-down) → mirror → rotate → translate.
-    """
-    # Library symbols use y-up; schematic uses y-down
-    ly = -ly
-
-    # Apply mirroring in local coords
-    if mirror_x:
-        ly = -ly
-    if mirror_y:
-        lx = -lx
-
-    # Apply rotation
-    if rotation != 0:
-        lx, ly = PinLocator.rotate_point(lx, ly, rotation)
-
-    return (sym_x + lx, sym_y + ly)
+    """Transform a library-local symbol point into schematic coordinates."""
+    return PinLocator.transform_local_point(lx, ly, sym_x, sym_y, rotation, mirror_x, mirror_y)
 
 
 def _compute_symbol_bbox_direct(
@@ -728,7 +711,7 @@ def _compute_pin_positions_direct(
     lookup in the schematic, so it works correctly when multiple symbols share
     the same reference designator (e.g. unannotated "Q?").
 
-    KiCad transform order: mirror (in local coords) → rotate → translate.
+    Uses the same transform as PinLocator so analysis matches KiCad ERC.
     """
     sym_x = sym["x"]
     sym_y = sym["y"]
@@ -740,18 +723,16 @@ def _compute_pin_positions_direct(
     for pin_num, pin_data in pin_defs.items():
         rel_x = float(pin_data["x"])
         rel_y = float(pin_data["y"])
-
-        # Apply mirroring in local symbol coordinates
-        if mirror_x:
-            rel_y = -rel_y
-        if mirror_y:
-            rel_x = -rel_x
-
-        # Apply symbol rotation
-        if rotation != 0:
-            rel_x, rel_y = PinLocator.rotate_point(rel_x, rel_y, rotation)
-
-        result[pin_num] = [sym_x + rel_x, sym_y + rel_y]
+        world_x, world_y = PinLocator.transform_local_point(
+            rel_x,
+            rel_y,
+            sym_x,
+            sym_y,
+            rotation,
+            mirror_x,
+            mirror_y,
+        )
+        result[pin_num] = [world_x, world_y]
     return result
 
 

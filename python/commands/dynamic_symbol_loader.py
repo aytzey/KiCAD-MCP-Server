@@ -17,6 +17,11 @@ from typing import Dict, List, Optional, Tuple
 logger = logging.getLogger("kicad_interface")
 
 
+def _snap_schematic_coordinate(value: float, grid: float = 1.27) -> float:
+    """Snap schematic placements to the conventional KiCad connection grid."""
+    return round(round(float(value) / grid) * grid, 4)
+
+
 class DynamicSymbolLoader:
     """
     Dynamically loads symbols from KiCad library files and injects them into schematics.
@@ -334,7 +339,11 @@ class DynamicSymbolLoader:
         return result
 
     def inject_symbol_into_schematic(
-        self, schematic_path: Path, library_name: str, symbol_name: str
+        self,
+        schematic_path: Path,
+        library_name: str,
+        symbol_name: str,
+        replace_existing: bool = False,
     ) -> bool:
         """
         Inject a symbol definition into a schematic's lib_symbols section.
@@ -344,23 +353,6 @@ class DynamicSymbolLoader:
 
         with open(schematic_path, "r", encoding="utf-8") as f:
             content = f.read()
-
-        # Check if symbol already exists
-        if f'(symbol "{full_name}"' in content:
-            logger.info(f"Symbol {full_name} already exists in schematic")
-            return True
-
-        # Extract symbol from library
-        symbol_block = self.extract_symbol_from_library(library_name, symbol_name)
-        if not symbol_block:
-            raise ValueError(f"Symbol '{symbol_name}' not found in library '{library_name}'")
-
-        # Indent the block to match lib_symbols indentation (4 spaces for top-level)
-        indented_lines = []
-        for line in symbol_block.split("\n"):
-            # Add 4-space indent for the content inside lib_symbols
-            indented_lines.append("    " + line if line.strip() else line)
-        indented_block = "\n".join(indented_lines)
 
         # Find the end of lib_symbols section using string search (format-independent,
         # works even when sexpdata.dumps() has compacted the file to a single line)
@@ -381,8 +373,39 @@ class DynamicSymbolLoader:
         else:
             raise ValueError("No lib_symbols section found in schematic")
 
-        # Insert the symbol block just before the closing ) of lib_symbols
-        content = content[:lib_sym_end] + "\n    " + indented_block + "\n  " + content[lib_sym_end:]
+        existing_start = content.find(f'(symbol "{full_name}"', lib_sym_start, lib_sym_end)
+        if existing_start != -1 and not replace_existing:
+            logger.info(f"Symbol {full_name} already exists in schematic")
+            return True
+
+        # Extract symbol from library
+        symbol_block = self.extract_symbol_from_library(library_name, symbol_name)
+        if not symbol_block:
+            raise ValueError(f"Symbol '{symbol_name}' not found in library '{library_name}'")
+
+        # Indent the block to match lib_symbols indentation (4 spaces for top-level)
+        indented_lines = []
+        for line in symbol_block.split("\n"):
+            # Add 4-space indent for the content inside lib_symbols
+            indented_lines.append("    " + line if line.strip() else line)
+        indented_block = "\n".join(indented_lines)
+
+        if existing_start != -1:
+            depth = 0
+            existing_end = existing_start
+            for i in range(existing_start, len(content)):
+                if content[i] == "(":
+                    depth += 1
+                elif content[i] == ")":
+                    depth -= 1
+                    if depth == 0:
+                        existing_end = i
+                        break
+            content = content[:existing_start] + indented_block + content[existing_end + 1 :]
+            logger.info(f"Replaced existing symbol definition for {full_name}")
+        else:
+            # Insert the symbol block just before the closing ) of lib_symbols
+            content = content[:lib_sym_end] + "\n    " + indented_block + "\n  " + content[lib_sym_end:]
 
         with open(schematic_path, "w", encoding="utf-8") as f:
             f.write(content)
@@ -402,11 +425,17 @@ class DynamicSymbolLoader:
         footprint: str = "",
         x: float = 0,
         y: float = 0,
+        snap_to_grid: bool = True,
+        grid: float = 1.27,
     ) -> bool:
         """
         Add a component instance to the schematic.
         This creates the (symbol ...) block with lib_id reference.
         """
+        if snap_to_grid:
+            x = _snap_schematic_coordinate(x, grid)
+            y = _snap_schematic_coordinate(y, grid)
+
         full_lib_id = f"{library_name}:{symbol_name}"
         new_uuid = str(uuid.uuid4())
 
@@ -454,7 +483,11 @@ class DynamicSymbolLoader:
         return True
 
     def load_symbol_dynamically(
-        self, schematic_path: Path, library_name: str, symbol_name: str
+        self,
+        schematic_path: Path,
+        library_name: str,
+        symbol_name: str,
+        refresh_existing: bool = True,
     ) -> str:
         """
         Complete workflow: inject symbol definition and create a template instance.
@@ -463,7 +496,12 @@ class DynamicSymbolLoader:
         logger.info(f"Loading symbol dynamically: {library_name}:{symbol_name}")
 
         # Step 1: Inject symbol definition into lib_symbols
-        self.inject_symbol_into_schematic(schematic_path, library_name, symbol_name)
+        self.inject_symbol_into_schematic(
+            schematic_path,
+            library_name,
+            symbol_name,
+            replace_existing=refresh_existing,
+        )
 
         # Step 2: Create an offscreen template instance
         lib_clean = library_name.replace("-", "_").replace(".", "_")
@@ -494,6 +532,9 @@ class DynamicSymbolLoader:
         x: float = 0,
         y: float = 0,
         project_path: Optional[Path] = None,
+        snap_to_grid: bool = True,
+        schematic_grid: float = 1.27,
+        refresh_symbol_definition: bool = True,
     ) -> bool:
         """
         High-level: ensure symbol definition exists in schematic, then add an instance.
@@ -506,7 +547,12 @@ class DynamicSymbolLoader:
         if project_path:
             self.project_path = project_path
         # Ensure symbol definition is in lib_symbols
-        self.inject_symbol_into_schematic(schematic_path, library_name, symbol_name)
+        self.inject_symbol_into_schematic(
+            schematic_path,
+            library_name,
+            symbol_name,
+            replace_existing=refresh_symbol_definition,
+        )
 
         # Add the component instance
         return self.create_component_instance(
@@ -518,6 +564,8 @@ class DynamicSymbolLoader:
             footprint=footprint,
             x=x,
             y=y,
+            snap_to_grid=snap_to_grid,
+            grid=schematic_grid,
         )
 
 

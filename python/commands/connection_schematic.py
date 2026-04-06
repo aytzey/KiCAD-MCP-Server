@@ -66,7 +66,7 @@ class ConnectionManager:
 
     @staticmethod
     def _direction_from_angle(angle_degrees: float) -> Tuple[int, int]:
-        """Convert KiCad pin angle to a schematic axis vector."""
+        """Convert a schematic outward angle to a screen-axis unit vector."""
         angle = int(round(angle_degrees / 90.0)) % 4
         mapping = {
             0: (1, 0),
@@ -215,23 +215,20 @@ class ConnectionManager:
 
             direction = ConnectionManager._direction_from_angle(pin_angle_deg)
             perpendicular = ConnectionManager._perpendicular(direction)
-            own_bbox = symbol_bboxes.get(component_ref)
             other_bboxes = [
                 bbox for reference, bbox in symbol_bboxes.items() if reference != component_ref
             ]
             grid = 2.54
-            escape_point = ConnectionManager._exit_point_from_bbox(
-                pin_loc,
-                direction,
-                own_bbox,
-                margin=1.27,
+            anchor_point = (
+                round(pin_loc[0] + direction[0] * grid, 4),
+                round(pin_loc[1] + direction[1] * grid, 4),
             )
 
             candidates = []
-            for distance_steps in (1, 2, 3):
+            for distance_steps in (0, 1, 2):
                 forward_point = (
-                    round(escape_point[0] + direction[0] * grid * distance_steps, 4),
-                    round(escape_point[1] + direction[1] * grid * distance_steps, 4),
+                    round(anchor_point[0] + direction[0] * grid * distance_steps, 4),
+                    round(anchor_point[1] + direction[1] * grid * distance_steps, 4),
                 )
                 for offset_steps in (0, 1, -1, 2, -2):
                     label_point = (
@@ -242,7 +239,7 @@ class ConnectionManager:
                         continue
 
                     tail_path = plan_orthogonal_path(
-                        escape_point,
+                        anchor_point,
                         label_point,
                         other_bboxes,
                         bend_penalty=1.0,
@@ -250,7 +247,7 @@ class ConnectionManager:
                     if not tail_path:
                         continue
 
-                    full_path = compress_path([tuple(pin_loc), escape_point] + tail_path[1:])
+                    full_path = compress_path([tuple(pin_loc), anchor_point] + tail_path[1:])
                     if ConnectionManager._path_hits_symbol_bboxes(full_path, other_bboxes):
                         continue
                     if ConnectionManager._path_crosses_wires(full_path, wires):
@@ -270,11 +267,8 @@ class ConnectionManager:
                 _, chosen_path, label_point = min(candidates, key=lambda item: item[0])
             else:
                 # Conservative fallback: preserve the old simple outward stub.
-                label_point = (
-                    round(pin_loc[0] + direction[0] * grid, 4),
-                    round(pin_loc[1] + direction[1] * grid, 4),
-                )
-                chosen_path = [tuple(pin_loc), label_point]
+                label_point = anchor_point
+                chosen_path = [tuple(pin_loc), anchor_point]
 
             wire_success = (
                 WireManager.add_polyline_wire(schematic_path, [[p[0], p[1]] for p in chosen_path])

@@ -25,6 +25,27 @@ class PinLocator:
         """Initialize pin locator with empty cache"""
         self.pin_definition_cache = {}  # Cache: "lib_id:symbol_name" -> pin_data
         self._schematic_cache: Dict[str, object] = {}  # Cache: path -> loaded Schematic
+        self._schematic_mtime: Dict[str, int] = {}  # Cache: path -> file mtime for reloads
+
+    def _load_schematic(self, schematic_path: Path):
+        """Load or reload a schematic when the backing file has changed on disk."""
+        sch_key = str(schematic_path)
+        try:
+            mtime = schematic_path.stat().st_mtime_ns
+        except OSError:
+            mtime = -1
+
+        cached_mtime = self._schematic_mtime.get(sch_key)
+        if sch_key not in self._schematic_cache or cached_mtime != mtime:
+            self._schematic_cache[sch_key] = Schematic(sch_key)
+            self._schematic_mtime[sch_key] = mtime
+
+            prefix = f"{schematic_path}:"
+            stale_keys = [key for key in self.pin_definition_cache if key.startswith(prefix)]
+            for key in stale_keys:
+                self.pin_definition_cache.pop(key, None)
+
+        return self._schematic_cache[sch_key]
 
     @staticmethod
     def parse_symbol_definition(symbol_def: list) -> Dict[str, Dict]:
@@ -172,13 +193,77 @@ class PinLocator:
 
         return (rotated_x, rotated_y)
 
+    @staticmethod
+    def transform_local_point(
+        x: float,
+        y: float,
+        symbol_x: float,
+        symbol_y: float,
+        rotation: float,
+        mirror_x: bool,
+        mirror_y: bool,
+    ) -> Tuple[float, float]:
+        """
+        Transform a library-local symbol point into schematic coordinates.
+
+        KiCad stores symbol library geometry in a y-up coordinate system while
+        schematic instances are displayed in y-down screen coordinates.
+        """
+        local_x, local_y = PinLocator.rotate_point(x, y, rotation)
+        schematic_x = local_x
+        schematic_y = -local_y
+
+        if mirror_x:
+            schematic_y = -schematic_y
+        if mirror_y:
+            schematic_x = -schematic_x
+
+        return (symbol_x + schematic_x, symbol_y + schematic_y)
+
+    @staticmethod
+    def transform_local_vector(
+        x: float,
+        y: float,
+        rotation: float,
+        mirror_x: bool,
+        mirror_y: bool,
+    ) -> Tuple[float, float]:
+        """Transform a direction vector using the same rules as symbol points."""
+        vector_x, vector_y = PinLocator.rotate_point(x, y, rotation)
+        schematic_x = vector_x
+        schematic_y = -vector_y
+
+        if mirror_x:
+            schematic_y = -schematic_y
+        if mirror_y:
+            schematic_x = -schematic_x
+
+        return (schematic_x, schematic_y)
+
+    @staticmethod
+    def _library_angle_to_vector(angle_degrees: float) -> Tuple[int, int]:
+        """Convert a KiCad library pin angle to a unit vector in library coordinates."""
+        angle = int(round(angle_degrees / 90.0)) % 4
+        mapping = {
+            0: (1, 0),
+            1: (0, 1),
+            2: (-1, 0),
+            3: (0, -1),
+        }
+        return mapping[angle]
+
+    @staticmethod
+    def _schematic_vector_to_angle(x: float, y: float) -> float:
+        """Convert a schematic direction vector to 0/right, 90/up, 180/left, 270/down."""
+        if abs(x) >= abs(y):
+            return 0.0 if x >= 0 else 180.0
+        return 270.0 if y >= 0 else 90.0
+
     def _get_lib_id(self, schematic_path: Path, symbol_reference: str) -> Optional[str]:
         """Helper: return the lib_id string for a placed symbol"""
         try:
             sch_key = str(schematic_path)
-            if sch_key not in self._schematic_cache:
-                self._schematic_cache[sch_key] = Schematic(sch_key)
-            sch = self._schematic_cache[sch_key]
+            sch = self._load_schematic(schematic_path)
             for symbol in sch.symbol:
                 if symbol.property.Reference.value == symbol_reference:
                     return symbol.lib_id.value if hasattr(symbol, "lib_id") else None
@@ -197,9 +282,7 @@ class PinLocator:
         """
         try:
             sch_key = str(schematic_path)
-            if sch_key not in self._schematic_cache:
-                self._schematic_cache[sch_key] = Schematic(sch_key)
-            sch = self._schematic_cache[sch_key]
+            sch = self._load_schematic(schematic_path)
 
             target_symbol = None
             for symbol in sch.symbol:
@@ -212,6 +295,15 @@ class PinLocator:
 
             symbol_at = target_symbol.at.value
             symbol_rotation = float(symbol_at[2]) if len(symbol_at) > 2 else 0.0
+            mirror_x = False
+            mirror_y = False
+            mirror_attr = getattr(target_symbol, "mirror", None)
+            if mirror_attr is not None and getattr(mirror_attr, "value", None) is not None:
+                mirror_value = str(mirror_attr.value)
+                if mirror_value == "x":
+                    mirror_x = True
+                elif mirror_value == "y":
+                    mirror_y = True
 
             lib_id = target_symbol.lib_id.value if hasattr(target_symbol, "lib_id") else None
             if not lib_id:
@@ -228,10 +320,20 @@ class PinLocator:
                 else:
                     return None
 
-            # Pin definition angle + symbol rotation = absolute outward direction
-            pin_def_angle = pins[pin_number].get("angle", 0)
-            absolute_angle = (pin_def_angle + symbol_rotation) % 360
-            return absolute_angle
+            # KiCad stores the pin angle as the inward direction from the
+            # connection point toward the symbol body. Routing needs the
+            # outward direction after instance rotation/mirroring.
+            inward_angle = float(pins[pin_number].get("angle", 0))
+            outward_angle = (inward_angle + 180.0) % 360.0
+            local_dx, local_dy = self._library_angle_to_vector(outward_angle)
+            schematic_dx, schematic_dy = self.transform_local_vector(
+                local_dx,
+                local_dy,
+                symbol_rotation,
+                mirror_x,
+                mirror_y,
+            )
+            return self._schematic_vector_to_angle(schematic_dx, schematic_dy)
 
         except Exception:
             return None
@@ -254,9 +356,7 @@ class PinLocator:
             # Load schematic with kicad-skip to get symbol instance
             # Use cache to avoid reloading the file for every pin lookup
             sch_key = str(schematic_path)
-            if sch_key not in self._schematic_cache:
-                self._schematic_cache[sch_key] = Schematic(sch_key)
-            sch = self._schematic_cache[sch_key]
+            sch = self._load_schematic(schematic_path)
 
             # Find the symbol instance
             target_symbol = None
@@ -275,6 +375,15 @@ class PinLocator:
             symbol_x = float(symbol_at[0])
             symbol_y = float(symbol_at[1])
             symbol_rotation = float(symbol_at[2]) if len(symbol_at) > 2 else 0.0
+            mirror_x = False
+            mirror_y = False
+            mirror_attr = getattr(target_symbol, "mirror", None)
+            if mirror_attr is not None and getattr(mirror_attr, "value", None) is not None:
+                mirror_value = str(mirror_attr.value)
+                if mirror_value == "x":
+                    mirror_x = True
+                elif mirror_value == "y":
+                    mirror_y = True
 
             # Get symbol lib_id
             lib_id = target_symbol.lib_id.value if hasattr(target_symbol, "lib_id") else None
@@ -319,14 +428,15 @@ class PinLocator:
 
             logger.debug(f"Pin {pin_number} relative position: ({pin_rel_x}, {pin_rel_y})")
 
-            # Apply symbol rotation to pin position
-            if symbol_rotation != 0:
-                pin_rel_x, pin_rel_y = self.rotate_point(pin_rel_x, pin_rel_y, symbol_rotation)
-                logger.debug(f"After rotation {symbol_rotation}°: ({pin_rel_x}, {pin_rel_y})")
-
-            # Calculate absolute position
-            abs_x = symbol_x + pin_rel_x
-            abs_y = symbol_y + pin_rel_y
+            abs_x, abs_y = self.transform_local_point(
+                pin_rel_x,
+                pin_rel_y,
+                symbol_x,
+                symbol_y,
+                symbol_rotation,
+                mirror_x,
+                mirror_y,
+            )
 
             logger.info(f"Pin {symbol_reference}/{pin_number} located at ({abs_x}, {abs_y})")
             return [abs_x, abs_y]
@@ -354,9 +464,7 @@ class PinLocator:
         try:
             # Load schematic (use cache)
             sch_key = str(schematic_path)
-            if sch_key not in self._schematic_cache:
-                self._schematic_cache[sch_key] = Schematic(sch_key)
-            sch = self._schematic_cache[sch_key]
+            sch = self._load_schematic(schematic_path)
 
             # Find symbol
             target_symbol = None

@@ -702,6 +702,9 @@ class KiCADInterface:
             footprint = component.get("footprint", "")
             x = component.get("x", 0)
             y = component.get("y", 0)
+            snap_to_grid = component.get("snapToGrid", True)
+            schematic_grid = component.get("grid", 1.27)
+            refresh_from_library = component.get("refreshFromLibrary", True)
 
             # Derive project path from schematic path for project-local library resolution
             schematic_file = Path(schematic_path)
@@ -718,12 +721,21 @@ class KiCADInterface:
                 x=x,
                 y=y,
                 project_path=derived_project_path,
+                snap_to_grid=snap_to_grid,
+                schematic_grid=schematic_grid,
+                refresh_symbol_definition=refresh_from_library,
             )
 
             return {
                 "success": True,
                 "component_reference": reference,
                 "symbol_source": f"{library}:{comp_type}",
+                "position": {
+                    "x": x,
+                    "y": y,
+                    "snapToGrid": snap_to_grid,
+                    "grid": schematic_grid,
+                },
             }
         except Exception as e:
             logger.error(f"Error adding component to schematic: {str(e)}")

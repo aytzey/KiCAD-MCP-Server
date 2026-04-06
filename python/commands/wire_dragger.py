@@ -152,16 +152,15 @@ class WireDragger:
         """
         Compute the world coordinate of a pin given the symbol transform.
 
-        KiCAD applies mirror first (in local space), then rotation, then translation.
-        mirror_x negates the local X axis; mirror_y negates the local Y axis.
+        Mirrors are expressed in schematic axes:
+        - ``mirror x`` flips schematic Y
+        - ``mirror y`` flips schematic X
         """
-        lx, ly = px, py
-        if mirror_x:
-            lx = -lx
-        if mirror_y:
-            ly = -ly
-        rx, ry = _rotate(lx, ly, rotation)
-        return sym_x + rx, sym_y + ry
+        from commands.pin_locator import PinLocator
+
+        return PinLocator.transform_local_point(
+            px, py, sym_x, sym_y, rotation, mirror_x, mirror_y
+        )
 
     @staticmethod
     def compute_pin_positions(

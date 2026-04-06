@@ -38,6 +38,7 @@ from commands.schematic_analysis import (
     find_wires_crossing_symbols,
     get_elements_in_region,
 )
+from commands.pin_locator import PinLocator
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -361,6 +362,28 @@ class TestComputeSymbolBbox:
         locator = PinLocator()
         result = compute_symbol_bbox(tmp, "NONEXISTENT", locator)
         assert result is None
+
+
+class TestPinLocatorIntegration:
+    """Integration coverage for placed-symbol pin locations and outward angles."""
+
+    def test_resistor_pin_location_and_angle_no_rotation(self):
+        tmp = _make_temp_schematic(_make_resistor_sexp("R1", 100, 100))
+        locator = PinLocator()
+
+        assert locator.get_pin_location(tmp, "R1", "1") == pytest.approx([100.0, 96.19])
+        assert locator.get_pin_location(tmp, "R1", "2") == pytest.approx([100.0, 103.81])
+        assert locator.get_pin_angle(tmp, "R1", "1") == pytest.approx(90.0)
+        assert locator.get_pin_angle(tmp, "R1", "2") == pytest.approx(270.0)
+
+    def test_resistor_pin_location_and_angle_rotated_90(self):
+        tmp = _make_temp_schematic(_make_resistor_sexp("R1", 100, 100, rotation=90))
+        locator = PinLocator()
+
+        assert locator.get_pin_location(tmp, "R1", "1") == pytest.approx([96.19, 100.0])
+        assert locator.get_pin_location(tmp, "R1", "2") == pytest.approx([103.81, 100.0])
+        assert locator.get_pin_angle(tmp, "R1", "1") == pytest.approx(180.0)
+        assert locator.get_pin_angle(tmp, "R1", "2") == pytest.approx(0.0)
 
 
 # ===================================================================
@@ -768,10 +791,10 @@ class TestTransformLocalPoint:
         assert y == pytest.approx(-2.0)
 
     def test_rotation_90(self):
-        # ly=0 negated is still 0, then rotate lx=1 by 90°
+        # Rotation is applied in library coordinates before schematic y inversion.
         x, y = _transform_local_point(1.0, 0.0, 0.0, 0.0, 90, False, False)
         assert x == pytest.approx(0.0, abs=1e-9)
-        assert y == pytest.approx(1.0, abs=1e-9)
+        assert y == pytest.approx(-1.0, abs=1e-9)
 
 
 # ===================================================================

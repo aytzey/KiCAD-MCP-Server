@@ -8,6 +8,11 @@ from skip import Schematic
 
 logger = logging.getLogger(__name__)
 
+
+def _snap_schematic_coordinate(value: float, grid: float = 1.27) -> float:
+    """Snap schematic placements to the conventional KiCad connection grid."""
+    return round(round(float(value) / grid) * grid, 4)
+
 # Import dynamic symbol loader
 try:
     from commands.dynamic_symbol_loader import DynamicSymbolLoader
@@ -243,6 +248,10 @@ class ComponentManager:
             # Set position
             x = component_def.get("x", 0)
             y = component_def.get("y", 0)
+            if component_def.get("snapToGrid", True):
+                grid = component_def.get("grid", 1.27)
+                x = _snap_schematic_coordinate(x, grid)
+                y = _snap_schematic_coordinate(y, grid)
             rotation = component_def.get("rotation", 0)
             new_symbol.at.value = [x, y, rotation]
             logger.debug(f"Set position to ({x}, {y}, {rotation})")
