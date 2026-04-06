@@ -37,6 +37,9 @@ def _python_env() -> Dict[str, str]:
 
 
 def _interface_python() -> str:
+    venv_python = _repo_root() / ".venv" / "bin" / "python"
+    if venv_python.exists():
+        return str(venv_python)
     return "/usr/bin/python3" if Path("/usr/bin/python3").exists() else sys.executable
 
 

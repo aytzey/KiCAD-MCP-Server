@@ -217,6 +217,13 @@ def _track_length_mm(track: Any) -> float:
         return 0.0
 
 
+def _track_width_mm(track: Any) -> float:
+    try:
+        return float(track.GetWidth()) / 1_000_000
+    except Exception:
+        return 0.0
+
+
 def _distance_mm(a: PointMm, b: PointMm) -> float:
     return math.hypot(a[0] - b[0], a[1] - b[1])
 
@@ -532,6 +539,7 @@ class AutorouteCFHACommands:
                 "track_length_mm": 0.0,
                 "track_count": 0,
                 "via_count": 0,
+                "min_track_width_mm": None,
                 "zones": [],
             }
 
@@ -571,6 +579,10 @@ class AutorouteCFHACommands:
             else:
                 nets[net_name]["track_count"] += 1
                 nets[net_name]["track_length_mm"] += _track_length_mm(item)
+                width_mm = _track_width_mm(item)
+                current_min = nets[net_name]["min_track_width_mm"]
+                if width_mm > 0 and (current_min is None or width_mm < current_min):
+                    nets[net_name]["min_track_width_mm"] = width_mm
 
         for zone in self._collect_zones(board):
             net_name = zone["net"]
@@ -605,9 +617,15 @@ class AutorouteCFHACommands:
         )
         has_ground_plane = any(_best_intent(zone["net"]) == "GROUND" for zone in zones)
 
+        intent_counts: Dict[str, int] = {}
+        for net_name in inventory:
+            intent_counts[_best_intent(net_name)] = intent_counts.get(_best_intent(net_name), 0) + 1
+
         inferred_profiles = []
         inferred_profiles.append("generic_4layer" if len(copper_layers) >= 4 else "generic_2layer")
-        if any(_best_intent(net_name) == "POWER_SWITCHING" for net_name in inventory):
+        if intent_counts.get("POWER_SWITCHING", 0) >= 2 or (
+            len(copper_layers) >= 4 and intent_counts.get("POWER_DC", 0) >= 3
+        ):
             inferred_profiles.append("power")
         if any(
             _best_intent(net_name) == "HS_SINGLE" or _diff_partner_name(net_name) in inventory
@@ -635,6 +653,7 @@ class AutorouteCFHACommands:
             "interfaces": params.get("interfaces", []),
             "backends": asdict(backends),
             "netInventory": inventory,
+            "intentCounts": intent_counts,
         }
 
     def extract_routing_intents(self, params: Dict[str, Any]) -> Dict[str, Any]:
@@ -693,6 +712,7 @@ class AutorouteCFHACommands:
             "intents": [asdict(intent) for intent in intents],
             "byIntent": by_intent,
             "analysisSummary": analysis.get("summary", {}),
+            "netInventory": inventory,
         }
 
     def generate_routing_constraints(self, params: Dict[str, Any]) -> Dict[str, Any]:
@@ -708,6 +728,7 @@ class AutorouteCFHACommands:
         merged_defaults = _profile_merge(profiles, interfaces)
         by_intent = intents_result["byIntent"]
         intents = intents_result["intents"]
+        inventory = intents_result.get("netInventory", {})
         seed = int(params.get("seed", 42))
         exclude_from_freerouting = list(
             dict.fromkeys(
@@ -717,6 +738,16 @@ class AutorouteCFHACommands:
                 + by_intent.get("POWER_SWITCHING", [])
             )
         )
+
+        power_target_width_mm = float(merged_defaults["power_min_width_mm"])
+        observed_power_widths = [
+            float(inventory[net]["min_track_width_mm"])
+            for net in by_intent.get("POWER_DC", [])
+            if net in inventory and inventory[net].get("min_track_width_mm") is not None
+        ]
+        power_rule_min_width_mm = power_target_width_mm
+        if observed_power_widths:
+            power_rule_min_width_mm = min(power_target_width_mm, min(observed_power_widths))
 
         compiled_rules: List[Dict[str, Any]] = []
         hs_diff_condition = _condition_for_nets(by_intent.get("HS_DIFF", []))
@@ -763,7 +794,7 @@ class AutorouteCFHACommands:
                     "name": "cfha_power_min_width",
                     "condition": power_condition,
                     "constraint": "track_width",
-                    "min": merged_defaults["power_min_width_mm"],
+                    "min": round(power_rule_min_width_mm, 4),
                 }
             )
 
@@ -795,6 +826,13 @@ class AutorouteCFHACommands:
             "intents": intents,
             "intentGroups": by_intent,
             "defaults": merged_defaults,
+            "derived": {
+                "powerTargetWidthMm": round(power_target_width_mm, 4),
+                "powerRuleMinWidthMm": round(power_rule_min_width_mm, 4),
+                "observedPowerMinWidthMm": round(min(observed_power_widths), 4)
+                if observed_power_widths
+                else None,
+            },
             "compiledRules": compiled_rules,
             "excludeFromFreeRouting": exclude_from_freerouting,
             "criticalClasses": params.get(
@@ -898,7 +936,12 @@ class AutorouteCFHACommands:
 
             width_mm = float(params.get("criticalWidthMm") or 0.25)
             if intent["intent"] in {"POWER_DC", "POWER_SWITCHING"}:
-                width_mm = max(width_mm, float(constraints["defaults"]["power_min_width_mm"]))
+                power_target = float(
+                    constraints.get("derived", {}).get(
+                        "powerTargetWidthMm", constraints["defaults"]["power_min_width_mm"]
+                    )
+                )
+                width_mm = max(width_mm, power_target)
 
             same_layer_ipc = False
             result: Dict[str, Any]
@@ -1162,6 +1205,8 @@ class AutorouteCFHACommands:
         via_count = 0
         power_misuse_flags: List[Dict[str, Any]] = []
         return_path_risk_flags: List[Dict[str, Any]] = []
+        copper_layers = self._board_layers(board)
+        prefer_power_zones = len(copper_layers) >= 4
 
         for intent in intents_result["intents"]:
             net_name = intent["net_name"]
@@ -1176,7 +1221,11 @@ class AutorouteCFHACommands:
                 if has_copper:
                     completed_nets += 1
 
-            if intent["intent"] in {"POWER_DC", "POWER_SWITCHING"} and not info.get("zones"):
+            if (
+                prefer_power_zones
+                and intent["intent"] in {"POWER_DC", "POWER_SWITCHING"}
+                and not info.get("zones")
+            ):
                 power_misuse_flags.append(
                     {
                         "net": net_name,

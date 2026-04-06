@@ -125,6 +125,38 @@ def test_detect_backends_prefers_external_orthoroute_with_gpu(monkeypatch):
     assert backends.critical_router_default == "orthoroute-external"
 
 
+def test_generate_constraints_clamps_power_rule_to_existing_board_width(tmp_path):
+    commands = AutorouteCFHACommands()
+    result = commands.generate_routing_constraints(
+        {
+            "intentResult": {
+                "success": True,
+                "boardPath": str(tmp_path / "demo.kicad_pcb"),
+                "profiles": ["generic_2layer", "power"],
+                "interfaces": [],
+                "analysisSummary": {"copperLayers": ["F.Cu", "B.Cu"]},
+                "byIntent": {"POWER_DC": ["+5V"], "GROUND": ["GND"]},
+                "intents": [
+                    {"net_name": "+5V", "intent": "POWER_DC", "track_length_mm": 10.0},
+                    {"net_name": "GND", "intent": "GROUND", "track_length_mm": 0.0},
+                ],
+                "netInventory": {
+                    "+5V": {"min_track_width_mm": 0.5},
+                    "GND": {"min_track_width_mm": None},
+                },
+            }
+        }
+    )
+
+    assert result["success"] is True
+    assert result["constraints"]["derived"]["powerTargetWidthMm"] == 1.0
+    assert result["constraints"]["derived"]["powerRuleMinWidthMm"] == 0.5
+    power_rule = next(
+        rule for rule in result["constraints"]["compiledRules"] if rule["name"] == "cfha_power_min_width"
+    )
+    assert power_rule["min"] == 0.5
+
+
 def test_autoroute_default_pipeline_returns_artifacts(monkeypatch, tmp_path):
     board = MagicMock()
     board.GetFileName.return_value = str(tmp_path / "demo.kicad_pcb")
