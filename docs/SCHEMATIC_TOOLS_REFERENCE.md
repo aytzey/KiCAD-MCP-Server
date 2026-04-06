@@ -3,7 +3,25 @@
 Added in: v2.1.0, expanded in v2.2.0-v2.2.3
 Contributors: @Mehanik (PRs #60, #66), @Kletternaut (PR #57)
 
-This document provides a complete reference for the 27 schematic tools in the KiCAD MCP Server. These tools enable a complete schematic design workflow, from creating projects and adding components to wiring, validation, and synchronization with PCB boards. The dynamic symbol loading feature provides access to approximately 10,000 standard KiCad symbols.
+This document provides a complete reference for the 28 schematic tools in the KiCAD MCP Server. These tools enable a complete schematic design workflow, from creating projects and adding components to wiring, validation, and synchronization with PCB boards. The dynamic symbol loading feature provides access to approximately 10,000 standard KiCad symbols.
+
+## Built-in Readability Guard
+
+The schematic harness now enforces a readability gate after schematic mutations. New schematic edits are reverted if they introduce new readability violations such as:
+
+- symbol or label overlap
+- duplicate collinear wires
+- wires crossing through symbol bodies
+- visible fields placed inside symbol bodies
+- off-grid symbol or wire placements
+
+The guard is aligned with KiCad's own schematic editor guidance:
+
+- use the recommended 50 mil / 1.27 mm grid for symbols and wires
+- only wire ends make connections; use junctions for intentional crossings
+- use power symbols for power and ground nets
+- mark intentionally unused pins with no-connect flags
+- keep visible symbol fields outside crowded symbol bodies
 
 ## Component Operations (8 tools)
 
@@ -271,7 +289,19 @@ Generate a netlist from the schematic.
 
 **Usage Notes:** Returns a complete netlist with component information (reference, value, footprint) and net connections (net name with all connected component/pin pairs).
 
-## Validation and Synchronization (3 tools)
+## Validation and Synchronization (4 tools)
+
+### check_schematic_readability
+
+Run the full schematic readability report used by the MCP harness.
+
+| Parameter     | Type   | Required | Description                                                |
+| ------------- | ------ | -------- | ---------------------------------------------------------- |
+| schematicPath | string | Yes      | Path to the .kicad_sch file                                |
+| tolerance     | number | No       | Overlap tolerance in mm for label and wire checks          |
+| grid          | number | No       | Expected placement grid in mm (default: 1.27)              |
+
+**Usage Notes:** This combines overlap detection, wire-through-symbol detection, visible field placement checks, and off-grid detection into a single readability report. Use it before exporting or after major schematic edits when you want a single quality summary.
 
 ### run_erc
 

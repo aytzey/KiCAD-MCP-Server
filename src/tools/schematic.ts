@@ -5,6 +5,9 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 
+const SCHEMATIC_READABILITY_RULES =
+  "Readability rules: keep symbols and wires on the 1.27 mm (50 mil) grid; keep visible fields outside symbol bodies; use power symbols for power/ground nets; use junctions for intentional crossings; never route wires through symbols. The backend now rejects mutations that introduce new readability violations.";
+
 export function registerSchematicTools(server: McpServer, callKicadScript: Function) {
   // Create schematic tool
   server.tool(
@@ -30,7 +33,7 @@ export function registerSchematicTools(server: McpServer, callKicadScript: Funct
   // Add component to schematic
   server.tool(
     "add_schematic_component",
-    "Add a component to the schematic. Symbol format is 'Library:SymbolName' (e.g., 'Device:R', 'EDA-MCP:ESP32-C3')",
+    `Add a component to the schematic. Symbol format is 'Library:SymbolName' (e.g., 'Device:R', 'EDA-MCP:ESP32-C3'). Place symbols on the 1.27 mm grid with enough spacing that bodies and visible fields do not overlap. ${SCHEMATIC_READABILITY_RULES}`,
     {
       schematicPath: z.string().describe("Path to the schematic file"),
       symbol: z
@@ -146,7 +149,8 @@ To remove a footprint from a PCB, use delete_component instead.`,
 
 Use this tool to assign or update a footprint, change the value, or rename the reference
 of an already-placed component. This is more efficient than delete + re-add because it
-preserves the component's position and UUID.
+preserves the component's position and UUID. Use fieldPositions to move visible fields
+outside the symbol body when needed. ${SCHEMATIC_READABILITY_RULES}
 
 Note: operates on .kicad_sch files only. To modify a PCB footprint use edit_component.`,
     {
@@ -248,7 +252,7 @@ Note: operates on .kicad_sch files only. To modify a PCB footprint use edit_comp
   // Draw wire between coordinate waypoints with optional pin snapping
   server.tool(
     "add_schematic_wire",
-    "Draws a wire on the schematic between two or more coordinate points. Always call get_schematic_pin_locations first to get the approximate pin coordinates, then pass them as the first and last waypoints. snapToPins (on by default) will correct any float imprecision by snapping endpoints to the exact nearest pin coordinate. To route around components, add intermediate waypoints between the start and end: e.g. [[x1,y1], [xMid,y1], [xMid,y2], [x2,y2]] routes horizontally then vertically. Intermediate waypoints are never snapped.",
+    `Draws a wire on the schematic between two or more coordinate points. Always call get_schematic_pin_locations first to get the approximate pin coordinates, then pass them as the first and last waypoints. snapToPins (on by default) will correct any float imprecision by snapping endpoints to the exact nearest pin coordinate. To route around components, add intermediate waypoints between the start and end: e.g. [[x1,y1], [xMid,y1], [xMid,y2], [x2,y2]] routes horizontally then vertically. Intermediate waypoints are never snapped. ${SCHEMATIC_READABILITY_RULES}`,
     {
       schematicPath: z.string().describe("Path to the .kicad_sch file"),
       waypoints: z
@@ -325,7 +329,7 @@ Note: operates on .kicad_sch files only. To modify a PCB footprint use edit_comp
   // Add net label
   server.tool(
     "add_schematic_net_label",
-    "Add a net label to the schematic",
+    `Add a net label to the schematic. Place labels on real wire or pin endpoints only, and do not stack labels on top of other labels or symbol bodies. ${SCHEMATIC_READABILITY_RULES}`,
     {
       schematicPath: z.string().describe("Path to the schematic file"),
       netName: z.string().describe("Name of the net (e.g., VCC, GND, SIGNAL_1)"),
@@ -358,7 +362,7 @@ Note: operates on .kicad_sch files only. To modify a PCB footprint use edit_comp
   // Connect pin to net
   server.tool(
     "connect_to_net",
-    "Connect a component pin to a named net",
+    `Connect a component pin to a named net. Prefer this over manual label placement when you want a clean stub from a known pin. For power and ground nets, prefer dedicated power symbols instead of plain text labels. ${SCHEMATIC_READABILITY_RULES}`,
     {
       schematicPath: z.string().describe("Path to the schematic file"),
       componentRef: z.string().describe("Component reference (e.g., U1, R1)"),
@@ -505,7 +509,7 @@ Note: operates on .kicad_sch files only. To modify a PCB footprint use edit_comp
   // Connect all pins of source connector to matching pins of target connector (passthrough)
   server.tool(
     "connect_passthrough",
-    "Connects all pins of a source connector (e.g. J1) to matching pins of a target connector (e.g. J2) via shared net labels — pin N gets net '{netPrefix}_{N}'. Use this for FFC/ribbon cable passthrough adapters instead of calling connect_to_net for every pin.",
+    `Connects all pins of a source connector (e.g. J1) to matching pins of a target connector (e.g. J2) via shared net labels — pin N gets net '{netPrefix}_{N}'. Use this for FFC/ribbon cable passthrough adapters instead of calling connect_to_net for every pin. Leave enough space between connectors so repeated labels do not collide. ${SCHEMATIC_READABILITY_RULES}`,
     {
       schematicPath: z.string().describe("Path to the schematic file"),
       sourceRef: z.string().describe("Source connector reference (e.g. J1)"),
@@ -720,7 +724,7 @@ Note: operates on .kicad_sch files only. To modify a PCB footprint use edit_comp
   // Move a placed symbol, dragging connected wires
   server.tool(
     "move_schematic_component",
-    "Move a placed symbol to a new position in the schematic. By default (preserveWires=true) wire endpoints touching the component's pins are stretched to follow the new position.",
+    `Move a placed symbol to a new position in the schematic. By default (preserveWires=true) wire endpoints touching the component's pins are stretched to follow the new position. Use this to open space between crowded symbols and to keep fields readable. ${SCHEMATIC_READABILITY_RULES}`,
     {
       schematicPath: z.string().describe("Path to the .kicad_sch file"),
       reference: z.string().describe("Reference designator (e.g., R1, U1)"),
@@ -770,7 +774,7 @@ Note: operates on .kicad_sch files only. To modify a PCB footprint use edit_comp
   // Rotate schematic component
   server.tool(
     "rotate_schematic_component",
-    "Rotate a placed symbol in the schematic.",
+    `Rotate a placed symbol in the schematic. Use rotation to keep power pins up, ground pins down, and text readable. ${SCHEMATIC_READABILITY_RULES}`,
     {
       schematicPath: z.string().describe("Path to the .kicad_sch file"),
       reference: z.string().describe("Reference designator (e.g., R1, U1)"),
@@ -1197,10 +1201,62 @@ Note: operates on .kicad_sch files only. To modify a PCB footprint use edit_comp
     },
   );
 
+  // Full readability report
+  server.tool(
+    "check_schematic_readability",
+    "Run the full schematic readability report. This checks overlaps, wires crossing symbol bodies, visible fields placed inside symbol bodies, and off-grid symbol or wire placements against KiCad-aligned readability rules.",
+    {
+      schematicPath: z.string().describe("Path to the .kicad_sch schematic file"),
+      tolerance: z
+        .number()
+        .optional()
+        .describe("Overlap tolerance in mm for label and wire comparisons (default: 0.5)"),
+      grid: z
+        .number()
+        .optional()
+        .describe("Expected schematic placement grid in mm (default: 1.27)"),
+    },
+    async (args: { schematicPath: string; tolerance?: number; grid?: number }) => {
+      const result = await callKicadScript("check_schematic_readability", args);
+      if (result.success) {
+        const counts = result.counts ?? {};
+        const lines = [
+          `Readability: ${result.totalIssues} issue(s)`,
+          `  overlaps: ${counts.overlaps ?? 0}`,
+          `  wireCrossings: ${counts.wireCrossings ?? 0}`,
+          `  fieldIssues: ${counts.fieldIssues ?? 0}`,
+          `  offGridItems: ${counts.offGridItems ?? 0}`,
+        ];
+        const fieldIssues: any[] = result.fieldIssues || [];
+        if (fieldIssues.length) {
+          lines.push("\nField issues:");
+          fieldIssues.slice(0, 10).forEach((issue: any) => {
+            lines.push(
+              `  ${issue.reference}.${issue.field} @ (${issue.position.x}, ${issue.position.y}) [${issue.type}]`,
+            );
+          });
+        }
+        const offGridItems: any[] = result.offGridItems || [];
+        if (offGridItems.length) {
+          lines.push("\nOff-grid items:");
+          offGridItems.slice(0, 10).forEach((issue: any) => {
+            lines.push(
+              `  ${issue.type} ${issue.name} @ (${issue.position.x}, ${issue.position.y})`,
+            );
+          });
+        }
+        return { content: [{ type: "text", text: lines.join("\n") }] };
+      }
+      return {
+        content: [{ type: "text", text: `Failed: ${result.message || "Unknown error"}` }],
+      };
+    },
+  );
+
   // Find overlapping elements
   server.tool(
     "find_overlapping_elements",
-    "Detect spatially overlapping symbols, wires, and labels in the schematic. Finds duplicate power symbols at the same position, collinear overlapping wires, and labels stacked on top of each other.",
+    "Detect spatially overlapping symbols, wires, and labels in the schematic. Finds duplicate power symbols at the same position, collinear overlapping wires, and labels stacked on top of each other. This is one part of the built-in readability gate.",
     {
       schematicPath: z.string().describe("Path to the .kicad_sch schematic file"),
       tolerance: z

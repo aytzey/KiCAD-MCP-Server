@@ -12,6 +12,7 @@ import logging
 import os
 import sys
 import traceback
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 from resources.resource_definitions import RESOURCE_DEFINITIONS, handle_resource_read
@@ -399,6 +400,7 @@ class KiCADInterface:
             "export_schematic_svg": self._handle_export_schematic_svg,
             # Schematic analysis tools (read-only)
             "get_schematic_view_region": self._handle_get_schematic_view_region,
+            "check_schematic_readability": self._handle_check_schematic_readability,
             "find_overlapping_elements": self._handle_find_overlapping_elements,
             "get_elements_in_region": self._handle_get_elements_in_region,
             "find_wires_crossing_symbols": self._handle_find_wires_crossing_symbols,
@@ -433,6 +435,74 @@ class KiCADInterface:
         }
 
         logger.info(f"KiCAD interface initialized (backend: {'IPC' if self.use_ipc else 'SWIG'})")
+
+    def _check_schematic_readability(self, schematic_path: str) -> Dict[str, Any]:
+        """Run the schematic readability checks used by the MCP quality gate."""
+        from commands.schematic_analysis import check_schematic_readability
+
+        return check_schematic_readability(Path(schematic_path))
+
+    def _guard_schematic_mutation(
+        self,
+        schematic_path: str,
+        operation_name: str,
+        mutate_fn,
+    ) -> Dict[str, Any]:
+        """
+        Protect schematic mutations with a before/after readability comparison.
+
+        If a mutation introduces new readability violations, restore the original
+        file contents and return a failure so the agent retries with a cleaner
+        placement or routing strategy.
+        """
+        sch_path = Path(schematic_path)
+        if not sch_path.exists():
+            return {"success": False, "message": f"Schematic not found: {schematic_path}"}
+
+        original_text = sch_path.read_text(encoding="utf-8")
+        before_report = self._check_schematic_readability(schematic_path)
+        before_signatures = set(before_report.get("issueSignatures", []))
+
+        try:
+            result = mutate_fn()
+        except Exception:
+            current_text = sch_path.read_text(encoding="utf-8")
+            if current_text != original_text:
+                sch_path.write_text(original_text, encoding="utf-8")
+            raise
+
+        if not result.get("success"):
+            current_text = sch_path.read_text(encoding="utf-8")
+            if current_text != original_text:
+                sch_path.write_text(original_text, encoding="utf-8")
+            return result
+
+        after_report = self._check_schematic_readability(schematic_path)
+        after_signatures = set(after_report.get("issueSignatures", []))
+        new_signatures = sorted(after_signatures - before_signatures)
+
+        if new_signatures:
+            sch_path.write_text(original_text, encoding="utf-8")
+            issue_messages = after_report.get("issueMessages", {})
+            readable = [issue_messages.get(sig, sig) for sig in new_signatures[:6]]
+            details = "; ".join(readable)
+            if len(new_signatures) > 6:
+                details += f"; ... and {len(new_signatures) - 6} more"
+            return {
+                "success": False,
+                "message": (
+                    f"{operation_name} reverted by schematic readability gate: "
+                    f"introduced {len(new_signatures)} new issue(s): {details}"
+                ),
+                "readability": after_report,
+                "newIssues": new_signatures,
+            }
+
+        result["readability"] = {
+            "remainingIssues": after_report.get("totalIssues", 0),
+            "counts": after_report.get("counts", {}),
+        }
+        return result
 
     # Commands that can be handled via IPC for real-time updates
     IPC_CAPABLE_COMMANDS = {
@@ -683,8 +753,6 @@ class KiCADInterface:
         """Add a component to a schematic using text-based injection (no sexpdata)"""
         logger.info("Adding component to schematic")
         try:
-            from pathlib import Path
-
             from commands.dynamic_symbol_loader import DynamicSymbolLoader
 
             schematic_path = params.get("schematicPath")
@@ -703,28 +771,35 @@ class KiCADInterface:
             x = component.get("x", 0)
             y = component.get("y", 0)
 
-            # Derive project path from schematic path for project-local library resolution
-            schematic_file = Path(schematic_path)
-            derived_project_path = schematic_file.parent
+            def _mutate():
+                # Derive project path from schematic path for project-local library resolution
+                schematic_file = Path(schematic_path)
+                derived_project_path = schematic_file.parent
 
-            loader = DynamicSymbolLoader(project_path=derived_project_path)
-            loader.add_component(
-                schematic_file,
-                library,
-                comp_type,
-                reference=reference,
-                value=value,
-                footprint=footprint,
-                x=x,
-                y=y,
-                project_path=derived_project_path,
+                loader = DynamicSymbolLoader(project_path=derived_project_path)
+                loader.add_component(
+                    schematic_file,
+                    library,
+                    comp_type,
+                    reference=reference,
+                    value=value,
+                    footprint=footprint,
+                    x=x,
+                    y=y,
+                    project_path=derived_project_path,
+                )
+
+                return {
+                    "success": True,
+                    "component_reference": reference,
+                    "symbol_source": f"{library}:{comp_type}",
+                }
+
+            return self._guard_schematic_mutation(
+                schematic_path,
+                "add_schematic_component",
+                _mutate,
             )
-
-            return {
-                "success": True,
-                "component_reference": reference,
-                "symbol_source": f"{library}:{comp_type}",
-            }
         except Exception as e:
             logger.error(f"Error adding component to schematic: {str(e)}")
             import traceback
@@ -845,7 +920,6 @@ class KiCADInterface:
         logger.info("Editing schematic component")
         try:
             import re
-            from pathlib import Path
 
             schematic_path = params.get("schematicPath")
             reference = params.get("reference")
@@ -880,109 +954,115 @@ class KiCADInterface:
                     "message": f"Schematic not found: {schematic_path}",
                 }
 
-            with open(sch_file, "r", encoding="utf-8") as f:
-                content = f.read()
+            def _mutate():
+                with open(sch_file, "r", encoding="utf-8") as f:
+                    content = f.read()
 
-            def find_matching_paren(s, start):
-                """Find the position of the closing paren matching the opening paren at start."""
-                depth = 0
-                i = start
-                while i < len(s):
-                    if s[i] == "(":
-                        depth += 1
-                    elif s[i] == ")":
-                        depth -= 1
-                        if depth == 0:
-                            return i
-                    i += 1
-                return -1
+                def find_matching_paren(s, start):
+                    """Find the position of the closing paren matching the opening paren at start."""
+                    depth = 0
+                    i = start
+                    while i < len(s):
+                        if s[i] == "(":
+                            depth += 1
+                        elif s[i] == ")":
+                            depth -= 1
+                            if depth == 0:
+                                return i
+                        i += 1
+                    return -1
 
-            # Skip lib_symbols section
-            lib_sym_pos = content.find("(lib_symbols")
-            lib_sym_end = find_matching_paren(content, lib_sym_pos) if lib_sym_pos >= 0 else -1
-
-            # Find placed symbol blocks that match the reference
-            # Search for (symbol (lib_id "...") ... (property "Reference" "<ref>" ...) ...)
-            block_start = block_end = None
-            search_start = 0
-            pattern = re.compile(r'\(symbol\s+\(lib_id\s+"')
-            while True:
-                m = pattern.search(content, search_start)
-                if not m:
-                    break
-                pos = m.start()
-                # Skip if inside lib_symbols section
-                if lib_sym_pos >= 0 and lib_sym_pos <= pos <= lib_sym_end:
-                    search_start = lib_sym_end + 1
-                    continue
-                end = find_matching_paren(content, pos)
-                if end < 0:
-                    search_start = pos + 1
-                    continue
-                block_text = content[pos : end + 1]
-                if re.search(
-                    r'\(property\s+"Reference"\s+"' + re.escape(reference) + r'"',
-                    block_text,
-                ):
-                    block_start, block_end = pos, end
-                    break
-                search_start = end + 1
-
-            if block_start is None:
-                return {
-                    "success": False,
-                    "message": f"Component '{reference}' not found in schematic",
-                }
-
-            # Apply property replacements within the found block
-            block_text = content[block_start : block_end + 1]
-            if new_footprint is not None:
-                block_text = re.sub(
-                    r'(\(property\s+"Footprint"\s+)"[^"]*"',
-                    rf'\1"{new_footprint}"',
-                    block_text,
+                lib_sym_pos = content.find("(lib_symbols")
+                lib_sym_end = (
+                    find_matching_paren(content, lib_sym_pos) if lib_sym_pos >= 0 else -1
                 )
-            if new_value is not None:
-                block_text = re.sub(
-                    r'(\(property\s+"Value"\s+)"[^"]*"', rf'\1"{new_value}"', block_text
-                )
-            if new_reference is not None:
-                block_text = re.sub(
-                    r'(\(property\s+"Reference"\s+)"[^"]*"',
-                    rf'\1"{new_reference}"',
-                    block_text,
-                )
-            if field_positions is not None:
-                for field_name, pos in field_positions.items():
-                    x = pos.get("x", 0)
-                    y = pos.get("y", 0)
-                    angle = pos.get("angle", 0)
+
+                block_start = block_end = None
+                search_start = 0
+                pattern = re.compile(r'\(symbol\s+\(lib_id\s+"')
+                while True:
+                    m = pattern.search(content, search_start)
+                    if not m:
+                        break
+                    pos = m.start()
+                    if lib_sym_pos >= 0 and lib_sym_pos <= pos <= lib_sym_end:
+                        search_start = lib_sym_end + 1
+                        continue
+                    end = find_matching_paren(content, pos)
+                    if end < 0:
+                        search_start = pos + 1
+                        continue
+                    block_text = content[pos : end + 1]
+                    if re.search(
+                        r'\(property\s+"Reference"\s+"' + re.escape(reference) + r'"',
+                        block_text,
+                    ):
+                        block_start, block_end = pos, end
+                        break
+                    search_start = end + 1
+
+                if block_start is None:
+                    return {
+                        "success": False,
+                        "message": f"Component '{reference}' not found in schematic",
+                    }
+
+                block_text = content[block_start : block_end + 1]
+                if new_footprint is not None:
                     block_text = re.sub(
-                        r'(\(property\s+"'
-                        + re.escape(field_name)
-                        + r'"\s+"[^"]*"\s+)\(at\s+[\d\.\-]+\s+[\d\.\-]+\s+[\d\.\-]+\s*\)',
-                        rf"\1(at {x} {y} {angle})",
+                        r'(\(property\s+"Footprint"\s+)"[^"]*"',
+                        rf'\1"{new_footprint}"',
                         block_text,
                     )
+                if new_value is not None:
+                    block_text = re.sub(
+                        r'(\(property\s+"Value"\s+)"[^"]*"',
+                        rf'\1"{new_value}"',
+                        block_text,
+                    )
+                if new_reference is not None:
+                    block_text = re.sub(
+                        r'(\(property\s+"Reference"\s+)"[^"]*"',
+                        rf'\1"{new_reference}"',
+                        block_text,
+                    )
+                if field_positions is not None:
+                    for field_name, pos in field_positions.items():
+                        x = pos.get("x", 0)
+                        y = pos.get("y", 0)
+                        angle = pos.get("angle", 0)
+                        block_text = re.sub(
+                            r'(\(property\s+"'
+                            + re.escape(field_name)
+                            + r'"\s+"[^"]*"\s+)\(at\s+[\d\.\-]+\s+[\d\.\-]+\s+[\d\.\-]+\s*\)',
+                            rf"\1(at {x} {y} {angle})",
+                            block_text,
+                        )
 
-            content = content[:block_start] + block_text + content[block_end + 1 :]
+                content = content[:block_start] + block_text + content[block_end + 1 :]
 
-            with open(sch_file, "w", encoding="utf-8") as f:
-                f.write(content)
+                with open(sch_file, "w", encoding="utf-8") as f:
+                    f.write(content)
 
-            changes = {
-                k: v
-                for k, v in {
-                    "footprint": new_footprint,
-                    "value": new_value,
-                    "reference": new_reference,
-                }.items()
-                if v is not None
-            }
-            if field_positions is not None:
-                changes["fieldPositions"] = field_positions
-            logger.info(f"Edited schematic component {reference}: {changes}")
-            return {"success": True, "reference": reference, "updated": changes}
+                changes = {
+                    k: v
+                    for k, v in {
+                        "footprint": new_footprint,
+                        "value": new_value,
+                        "reference": new_reference,
+                    }.items()
+                    if v is not None
+                }
+                if field_positions is not None:
+                    changes["fieldPositions"] = field_positions
+                logger.info(f"Edited schematic component {reference}: {changes}")
+                return {"success": True, "reference": reference, "updated": changes}
+
+            return self._guard_schematic_mutation(
+                schematic_path,
+                "edit_schematic_component",
+                _mutate,
+            )
 
         except Exception as e:
             logger.error(f"Error editing schematic component: {e}")
@@ -1118,8 +1198,6 @@ class KiCADInterface:
         """Add a wire to a schematic using WireManager, with optional pin snapping"""
         logger.info("Adding wire to schematic")
         try:
-            from pathlib import Path
-
             from commands.wire_manager import WireManager
 
             schematic_path = params.get("schematicPath")
@@ -1203,30 +1281,35 @@ class KiCADInterface:
             stroke_width = properties.get("stroke_width", 0)
             stroke_type = properties.get("stroke_type", "default")
 
-            # Use WireManager for S-expression manipulation
-            if len(points) == 2:
-                success = WireManager.add_wire(
-                    Path(schematic_path),
-                    points[0],
-                    points[1],
-                    stroke_width=stroke_width,
-                    stroke_type=stroke_type,
-                )
-            else:
-                success = WireManager.add_polyline_wire(
-                    Path(schematic_path),
-                    points,
-                    stroke_width=stroke_width,
-                    stroke_type=stroke_type,
-                )
+            def _mutate():
+                if len(points) == 2:
+                    success = WireManager.add_wire(
+                        Path(schematic_path),
+                        points[0],
+                        points[1],
+                        stroke_width=stroke_width,
+                        stroke_type=stroke_type,
+                    )
+                else:
+                    success = WireManager.add_polyline_wire(
+                        Path(schematic_path),
+                        points,
+                        stroke_width=stroke_width,
+                        stroke_type=stroke_type,
+                    )
 
-            if success:
-                message = "Wire added successfully"
-                if snapped_info:
-                    message += "; " + "; ".join(snapped_info)
-                return {"success": True, "message": message}
-            else:
+                if success:
+                    message = "Wire added successfully"
+                    if snapped_info:
+                        message += "; " + "; ".join(snapped_info)
+                    return {"success": True, "message": message}
                 return {"success": False, "message": "Failed to add wire"}
+
+            return self._guard_schematic_mutation(
+                schematic_path,
+                "add_schematic_wire",
+                _mutate,
+            )
         except Exception as e:
             logger.error(f"Error adding wire to schematic: {str(e)}")
             import traceback
@@ -1242,8 +1325,6 @@ class KiCADInterface:
         """Add a junction (connection dot) to a schematic using WireManager"""
         logger.info("Adding junction to schematic")
         try:
-            from pathlib import Path
-
             from commands.wire_manager import WireManager
 
             schematic_path = params.get("schematicPath")
@@ -1254,12 +1335,18 @@ class KiCADInterface:
             if not position:
                 return {"success": False, "message": "Position is required"}
 
-            success = WireManager.add_junction(Path(schematic_path), position)
+            def _mutate():
+                success = WireManager.add_junction(Path(schematic_path), position)
 
-            if success:
-                return {"success": True, "message": "Junction added successfully"}
-            else:
+                if success:
+                    return {"success": True, "message": "Junction added successfully"}
                 return {"success": False, "message": "Failed to add junction"}
+
+            return self._guard_schematic_mutation(
+                schematic_path,
+                "add_schematic_junction",
+                _mutate,
+            )
         except Exception as e:
             logger.error(f"Error adding junction to schematic: {str(e)}")
             import traceback
@@ -1516,8 +1603,6 @@ class KiCADInterface:
         """Add a net label to schematic using WireManager"""
         logger.info("Adding net label to schematic")
         try:
-            from pathlib import Path
-
             from commands.wire_manager import WireManager
 
             schematic_path = params.get("schematicPath")
@@ -1531,22 +1616,27 @@ class KiCADInterface:
             if not all([schematic_path, net_name, position]):
                 return {"success": False, "message": "Missing required parameters"}
 
-            # Use WireManager for S-expression manipulation
-            success = WireManager.add_label(
-                Path(schematic_path),
-                net_name,
-                position,
-                label_type=label_type,
-                orientation=orientation,
-            )
+            def _mutate():
+                success = WireManager.add_label(
+                    Path(schematic_path),
+                    net_name,
+                    position,
+                    label_type=label_type,
+                    orientation=orientation,
+                )
 
-            if success:
-                return {
-                    "success": True,
-                    "message": f"Added net label '{net_name}' at {position}",
-                }
-            else:
+                if success:
+                    return {
+                        "success": True,
+                        "message": f"Added net label '{net_name}' at {position}",
+                    }
                 return {"success": False, "message": "Failed to add net label"}
+
+            return self._guard_schematic_mutation(
+                schematic_path,
+                "add_schematic_net_label",
+                _mutate,
+            )
         except Exception as e:
             logger.error(f"Error adding net label: {str(e)}")
             import traceback
@@ -1562,8 +1652,6 @@ class KiCADInterface:
         """Connect a component pin to a named net using wire stub and label"""
         logger.info("Connecting component pin to net")
         try:
-            from pathlib import Path
-
             schematic_path = params.get("schematicPath")
             component_ref = params.get("componentRef")
             pin_name = params.get("pinName")
@@ -1572,18 +1660,23 @@ class KiCADInterface:
             if not all([schematic_path, component_ref, pin_name, net_name]):
                 return {"success": False, "message": "Missing required parameters"}
 
-            # Use ConnectionManager with new WireManager integration
-            success = ConnectionManager.connect_to_net(
-                Path(schematic_path), component_ref, pin_name, net_name
-            )
+            def _mutate():
+                success = ConnectionManager.connect_to_net(
+                    Path(schematic_path), component_ref, pin_name, net_name
+                )
 
-            if success:
-                return {
-                    "success": True,
-                    "message": f"Connected {component_ref}/{pin_name} to net '{net_name}'",
-                }
-            else:
+                if success:
+                    return {
+                        "success": True,
+                        "message": f"Connected {component_ref}/{pin_name} to net '{net_name}'",
+                    }
                 return {"success": False, "message": "Failed to connect to net"}
+
+            return self._guard_schematic_mutation(
+                schematic_path,
+                "connect_to_net",
+                _mutate,
+            )
         except Exception as e:
             logger.error(f"Error connecting to net: {str(e)}")
             import traceback
@@ -1599,8 +1692,6 @@ class KiCADInterface:
         """Connect all pins of source connector to matching pins of target connector"""
         logger.info("Connecting passthrough between two connectors")
         try:
-            from pathlib import Path
-
             schematic_path = params.get("schematicPath")
             source_ref = params.get("sourceRef")
             target_ref = params.get("targetRef")
@@ -1613,18 +1704,25 @@ class KiCADInterface:
                     "message": "Missing required parameters: schematicPath, sourceRef, targetRef",
                 }
 
-            result = ConnectionManager.connect_passthrough(
-                Path(schematic_path), source_ref, target_ref, net_prefix, pin_offset
-            )
+            def _mutate():
+                result = ConnectionManager.connect_passthrough(
+                    Path(schematic_path), source_ref, target_ref, net_prefix, pin_offset
+                )
 
-            n_ok = len(result["connected"])
-            n_fail = len(result["failed"])
-            return {
-                "success": n_fail == 0,
-                "message": f"Passthrough complete: {n_ok} connected, {n_fail} failed",
-                "connected": result["connected"],
-                "failed": result["failed"],
-            }
+                n_ok = len(result["connected"])
+                n_fail = len(result["failed"])
+                return {
+                    "success": n_fail == 0,
+                    "message": f"Passthrough complete: {n_ok} connected, {n_fail} failed",
+                    "connected": result["connected"],
+                    "failed": result["failed"],
+                }
+
+            return self._guard_schematic_mutation(
+                schematic_path,
+                "connect_passthrough",
+                _mutate,
+            )
         except Exception as e:
             logger.error(f"Error in connect_passthrough: {str(e)}")
             import traceback
@@ -2062,57 +2160,57 @@ class KiCADInterface:
                     "message": "position with x and y is required",
                 }
 
-            with open(schematic_path, "r", encoding="utf-8") as f:
-                sch_data = _sexpdata.loads(f.read())
+            def _mutate():
+                with open(schematic_path, "r", encoding="utf-8") as f:
+                    sch_data = _sexpdata.loads(f.read())
 
-            # Find symbol and record old position
-            found = WireDragger.find_symbol(sch_data, reference)
-            if found is None:
-                return {"success": False, "message": f"Component {reference} not found"}
-            _, old_x, old_y = found[0], found[1], found[2]
-            old_position = {"x": old_x, "y": old_y}
+                found = WireDragger.find_symbol(sch_data, reference)
+                if found is None:
+                    return {"success": False, "message": f"Component {reference} not found"}
+                _, old_x, old_y = found[0], found[1], found[2]
+                old_position = {"x": old_x, "y": old_y}
 
-            drag_summary = {}
-            if preserve_wires:
-                # Compute pin world positions before and after the move
-                pin_positions = WireDragger.compute_pin_positions(
-                    sch_data, reference, float(new_x), float(new_y)
-                )
-                # Build old→new coordinate map (deduplicate coincident pins)
-                old_to_new = {}
-                for _pin, (old_xy, new_xy) in pin_positions.items():
-                    if old_xy in old_to_new:
-                        logger.warning(
-                            f"move_schematic_component: pin {_pin!r} of {reference!r} "
-                            f"shares old position {old_xy} with another pin; "
-                            f"keeping first entry, skipping duplicate"
-                        )
-                        continue
-                    old_to_new[old_xy] = new_xy
+                drag_summary = {}
+                if preserve_wires:
+                    pin_positions = WireDragger.compute_pin_positions(
+                        sch_data, reference, float(new_x), float(new_y)
+                    )
+                    old_to_new = {}
+                    for _pin, (old_xy, new_xy) in pin_positions.items():
+                        if old_xy in old_to_new:
+                            logger.warning(
+                                f"move_schematic_component: pin {_pin!r} of {reference!r} "
+                                f"shares old position {old_xy} with another pin; "
+                                f"keeping first entry, skipping duplicate"
+                            )
+                            continue
+                        old_to_new[old_xy] = new_xy
 
-                drag_summary = WireDragger.drag_wires(sch_data, old_to_new)
+                    drag_summary = WireDragger.drag_wires(sch_data, old_to_new)
+                    wires_synthesized = WireDragger.synthesize_touching_pin_wires(
+                        sch_data, reference, pin_positions
+                    )
+                    drag_summary["wires_synthesized"] = wires_synthesized
 
-                # Synthesize wires for touching-pin connections after dragging,
-                # so drag_wires doesn't accidentally move and collapse the new wire.
-                wires_synthesized = WireDragger.synthesize_touching_pin_wires(
-                    sch_data, reference, pin_positions
-                )
-                drag_summary["wires_synthesized"] = wires_synthesized
+                WireDragger.update_symbol_position(sch_data, reference, float(new_x), float(new_y))
 
-            # Update symbol position
-            WireDragger.update_symbol_position(sch_data, reference, float(new_x), float(new_y))
+                with open(schematic_path, "w", encoding="utf-8") as f:
+                    f.write(_sexpdata.dumps(sch_data))
 
-            with open(schematic_path, "w", encoding="utf-8") as f:
-                f.write(_sexpdata.dumps(sch_data))
+                return {
+                    "success": True,
+                    "oldPosition": old_position,
+                    "newPosition": {"x": new_x, "y": new_y},
+                    "wiresMoved": drag_summary.get("endpoints_moved", 0),
+                    "wiresRemoved": drag_summary.get("wires_removed", 0),
+                    "wiresSynthesized": drag_summary.get("wires_synthesized", 0),
+                }
 
-            return {
-                "success": True,
-                "oldPosition": old_position,
-                "newPosition": {"x": new_x, "y": new_y},
-                "wiresMoved": drag_summary.get("endpoints_moved", 0),
-                "wiresRemoved": drag_summary.get("wires_removed", 0),
-                "wiresSynthesized": drag_summary.get("wires_synthesized", 0),
-            }
+            return self._guard_schematic_mutation(
+                schematic_path,
+                "move_schematic_component",
+                _mutate,
+            )
 
         except Exception as e:
             logger.error(f"Error moving schematic component: {e}")
@@ -2136,33 +2234,40 @@ class KiCADInterface:
                     "message": "schematicPath and reference are required",
                 }
 
-            schematic = SchematicManager.load_schematic(schematic_path)
-            if not schematic:
-                return {"success": False, "message": "Failed to load schematic"}
+            def _mutate():
+                schematic = SchematicManager.load_schematic(schematic_path)
+                if not schematic:
+                    return {"success": False, "message": "Failed to load schematic"}
 
-            for symbol in schematic.symbol:
-                if not hasattr(symbol.property, "Reference"):
-                    continue
-                if symbol.property.Reference.value == reference:
-                    pos = list(symbol.at.value)
-                    while len(pos) < 3:
-                        pos.append(0)
-                    pos[2] = angle
-                    symbol.at.value = pos
+                for symbol in schematic.symbol:
+                    if not hasattr(symbol.property, "Reference"):
+                        continue
+                    if symbol.property.Reference.value == reference:
+                        pos = list(symbol.at.value)
+                        while len(pos) < 3:
+                            pos.append(0)
+                        pos[2] = angle
+                        symbol.at.value = pos
 
-                    if mirror:
-                        if hasattr(symbol, "mirror"):
-                            symbol.mirror.value = mirror
-                        else:
-                            logger.warning(
-                                f"Mirror '{mirror}' requested for {reference}, "
-                                f"but symbol has no mirror attribute; skipped"
-                            )
+                        if mirror:
+                            if hasattr(symbol, "mirror"):
+                                symbol.mirror.value = mirror
+                            else:
+                                logger.warning(
+                                    f"Mirror '{mirror}' requested for {reference}, "
+                                    f"but symbol has no mirror attribute; skipped"
+                                )
 
-                    SchematicManager.save_schematic(schematic, schematic_path)
-                    return {"success": True, "reference": reference, "angle": angle}
+                        SchematicManager.save_schematic(schematic, schematic_path)
+                        return {"success": True, "reference": reference, "angle": angle}
 
-            return {"success": False, "message": f"Component {reference} not found"}
+                return {"success": False, "message": f"Component {reference} not found"}
+
+            return self._guard_schematic_mutation(
+                schematic_path,
+                "rotate_schematic_component",
+                _mutate,
+            )
 
         except Exception as e:
             logger.error(f"Error rotating schematic component: {e}")
@@ -2804,6 +2909,35 @@ class KiCADInterface:
 
         except Exception as e:
             logger.error(f"Error in get_schematic_view_region: {e}")
+            import traceback
+
+            logger.error(traceback.format_exc())
+            return {"success": False, "message": str(e)}
+
+    def _handle_check_schematic_readability(self, params):
+        """Run the full schematic readability report used by the mutation guard."""
+        logger.info("Checking schematic readability")
+        try:
+            from commands.schematic_analysis import check_schematic_readability
+
+            schematic_path = params.get("schematicPath")
+            if not schematic_path:
+                return {"success": False, "message": "schematicPath is required"}
+
+            tolerance = float(params.get("tolerance", 0.5))
+            grid = float(params.get("grid", 1.27))
+            result = check_schematic_readability(
+                Path(schematic_path),
+                tolerance=tolerance,
+                grid=grid,
+            )
+            return {
+                "success": True,
+                **result,
+                "message": f"Readability check complete: {result['totalIssues']} issue(s)",
+            }
+        except Exception as e:
+            logger.error(f"Error checking schematic readability: {e}")
             import traceback
 
             logger.error(traceback.format_exc())

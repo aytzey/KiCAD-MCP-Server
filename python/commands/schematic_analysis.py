@@ -1,8 +1,10 @@
 """
-Schematic Analysis Tools for KiCad Schematics
+Schematic analysis and readability tools for KiCad schematics.
 
-Read-only analysis tools for detecting spatial problems, querying regions,
-and checking connectivity in KiCad schematic files.
+This module powers read-only inspection tools used by the MCP server to detect
+spatial problems, query regions, and check connectivity in KiCad schematic
+files. It also provides a higher-level readability report that the MCP harness
+uses as a quality gate after schematic mutations.
 """
 
 import logging
@@ -15,6 +17,8 @@ from commands.pin_locator import PinLocator
 from sexpdata import Symbol
 
 logger = logging.getLogger("kicad_interface")
+
+DEFAULT_SCHEMATIC_GRID_MM = 1.27
 
 
 # ---------------------------------------------------------------------------
@@ -85,7 +89,11 @@ def _parse_symbols(sexp_data: list) -> List[Dict[str, Any]]:
     """
     Parse all placed symbol instances from the schematic S-expression.
 
-    Returns list of dicts: {reference, lib_id, x, y, rotation, mirror_x, mirror_y, is_power}
+    Returns list of dicts:
+        {
+            reference, lib_id, x, y, rotation, mirror_x, mirror_y, is_power,
+            fields: [{name, value, x, y, angle, hidden}, ...]
+        }
     """
     symbols = []
     for item in sexp_data:
@@ -100,6 +108,7 @@ def _parse_symbols(sexp_data: list) -> List[Dict[str, Any]]:
         is_power = False
         mirror_x = False
         mirror_y = False
+        fields: List[Dict[str, Any]] = []
 
         for sub in item:
             if isinstance(sub, list) and len(sub) >= 2:
@@ -120,6 +129,25 @@ def _parse_symbols(sexp_data: list) -> List[Dict[str, Any]]:
                     prop_name = str(sub[1]).strip('"')
                     if prop_name == "Reference":
                         reference = str(sub[2]).strip('"')
+                    field = {
+                        "name": prop_name,
+                        "value": str(sub[2]).strip('"'),
+                        "x": x,
+                        "y": y,
+                        "angle": 0.0,
+                        "hidden": False,
+                    }
+                    for prop_sub in sub[3:]:
+                        if not isinstance(prop_sub, list) or not prop_sub:
+                            continue
+                        if prop_sub[0] == Symbol("at") and len(prop_sub) >= 3:
+                            field["x"] = float(prop_sub[1])
+                            field["y"] = float(prop_sub[2])
+                            if len(prop_sub) >= 4:
+                                field["angle"] = float(prop_sub[3])
+                        elif prop_sub[0] == Symbol("effects"):
+                            field["hidden"] = _sexp_tree_contains_symbol(prop_sub, Symbol("hide"))
+                    fields.append(field)
 
         is_power = reference.startswith("#PWR") or reference.startswith("#FLG")
         symbols.append(
@@ -132,9 +160,19 @@ def _parse_symbols(sexp_data: list) -> List[Dict[str, Any]]:
                 "mirror_x": mirror_x,
                 "mirror_y": mirror_y,
                 "is_power": is_power,
+                "fields": fields,
             }
         )
     return symbols
+
+
+def _sexp_tree_contains_symbol(node: Any, needle: Symbol) -> bool:
+    """Return True when an S-expression subtree contains the given Symbol."""
+    if node == needle:
+        return True
+    if isinstance(node, list):
+        return any(_sexp_tree_contains_symbol(child, needle) for child in node)
+    return False
 
 
 def _parse_lib_symbol_graphics(symbol_def: list) -> List[Tuple[float, float]]:
@@ -318,6 +356,18 @@ def _point_in_rect(
 ) -> bool:
     """Check if a point is within a rectangle."""
     return min_x <= px <= max_x and min_y <= py <= max_y
+
+
+def _is_on_grid(value: float, grid: float, tolerance: float = 0.01) -> bool:
+    """Check whether a coordinate lies on the requested grid within tolerance."""
+    if grid <= 0:
+        return True
+    nearest = round(value / grid) * grid
+    return abs(value - nearest) <= tolerance
+
+
+def _round_point(x: float, y: float, digits: int = 4) -> Tuple[float, float]:
+    return (round(x, digits), round(y, digits))
 
 
 def _distance(p1: Tuple[float, float], p2: Tuple[float, float]) -> float:
@@ -555,6 +605,204 @@ def find_overlapping_elements(schematic_path: Path, tolerance: float = 0.5) -> D
         "overlappingLabels": overlapping_labels,
         "overlappingWires": overlapping_wires,
         "totalOverlaps": total,
+    }
+
+
+def check_schematic_readability(
+    schematic_path: Path,
+    tolerance: float = 0.5,
+    grid: float = DEFAULT_SCHEMATIC_GRID_MM,
+) -> Dict[str, Any]:
+    """
+    Produce a higher-level readability report for a schematic.
+
+    The rules are derived from KiCad's own schematic editor guidance:
+    - place symbols and wires on the recommended 50 mil / 1.27 mm grid
+    - avoid overlapping symbols, labels, and duplicate wires
+    - do not route wires through symbol bodies
+    - keep visible symbol fields outside symbol bodies
+
+    Returns a dict with per-category issues, aggregate counts, and stable
+    signatures suitable for before/after comparison by the MCP harness.
+    """
+    sexp_data = _load_sexp(schematic_path)
+    symbols = _parse_symbols(sexp_data)
+    wires = _parse_wires(sexp_data)
+    labels = _parse_labels(sexp_data)
+    overlap_report = find_overlapping_elements(schematic_path, tolerance=tolerance)
+    wire_crossings = find_wires_crossing_symbols(schematic_path)
+
+    lib_defs = _extract_lib_symbols(sexp_data)
+
+    non_template_symbols = [
+        s for s in symbols if s["reference"] and not s["reference"].startswith("_TEMPLATE")
+    ]
+
+    symbol_bboxes: List[Tuple[Dict[str, Any], Optional[Tuple[float, float, float, float]]]] = []
+    for sym in non_template_symbols:
+        lib_data = lib_defs.get(sym["lib_id"], {})
+        pin_defs = lib_data.get("pins", {})
+        graphics_points = lib_data.get("graphics_points", [])
+        bbox = None
+        if pin_defs:
+            bbox = _compute_symbol_bbox_direct(sym, pin_defs, graphics_points=graphics_points)
+        symbol_bboxes.append((sym, bbox))
+
+    field_issues: List[Dict[str, Any]] = []
+    for sym, bbox in symbol_bboxes:
+        if bbox is None:
+            continue
+        for field in sym.get("fields", []):
+            if field.get("hidden"):
+                continue
+            fx = float(field["x"])
+            fy = float(field["y"])
+            if _point_in_rect(fx, fy, *bbox):
+                field_issues.append(
+                    {
+                        "type": "field_inside_symbol_body",
+                        "reference": sym["reference"],
+                        "field": field["name"],
+                        "position": {"x": round(fx, 4), "y": round(fy, 4)},
+                    }
+                )
+                continue
+
+            for other_sym, other_bbox in symbol_bboxes:
+                if other_sym["reference"] == sym["reference"] or other_bbox is None:
+                    continue
+                if _point_in_rect(fx, fy, *other_bbox):
+                    field_issues.append(
+                        {
+                            "type": "field_inside_other_symbol_body",
+                            "reference": sym["reference"],
+                            "field": field["name"],
+                            "position": {"x": round(fx, 4), "y": round(fy, 4)},
+                            "targetReference": other_sym["reference"],
+                        }
+                    )
+                    break
+
+    off_grid_items: List[Dict[str, Any]] = []
+
+    for sym in non_template_symbols:
+        if not (_is_on_grid(sym["x"], grid) and _is_on_grid(sym["y"], grid)):
+            off_grid_items.append(
+                {
+                    "type": "symbol",
+                    "name": sym["reference"],
+                    "position": {"x": round(sym["x"], 4), "y": round(sym["y"], 4)},
+                }
+            )
+
+    for lbl in labels:
+        if not (_is_on_grid(lbl["x"], grid) and _is_on_grid(lbl["y"], grid)):
+            off_grid_items.append(
+                {
+                    "type": "label",
+                    "name": lbl["name"],
+                    "position": {"x": round(lbl["x"], 4), "y": round(lbl["y"], 4)},
+                }
+            )
+
+    seen_wire_points: Set[Tuple[str, float, float]] = set()
+    for idx, wire in enumerate(wires):
+        for endpoint_name in ("start", "end"):
+            px, py = wire[endpoint_name]
+            key = (endpoint_name, round(px, 4), round(py, 4))
+            if key in seen_wire_points:
+                continue
+            seen_wire_points.add(key)
+            if not (_is_on_grid(px, grid) and _is_on_grid(py, grid)):
+                off_grid_items.append(
+                    {
+                        "type": "wire_endpoint",
+                        "name": f"wire_{idx}_{endpoint_name}",
+                        "position": {"x": round(px, 4), "y": round(py, 4)},
+                    }
+                )
+
+    issue_signatures: Set[str] = set()
+    issue_messages: Dict[str, str] = {}
+
+    for issue in overlap_report.get("overlappingSymbols", []):
+        refs = sorted([issue["element1"]["reference"], issue["element2"]["reference"]])
+        signature = f"overlap:symbol:{issue.get('type','symbol_overlap')}:{refs[0]}:{refs[1]}"
+        issue_signatures.add(signature)
+        issue_messages[signature] = f"overlapping symbols: {refs[0]} and {refs[1]}"
+
+    for issue in overlap_report.get("overlappingLabels", []):
+        names = sorted([issue["element1"]["name"], issue["element2"]["name"]])
+        signature = f"overlap:label:{names[0]}:{names[1]}"
+        issue_signatures.add(signature)
+        issue_messages[signature] = f"overlapping labels: {names[0]} and {names[1]}"
+
+    for issue in overlap_report.get("overlappingWires", []):
+        s = issue["wire1"]["start"]
+        e = issue["wire1"]["end"]
+        signature = (
+            f"overlap:wire:{round(s['x'],4)}:{round(s['y'],4)}:{round(e['x'],4)}:{round(e['y'],4)}"
+        )
+        issue_signatures.add(signature)
+        issue_messages[signature] = (
+            "overlapping wires: "
+            f"({round(s['x'],4)}, {round(s['y'],4)}) -> ({round(e['x'],4)}, {round(e['y'],4)})"
+        )
+
+    for issue in wire_crossings:
+        s = issue["wire"]["start"]
+        e = issue["wire"]["end"]
+        ref = issue["component"]["reference"]
+        signature = (
+            f"crossing:{ref}:{round(s['x'],4)}:{round(s['y'],4)}:{round(e['x'],4)}:{round(e['y'],4)}"
+        )
+        issue_signatures.add(signature)
+        issue_messages[signature] = (
+            "wire crossing symbol body: "
+            f"{ref} by ({round(s['x'],4)}, {round(s['y'],4)}) -> ({round(e['x'],4)}, {round(e['y'],4)})"
+        )
+
+    for issue in field_issues:
+        pos = issue["position"]
+        signature = (
+            f"field:{issue['type']}:{issue['reference']}:{issue['field']}:{round(pos['x'],4)}:{round(pos['y'],4)}"
+        )
+        issue_signatures.add(signature)
+        target_suffix = (
+            f" (inside {issue['targetReference']})" if issue.get("targetReference") else ""
+        )
+        issue_messages[signature] = (
+            f"visible field inside symbol body: {issue['reference']}.{issue['field']}{target_suffix}"
+        )
+
+    for issue in off_grid_items:
+        pos = issue["position"]
+        signature = (
+            f"offgrid:{issue['type']}:{issue['name']}:{round(pos['x'],4)}:{round(pos['y'],4)}"
+        )
+        issue_signatures.add(signature)
+        issue_messages[signature] = (
+            f"off-grid {issue['type']}: {issue['name']} @ ({round(pos['x'],4)}, {round(pos['y'],4)})"
+        )
+
+    counts = {
+        "overlaps": int(overlap_report.get("totalOverlaps", 0)),
+        "wireCrossings": len(wire_crossings),
+        "fieldIssues": len(field_issues),
+        "offGridItems": len(off_grid_items),
+    }
+
+    total_issues = sum(counts.values())
+    return {
+        "grid": grid,
+        "counts": counts,
+        "overlappingElements": overlap_report,
+        "wireCrossings": wire_crossings,
+        "fieldIssues": field_issues,
+        "offGridItems": off_grid_items,
+        "totalIssues": total_issues,
+        "issueSignatures": sorted(issue_signatures),
+        "issueMessages": issue_messages,
     }
 
 

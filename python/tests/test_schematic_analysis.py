@@ -33,6 +33,7 @@ from commands.schematic_analysis import (
     _parse_wires,
     _point_in_rect,
     _transform_local_point,
+    check_schematic_readability,
     compute_symbol_bbox,
     find_overlapping_elements,
     find_wires_crossing_symbols,
@@ -319,6 +320,40 @@ class TestFindOverlappingElements:
         tmp = _make_temp_schematic(extra)
         result = find_overlapping_elements(tmp, tolerance=0.5)
         assert result["totalOverlaps"] >= 1
+
+
+class TestCheckSchematicReadability:
+    """Test the higher-level readability report used by the harness."""
+
+    def test_detects_field_inside_symbol_body(self):
+        extra = _make_resistor_sexp("R1", 100, 100).replace(
+            '(property "Reference" "R1" (at 102.032 100 90)',
+            '(property "Reference" "R1" (at 100 100 0)',
+        )
+        tmp = _make_temp_schematic(extra)
+        result = check_schematic_readability(tmp)
+        assert result["counts"]["fieldIssues"] >= 1
+        assert any(issue["reference"] == "R1" for issue in result["fieldIssues"])
+
+    def test_detects_off_grid_symbol_and_wire_endpoint(self):
+        extra = _make_resistor_sexp("R1", 100.5, 100) + """
+        (wire (pts (xy 10.1 50) (xy 30 50))
+            (stroke (width 0) (type default))
+            (uuid "w-offgrid"))
+        """
+        tmp = _make_temp_schematic(extra)
+        result = check_schematic_readability(tmp)
+        assert result["counts"]["offGridItems"] >= 2
+        names = {issue["name"] for issue in result["offGridItems"]}
+        assert "R1" in names
+        assert "wire_0_start" in names
+
+    def test_returns_issue_signatures_and_messages(self):
+        extra = _make_resistor_sexp("R1", 100, 100) + _make_resistor_sexp("R2", 100.1, 100)
+        tmp = _make_temp_schematic(extra)
+        result = check_schematic_readability(tmp)
+        assert result["issueSignatures"]
+        assert result["issueMessages"]
 
 
 class TestGetElementsInRegion:

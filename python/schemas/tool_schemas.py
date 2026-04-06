@@ -12,6 +12,13 @@ Each tool includes:
 
 from typing import Any, Dict
 
+SCHEMATIC_READABILITY_RULES = (
+    "KiCad readability rules: keep symbols and wires on the recommended 50 mil "
+    "(1.27 mm) grid; keep visible fields outside symbol bodies; use power symbols "
+    "for power/ground nets; add junctions for intentional crossings; never route "
+    "wires through symbol bodies."
+)
+
 # =============================================================================
 # PROJECT TOOLS
 # =============================================================================
@@ -1338,7 +1345,7 @@ SCHEMATIC_TOOLS = [
     {
         "name": "add_schematic_component",
         "title": "Add Component to Schematic",
-        "description": "Places a symbol (resistor, capacitor, IC, etc.) on the schematic.",
+        "description": f"Places a symbol (resistor, capacitor, IC, etc.) on the schematic. Leave enough space so symbol bodies and visible fields do not overlap. {SCHEMATIC_READABILITY_RULES}",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1363,7 +1370,7 @@ SCHEMATIC_TOOLS = [
     {
         "name": "add_schematic_wire",
         "title": "Draw Wire Between Pins",
-        "description": "Draws a wire on the schematic between two or more coordinate points. Always call get_schematic_pin_locations first to get the approximate pin coordinates, then pass them as the first and last waypoints. snapToPins (on by default) will correct any float imprecision by snapping endpoints to the exact nearest pin coordinate. To route around components, add intermediate waypoints between the start and end: e.g. [[x1,y1], [xMid,y1], [xMid,y2], [x2,y2]] routes horizontally then vertically. Intermediate waypoints are never snapped.",
+        "description": f"Draws a wire on the schematic between two or more coordinate points. Always call get_schematic_pin_locations first to get the approximate pin coordinates, then pass them as the first and last waypoints. snapToPins (on by default) will correct any float imprecision by snapping endpoints to the exact nearest pin coordinate. To route around components, add intermediate waypoints between the start and end: e.g. [[x1,y1], [xMid,y1], [xMid,y2], [x2,y2]] routes horizontally then vertically. Intermediate waypoints are never snapped. {SCHEMATIC_READABILITY_RULES}",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1399,7 +1406,7 @@ SCHEMATIC_TOOLS = [
     {
         "name": "add_schematic_net_label",
         "title": "Add Net Label",
-        "description": "Adds a net label at exact coordinates on a schematic wire or pin endpoint. WARNING: x/y must match an existing wire endpoint or pin endpoint exactly — placing the label even 0.01mm away from a pin will result in an unconnected pin ERC error. To connect a component pin to a net by reference and pin number (recommended), use connect_to_net instead.",
+        "description": f"Adds a net label at exact coordinates on a schematic wire or pin endpoint. WARNING: x/y must match an existing wire endpoint or pin endpoint exactly — placing the label even 0.01mm away from a pin will result in an unconnected pin ERC error. To connect a component pin to a net by reference and pin number (recommended), use connect_to_net instead. Do not stack labels on top of other labels or symbol bodies. {SCHEMATIC_READABILITY_RULES}",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1425,7 +1432,7 @@ SCHEMATIC_TOOLS = [
     {
         "name": "connect_to_net",
         "title": "Connect Pin to Net",
-        "description": "Intelligently connects a component pin to a named net, automatically routing wires as needed.",
+        "description": f"Intelligently connects a component pin to a named net, automatically routing wires as needed. Prefer dedicated power symbols for power and ground nets instead of plain text labels. {SCHEMATIC_READABILITY_RULES}",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1513,7 +1520,7 @@ SCHEMATIC_TOOLS = [
     {
         "name": "connect_passthrough",
         "title": "Connect Passthrough (Pin-to-Pin)",
-        "description": "Connects all pins of a source connector to the matching pins of a target connector using shared net labels. Ideal for passthrough adapters where J1 pin N connects directly to J2 pin N. Each pair gets a net label '{netPrefix}_{pinNumber}'. Use this instead of calling connect_to_net 15 times for FFC/ribbon cable passthroughs. NOTE: KiCAD Connector_Generic symbols always have pin 1 at the TOP of the symbol and pin N at the BOTTOM. When assigning named nets (e.g. GND, CAM_SCL) to specific pin numbers, always use the physical pin number as shown in the connector datasheet — pin 1 = top of symbol.",
+        "description": f"Connects all pins of a source connector to the matching pins of a target connector using shared net labels. Ideal for passthrough adapters where J1 pin N connects directly to J2 pin N. Each pair gets a net label '{{netPrefix}}_{{pinNumber}}'. Use this instead of calling connect_to_net 15 times for FFC/ribbon cable passthroughs. NOTE: KiCAD Connector_Generic symbols always have pin 1 at the TOP of the symbol and pin N at the BOTTOM. When assigning named nets (e.g. GND, CAM_SCL) to specific pin numbers, always use the physical pin number as shown in the connector datasheet — pin 1 = top of symbol. {SCHEMATIC_READABILITY_RULES}",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1633,7 +1640,7 @@ SCHEMATIC_TOOLS = [
     {
         "name": "add_schematic_junction",
         "title": "Add Junction to Schematic",
-        "description": "Adds a junction (connection dot) at the specified coordinates on the schematic. Junctions are required in KiCAD to mark intentional connections where wires cross or where a wire branches off another wire. Without a junction, crossing wires are not electrically connected.",
+        "description": f"Adds a junction (connection dot) at the specified coordinates on the schematic. Junctions are required in KiCAD to mark intentional connections where wires cross or where a wire branches off another wire. Without a junction, crossing wires are not electrically connected. {SCHEMATIC_READABILITY_RULES}",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1653,6 +1660,29 @@ SCHEMATIC_TOOLS = [
         },
     },
     # --- Schematic Analysis Tools (read-only) ---
+    {
+        "name": "check_schematic_readability",
+        "title": "Check Schematic Readability",
+        "description": "Runs the full schematic readability report used by the MCP harness. Checks overlaps, wires crossing symbol bodies, visible fields placed inside symbol bodies, and off-grid symbol or wire placements.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "schematicPath": {
+                    "type": "string",
+                    "description": "Path to the .kicad_sch schematic file",
+                },
+                "tolerance": {
+                    "type": "number",
+                    "description": "Overlap tolerance in mm for label and wire comparisons (default: 0.5)",
+                },
+                "grid": {
+                    "type": "number",
+                    "description": "Expected schematic placement grid in mm (default: 1.27)",
+                },
+            },
+            "required": ["schematicPath"],
+        },
+    },
     {
         "name": "get_schematic_view_region",
         "title": "Get Schematic View Region",
@@ -1700,7 +1730,7 @@ SCHEMATIC_TOOLS = [
     {
         "name": "find_overlapping_elements",
         "title": "Find Overlapping Elements",
-        "description": "Detects spatially overlapping symbols, wires, and labels in the schematic. Finds: duplicate power symbols at the same position, collinear overlapping wire segments, and labels stacked on top of each other.",
+        "description": "Detects spatially overlapping symbols, wires, and labels in the schematic. Finds: duplicate power symbols at the same position, collinear overlapping wire segments, and labels stacked on top of each other. This is one part of the built-in readability gate.",
         "inputSchema": {
             "type": "object",
             "properties": {
