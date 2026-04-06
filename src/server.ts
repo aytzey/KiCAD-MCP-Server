@@ -156,6 +156,31 @@ function findPythonExecutable(scriptPath: string): string {
   return isWindows ? "python.exe" : "python3";
 }
 
+function defaultPythonPath(): string | undefined {
+  if (process.env.PYTHONPATH) {
+    return process.env.PYTHONPATH;
+  }
+
+  if (process.platform === "win32") {
+    return "C:/Program Files/KiCad/9.0/lib/python3/dist-packages";
+  }
+
+  if (process.platform === "linux") {
+    return "/usr/lib/python3/dist-packages";
+  }
+
+  return undefined;
+}
+
+function buildPythonEnv(): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...process.env };
+  const fallbackPythonPath = defaultPythonPath();
+  if (fallbackPythonPath && !env.PYTHONPATH) {
+    env.PYTHONPATH = fallbackPythonPath;
+  }
+  return env;
+}
+
 /**
  * KiCAD MCP Server class
  */
@@ -258,6 +283,7 @@ export class KiCADMcpServer {
     const isWindows = process.platform === "win32";
     const isLinux = process.platform !== "win32" && process.platform !== "darwin";
     const errors: string[] = [];
+    const pythonEnv = buildPythonEnv();
 
     // Check if Python executable exists (for absolute paths) or is executable (for commands)
     const isAbsolutePath =
@@ -288,7 +314,7 @@ export class KiCADMcpServer {
             `"${pythonExe}" --version`,
             {
               timeout: 3000,
-              env: { ...process.env },
+              env: pythonEnv,
             },
             (error: any, stdout: string, stderr: string) => {
               if (error) {
@@ -331,7 +357,7 @@ export class KiCADMcpServer {
     if (existsSync(pythonExe) && existsSync(this.kicadScriptPath)) {
       logger.info("Validating pcbnew module access...");
 
-      const testCommand = `"${pythonExe}" -c "import pcbnew; print('OK')"`;
+      const testCommand = `"${pythonExe}" -c "import pcbnew, skip, sexpdata; print('OK')"`;
 
       try {
         const { stdout, stderr } = await new Promise<{
@@ -342,7 +368,7 @@ export class KiCADMcpServer {
             testCommand,
             {
               timeout: 5000,
-              env: { ...process.env },
+              env: pythonEnv,
             },
             (error: any, stdout: string, stderr: string) => {
               if (error) {
@@ -355,7 +381,7 @@ export class KiCADMcpServer {
         });
 
         if (!stdout.includes("OK")) {
-          errors.push("pcbnew module import test failed");
+          errors.push("Python KiCad dependency validation failed");
           errors.push(`Output: ${stdout}`);
           errors.push(`Errors: ${stderr}`);
 
@@ -372,10 +398,10 @@ export class KiCADMcpServer {
             errors.push("4. See: docs/WINDOWS_TROUBLESHOOTING.md");
           }
         } else {
-          logger.info("✓ pcbnew module validated successfully");
+          logger.info("✓ pcbnew, skip, and sexpdata validated successfully");
         }
       } catch (error: any) {
-        errors.push(`pcbnew validation failed: ${error.message}`);
+        errors.push(`Python KiCad dependency validation failed: ${error.message}`);
 
         if (isWindows) {
           errors.push("");
@@ -430,11 +456,7 @@ export class KiCADMcpServer {
       }
       this.pythonProcess = spawn(pythonExe, [this.kicadScriptPath], {
         stdio: ["pipe", "pipe", "pipe"],
-        env: {
-          ...process.env,
-          PYTHONPATH:
-            process.env.PYTHONPATH || "C:/Program Files/KiCad/9.0/lib/python3/dist-packages",
-        },
+        env: buildPythonEnv(),
       });
 
       // Listen for process exit

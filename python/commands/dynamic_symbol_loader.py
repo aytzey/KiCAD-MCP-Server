@@ -46,6 +46,78 @@ def _symbol_board_flags(library_name: str, reference: str) -> Tuple[str, str]:
     return "yes", "yes"
 
 
+def _symbol_field_flags(library_name: str, reference: str) -> Tuple[bool, bool]:
+    """Return whether Reference/Value should be hidden for this symbol."""
+    if library_name == "power" or reference.startswith("#"):
+        return True, True
+    return False, False
+
+
+def _effects_block(hidden: bool = False) -> str:
+    hide = " (hide yes)" if hidden else ""
+    return f'(effects (font (size 1.27 1.27)){hide})'
+
+
+def _default_field_positions(
+    schematic_path: Path,
+    full_lib_id: str,
+    x: float,
+    y: float,
+    rotation: float = 0,
+) -> Dict[str, Tuple[float, float, float]]:
+    """Pick reference/value positions around the symbol body when possible."""
+    fallback = {
+        "Reference": (x, round(y - 2.54, 4), rotation),
+        "Value": (x, round(y + 2.54, 4), rotation),
+    }
+
+    try:
+        from commands.schematic_analysis import (
+            _compute_symbol_bbox_direct,
+            _extract_lib_symbols,
+            _load_sexp,
+        )
+
+        sexp_data = _load_sexp(schematic_path)
+        lib_defs = _extract_lib_symbols(sexp_data)
+        lib_data = lib_defs.get(full_lib_id)
+        if not lib_data or not lib_data.get("pins"):
+            return fallback
+
+        bbox = _compute_symbol_bbox_direct(
+            {
+                "x": x,
+                "y": y,
+                "rotation": rotation,
+                "mirror_x": False,
+                "mirror_y": False,
+            },
+            lib_data["pins"],
+            graphics_points=lib_data.get("graphics_points"),
+        )
+        if not bbox:
+            return fallback
+
+        min_x, min_y, max_x, max_y = bbox
+        margin = 2.54
+        center_y = round((min_y + max_y) / 2, 4)
+        width = max_x - min_x
+        height = max_y - min_y
+
+        if height > width * 1.4:
+            return {
+                "Reference": (round(max_x + margin, 4), round(center_y - 1.27, 4), 0),
+                "Value": (round(min_x - margin, 4), round(center_y + 1.27, 4), 0),
+            }
+
+        return {
+            "Reference": (round(min_x, 4), round(min_y - margin, 4), 0),
+            "Value": (round(min_x, 4), round(max_y + margin, 4), 0),
+        }
+    except Exception:
+        return fallback
+
+
 class DynamicSymbolLoader:
     """
     Dynamically loads symbols from KiCad library files and injects them into schematics.
@@ -464,15 +536,24 @@ class DynamicSymbolLoader:
         new_uuid = str(uuid.uuid4())
         project_name = _project_instance_name(schematic_path, self.project_path)
         in_bom, on_board = _symbol_board_flags(library_name, reference)
+        hide_ref, hide_value = _symbol_field_flags(library_name, reference)
+        field_positions = _default_field_positions(
+            schematic_path,
+            full_lib_id,
+            x,
+            y,
+        )
+        ref_x, ref_y, ref_rot = field_positions["Reference"]
+        val_x, val_y, val_rot = field_positions["Value"]
 
         instance_block = f"""  (symbol (lib_id "{full_lib_id}") (at {x} {y} 0) (unit 1)
     (in_bom {in_bom}) (on_board {on_board}) (dnp no)
     (uuid "{new_uuid}")
-    (property "Reference" "{reference}" (at {x} {y - 2.54} 0)
-      (effects (font (size 1.27 1.27)))
+    (property "Reference" "{reference}" (at {ref_x} {ref_y} {ref_rot})
+      {_effects_block(hide_ref)}
     )
-    (property "Value" "{value or symbol_name}" (at {x} {y + 2.54} 0)
-      (effects (font (size 1.27 1.27)))
+    (property "Value" "{value or symbol_name}" (at {val_x} {val_y} {val_rot})
+      {_effects_block(hide_value)}
     )
     (property "Footprint" "{footprint}" (at {x} {y} 0)
       (effects (font (size 1.27 1.27)) (hide yes))

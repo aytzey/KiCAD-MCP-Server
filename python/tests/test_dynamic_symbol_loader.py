@@ -96,3 +96,26 @@ def test_power_symbols_are_marked_as_non_board_items():
     content = schematic.read_text(encoding="utf-8")
     assert '(symbol (lib_id "power:PWR_FLAG")' in content
     assert "(in_bom no) (on_board no) (dnp no)" in content
+    assert '(property "Reference" "#FLG0101"' in content
+    assert "(hide yes)" in content
+
+
+def test_add_component_places_fields_outside_resistor_body():
+    schematic = _make_temp_schematic("arduino_pwm_controller.kicad_sch")
+    loader = DynamicSymbolLoader(project_path=schematic.parent)
+
+    ok = loader.add_component(
+        schematic,
+        "Device",
+        "R",
+        "R1",
+        value="10k",
+        x=10.0,
+        y=10.0,
+        project_path=schematic.parent,
+    )
+
+    assert ok is True
+    content = schematic.read_text(encoding="utf-8")
+    assert '(property "Reference" "R1" (at 13.716 8.89 0)' in content
+    assert '(property "Value" "10k" (at 6.604 11.43 0)' in content
