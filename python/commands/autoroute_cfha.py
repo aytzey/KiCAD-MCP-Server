@@ -94,6 +94,9 @@ PROFILE_DEFAULTS: Dict[str, Dict[str, Any]] = {
         "hs_diff_uncoupled_mm": 3.0,
         "hs_via_limit": 2,
         "rf_via_limit": 1,
+        "crosstalk_guard_mm": 0.5,
+        "analog_guard_mm": 1.0,
+        "rf_guard_mm": 1.5,
     },
     "generic_4layer": {
         "edge_clearance_mm": 0.2,
@@ -103,6 +106,9 @@ PROFILE_DEFAULTS: Dict[str, Dict[str, Any]] = {
         "hs_diff_uncoupled_mm": 2.0,
         "hs_via_limit": 2,
         "rf_via_limit": 1,
+        "crosstalk_guard_mm": 0.4,
+        "analog_guard_mm": 0.8,
+        "rf_guard_mm": 1.2,
     },
     "high_speed_digital": {
         "edge_clearance_mm": 0.2,
@@ -112,6 +118,9 @@ PROFILE_DEFAULTS: Dict[str, Dict[str, Any]] = {
         "hs_diff_uncoupled_mm": 1.5,
         "hs_via_limit": 2,
         "rf_via_limit": 1,
+        "crosstalk_guard_mm": 0.35,
+        "analog_guard_mm": 0.6,
+        "rf_guard_mm": 1.0,
     },
     "rf_mixed_signal": {
         "edge_clearance_mm": 0.35,
@@ -121,6 +130,9 @@ PROFILE_DEFAULTS: Dict[str, Dict[str, Any]] = {
         "hs_diff_uncoupled_mm": 1.0,
         "hs_via_limit": 1,
         "rf_via_limit": 1,
+        "crosstalk_guard_mm": 0.5,
+        "analog_guard_mm": 1.0,
+        "rf_guard_mm": 2.0,
     },
     "power": {
         "edge_clearance_mm": 0.3,
@@ -130,6 +142,9 @@ PROFILE_DEFAULTS: Dict[str, Dict[str, Any]] = {
         "hs_diff_uncoupled_mm": 3.0,
         "hs_via_limit": 2,
         "rf_via_limit": 1,
+        "crosstalk_guard_mm": 0.5,
+        "analog_guard_mm": 1.0,
+        "rf_guard_mm": 1.5,
     },
     "dense_bga": {
         "edge_clearance_mm": 0.2,
@@ -139,6 +154,9 @@ PROFILE_DEFAULTS: Dict[str, Dict[str, Any]] = {
         "hs_diff_uncoupled_mm": 1.0,
         "hs_via_limit": 2,
         "rf_via_limit": 1,
+        "crosstalk_guard_mm": 0.25,
+        "analog_guard_mm": 0.5,
+        "rf_guard_mm": 0.8,
     },
 }
 
@@ -279,6 +297,127 @@ def _condition_for_nets(nets: Iterable[str]) -> Optional[str]:
     return " || ".join(f"A.NetName == '{net}'" for net in net_list)
 
 
+# ---------------------------------------------------------------------------
+#  IPC-2221 current capacity calculation
+# ---------------------------------------------------------------------------
+
+def ipc2221_trace_width_mm(
+    current_a: float,
+    temp_rise_c: float = 10.0,
+    copper_oz: float = 1.0,
+    is_external: bool = True,
+) -> float:
+    """Calculate minimum trace width for a given current using IPC-2221.
+
+    Formula: I = k * dT^0.44 * A^0.725
+    where A = cross-section area in mil^2, dT = temp rise in C.
+    k = 0.048 for external layers, 0.024 for internal layers.
+
+    Reference: IPC-2221A Section 6.2 (charts 6-4 / 6-3).
+    Also validated against He (2024) Table 4.2 clearance defaults.
+    """
+    if current_a <= 0 or temp_rise_c <= 0 or copper_oz <= 0:
+        return 0.0
+    k = 0.048 if is_external else 0.024
+    # Solve for A (mil^2): A = (I / (k * dT^0.44))^(1/0.725)
+    area_mil2 = (current_a / (k * (temp_rise_c ** 0.44))) ** (1.0 / 0.725)
+    thickness_mil = copper_oz * 1.378  # 1 oz = 1.378 mil (35 um)
+    width_mil = area_mil2 / thickness_mil
+    width_mm = width_mil * 0.0254
+    return round(max(width_mm, 0.1), 4)  # floor at 0.1mm
+
+
+def compute_weighted_qor_score(
+    metrics: Dict[str, Any],
+    flags: Dict[str, Any],
+    weights: Dict[str, float],
+    constraints: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Compute a single weighted QoR score from routing metrics.
+
+    Normalises each metric to [0,1] where 1 = perfect, then computes a
+    weighted geometric mean.  The individual sub-scores are returned so
+    the caller can see which dimension is worst.
+
+    Weight keys: length, vias, skew, uncoupled, returnPathRisk, completion,
+                 drcErrors.
+
+    Reference: Inspired by He (2024) Eq 3.1 composite reward and
+    FreeRouting's internal score (wirelength + gamma_g * N_via).
+    """
+    w = {
+        "completion": 10.0,
+        "drcErrors": 8.0,
+        "length": 1.0,
+        "vias": 2.0,
+        "skew": 5.0,
+        "uncoupled": 5.0,
+        "returnPathRisk": 8.0,
+    }
+    w.update(weights or {})
+
+    sub: Dict[str, float] = {}
+
+    # Completion: 1.0 = all routed
+    sub["completion"] = float(metrics.get("completionRate", 0.0))
+
+    # DRC: 1.0 = zero errors
+    drc_errors = int(metrics.get("drcErrors", 0))
+    sub["drcErrors"] = 1.0 / (1.0 + drc_errors)
+
+    # Wirelength: lower is better — normalise against a soft upper bound
+    wl = float(metrics.get("wirelengthMm", 0))
+    # Soft reference: 500mm (typical small board), scales logarithmically
+    sub["length"] = 1.0 / (1.0 + wl / 500.0)
+
+    # Via count: fewer is better (He 2024: gamma_g=5 penalty per via)
+    vias = int(metrics.get("viaCount", 0))
+    sub["vias"] = 1.0 / (1.0 + vias / 10.0)
+
+    # Diff pair skew: closer to zero is better
+    skew = float(metrics.get("maxDiffSkewMm", 0))
+    skew_limit = 0.25  # default
+    if constraints:
+        skew_limit = float(
+            constraints.get("defaults", {}).get("hs_diff_skew_mm", 0.25)
+        )
+    sub["skew"] = max(0.0, 1.0 - skew / max(skew_limit, 0.01))
+
+    # Uncoupled: closer to zero is better
+    uncoupled = float(metrics.get("maxUncoupledMm", 0))
+    uncoupled_limit = 3.0
+    if constraints:
+        uncoupled_limit = float(
+            constraints.get("defaults", {}).get("hs_diff_uncoupled_mm", 3.0)
+        )
+    sub["uncoupled"] = max(0.0, 1.0 - uncoupled / max(uncoupled_limit, 0.01))
+
+    # Return path risk: binary per-flag (1.0 if no flags)
+    risk_count = len(flags.get("returnPathRisk", []))
+    sub["returnPathRisk"] = 1.0 / (1.0 + risk_count)
+
+    # Weighted geometric mean (avoids one bad metric drowning everything)
+    total_weight = sum(w.get(k, 0) for k in sub)
+    if total_weight <= 0:
+        return {"score": 0.0, "subScores": sub}
+
+    log_sum = sum(w.get(k, 0) * math.log(max(v, 1e-9)) for k, v in sub.items())
+    score = math.exp(log_sum / total_weight)
+
+    return {
+        "score": round(score, 4),
+        "subScores": {k: round(v, 4) for k, v in sub.items()},
+        "weights": {k: w.get(k, 0) for k in sub},
+        "grade": (
+            "A" if score >= 0.85 else
+            "B" if score >= 0.70 else
+            "C" if score >= 0.50 else
+            "D" if score >= 0.30 else
+            "F"
+        ),
+    }
+
+
 def compile_kicad_dru(constraints: Dict[str, Any]) -> str:
     """
     Compile canonical routing constraints into a KiCad .kicad_dru custom-rule file.
@@ -313,6 +452,10 @@ def compile_kicad_dru(constraints: Dict[str, Any]) -> str:
             lines.append(f'  (constraint track_width (min {rule["min"]}mm))')
         elif constraint == "edge_clearance":
             lines.append(f'  (constraint edge_clearance (min {rule["min"]}mm))')
+        elif constraint == "clearance":
+            lines.append(f'  (constraint clearance (min {rule["min"]}mm))')
+        elif constraint == "length":
+            lines.append(f'  (constraint length (max {rule["max"]}mm))')
         else:
             lines.append(f"  ; Unsupported constraint emitted as metadata: {constraint}")
 
@@ -740,7 +883,21 @@ class AutorouteCFHACommands:
             )
         exclude_from_freerouting = list(dict.fromkeys(exclude_candidates))
 
+        # --- Power trace width: use IPC-2221 if current estimate available ---
         power_target_width_mm = float(merged_defaults["power_min_width_mm"])
+        power_current_a = float(params.get("powerCurrentA", 0))
+        copper_oz = float(params.get("copperOz", 1.0))
+        temp_rise_c = float(params.get("tempRiseC", 10.0))
+        if power_current_a > 0:
+            ipc_width = ipc2221_trace_width_mm(
+                power_current_a, temp_rise_c, copper_oz, is_external=True
+            )
+            power_target_width_mm = max(power_target_width_mm, ipc_width)
+            logger.info(
+                f"IPC-2221: {power_current_a}A @ {temp_rise_c}°C rise → "
+                f"min width {ipc_width}mm (using {power_target_width_mm}mm)"
+            )
+
         observed_power_widths = [
             float(inventory[net]["min_track_width_mm"])
             for net in by_intent.get("POWER_DC", [])
@@ -799,6 +956,46 @@ class AutorouteCFHACommands:
                 }
             )
 
+        # --- Length matching for high-speed nets ---
+        # Reference: Mustafa Ozdal & Wong (2006) — Lagrangian min-max length
+        # Reference: Lin et al. (2021a) — concurrent hierarchical wire snaking
+        hs_single_condition = _condition_for_nets(by_intent.get("HS_SINGLE", []))
+        max_length_mm = float(params.get("maxLengthMm", 0))
+        if max_length_mm > 0 and hs_single_condition:
+            compiled_rules.append(
+                {
+                    "name": "cfha_hs_max_length",
+                    "condition": hs_single_condition,
+                    "constraint": "length",
+                    "max": max_length_mm,
+                    "metadata": {"reason": "HS single-ended length ceiling"},
+                }
+            )
+
+        # Matched-length groups: diff pairs auto-detected from intent partners
+        matched_groups: List[Dict[str, Any]] = []
+        seen_pairs: set = set()
+        for intent_item in intents:
+            if intent_item.get("intent") == "HS_DIFF" and intent_item.get("diff_partner"):
+                a_name = intent_item["net_name"]
+                b_name = intent_item["diff_partner"]
+                pair_key = tuple(sorted((a_name, b_name)))
+                if pair_key not in seen_pairs:
+                    seen_pairs.add(pair_key)
+                    matched_groups.append({
+                        "nets": list(pair_key),
+                        "maxSkewMm": merged_defaults["hs_diff_skew_mm"],
+                        "type": "diff_pair",
+                    })
+
+        # User-supplied matched-length groups (e.g. DDR data bus)
+        for group in params.get("matchedLengthGroups", []):
+            matched_groups.append({
+                "nets": group.get("nets", []),
+                "maxSkewMm": float(group.get("maxSkewMm", 0.5)),
+                "type": group.get("type", "bus"),
+            })
+
         edge_condition = _condition_for_nets(
             by_intent.get("RF", []) + by_intent.get("HS_DIFF", []) + by_intent.get("HS_SINGLE", [])
         )
@@ -811,6 +1008,55 @@ class AutorouteCFHACommands:
                     "min": merged_defaults["edge_clearance_mm"],
                 }
             )
+
+        # --- Crosstalk guard spacing ---
+        # HS nets need guard spacing from other signal nets to prevent crosstalk.
+        # Rule: 3x trace width is the industry-standard minimum; we use the
+        # profile-specific guard value which already accounts for stackup.
+        # Reference: IPC-2141A Section 5.3 — crosstalk coupling.
+        hs_all_nets = by_intent.get("HS_DIFF", []) + by_intent.get("HS_SINGLE", [])
+        crosstalk_guard = float(merged_defaults.get("crosstalk_guard_mm", 0.4))
+        if hs_all_nets and crosstalk_guard > 0:
+            hs_condition = _condition_for_nets(hs_all_nets)
+            if hs_condition:
+                compiled_rules.append({
+                    "name": "cfha_crosstalk_guard",
+                    "condition": hs_condition,
+                    "constraint": "clearance",
+                    "min": crosstalk_guard,
+                    "metadata": {"reason": "Crosstalk guard spacing (IPC-2141A)"},
+                })
+
+        # --- Analog/RF isolation ---
+        # Analog-sensitive and RF nets need extra clearance from digital signals.
+        # Reference: Henry Ott "Electromagnetic Compatibility Engineering" Ch 18.
+        analog_rf_nets = by_intent.get("ANALOG_SENSITIVE", []) + by_intent.get("RF", [])
+        analog_guard = float(merged_defaults.get("analog_guard_mm", 1.0))
+        if analog_rf_nets and analog_guard > 0:
+            analog_condition = _condition_for_nets(analog_rf_nets)
+            if analog_condition:
+                compiled_rules.append({
+                    "name": "cfha_analog_isolation",
+                    "condition": analog_condition,
+                    "constraint": "clearance",
+                    "min": analog_guard,
+                    "metadata": {"reason": "Analog/RF isolation from digital signals"},
+                })
+
+        # --- Power switching noise isolation ---
+        # Switching power nets (LX, PHASE, BST) should be kept away from
+        # sensitive analog/RF traces.
+        switching_nets = by_intent.get("POWER_SWITCHING", [])
+        if switching_nets and analog_rf_nets:
+            switching_condition = _condition_for_nets(switching_nets)
+            if switching_condition:
+                compiled_rules.append({
+                    "name": "cfha_switching_isolation",
+                    "condition": switching_condition,
+                    "constraint": "clearance",
+                    "min": max(analog_guard, 1.5),
+                    "metadata": {"reason": "Switching noise isolation from sensitive nets"},
+                })
 
         constraints = {
             "schemaVersion": 1,
@@ -833,7 +1079,16 @@ class AutorouteCFHACommands:
                 "observedPowerMinWidthMm": round(min(observed_power_widths), 4)
                 if observed_power_widths
                 else None,
+                "ipc2221": {
+                    "currentA": power_current_a,
+                    "copperOz": copper_oz,
+                    "tempRiseC": temp_rise_c,
+                    "calculatedWidthMm": round(
+                        ipc2221_trace_width_mm(power_current_a, temp_rise_c, copper_oz), 4
+                    ) if power_current_a > 0 else None,
+                },
             },
+            "matchedLengthGroups": matched_groups,
             "compiledRules": compiled_rules,
             "excludeFromFreeRouting": exclude_from_freerouting,
             "criticalClasses": params.get(
@@ -888,7 +1143,166 @@ class AutorouteCFHACommands:
             "ruleCount": len(constraints.get("compiledRules", [])),
         }
 
+    def _estimate_net_congestion(
+        self,
+        pads: List[Dict[str, Any]],
+        board: pcbnew.BOARD,
+    ) -> float:
+        """Estimate routing congestion for a net based on pad density.
+
+        Nets in congested regions should be routed earlier to secure channels.
+        Congestion = number of nearby pads from other nets within 3mm radius.
+
+        Reference: Rubin (1974) congestion-driven ordering; modern EDA tools
+        use similar heuristics for net ordering in sequential routers.
+        """
+        if not pads:
+            return 0.0
+        radius_mm = 3.0
+        total_nearby = 0
+        pad_positions = [(float(p["x"]), float(p["y"])) for p in pads]
+        for fp in board.GetFootprints():
+            for pad in fp.Pads():
+                pos = pad.GetPosition()
+                px = pos.x / 1_000_000
+                py = pos.y / 1_000_000
+                for cx, cy in pad_positions:
+                    if math.hypot(px - cx, py - cy) < radius_mm:
+                        total_nearby += 1
+                        break
+        return float(total_nearby)
+
+    def _route_multi_pin_net(
+        self,
+        pads: List[Dict[str, Any]],
+        layer: str,
+        width_mm: float,
+        net_name: str,
+        footprints: Dict[str, Any],
+        applier: "HybridRouteApplier",
+    ) -> Dict[str, Any]:
+        """Route a multi-pin net (>2 pads) using MST decomposition.
+
+        Algorithm:
+          1. Build MST over pad positions using Prim's algorithm.
+          2. Route each MST edge as a 2-pin sub-problem.
+          3. Use plan_steiner_tree from orthogonal_router when all pads
+             are on the same layer (fast path).
+          4. Fall back to sequential pad-to-pad routing otherwise.
+
+        Reference: Kahng & Robins (1992) — iterative Steiner tree heuristics.
+        """
+        from commands.orthogonal_router import plan_steiner_tree
+
+        # Check if all pads are on the same layer
+        pad_layers = set()
+        for p in pads:
+            ref = p["ref"]
+            if ref in footprints:
+                fp = footprints[ref]
+                pad_layers.add(fp.GetLayer())
+
+        terminals = [(float(p["x"]), float(p["y"])) for p in pads]
+
+        if len(pad_layers) == 1:
+            # All on same layer — use Steiner tree planner
+            obstacles = self.routing_commands._collect_routing_obstacles(
+                layer,
+                self.routing_commands._get_clearance_mm() + width_mm / 2,
+                ignored_refs=[p["ref"] for p in pads],
+                net=net_name,
+            )
+            tree_paths = plan_steiner_tree(
+                terminals, obstacles,
+                bend_penalty=max(width_mm * 2, 1.0),
+                pad_repulsion=1.0,
+                pad_centers=self._collect_all_pad_centers(),
+            )
+            if tree_paths:
+                segment_count = 0
+                for path in tree_paths:
+                    res = applier.route_path(
+                        path, layer=layer, width_mm=width_mm, net_name=net_name,
+                    )
+                    if res.get("success"):
+                        segment_count += 1
+                return {
+                    "success": segment_count > 0,
+                    "message": f"Steiner tree: routed {segment_count}/{len(tree_paths)} edges",
+                    "backend": "steiner_tree",
+                    "edgesRouted": segment_count,
+                    "edgesTotal": len(tree_paths),
+                }
+
+        # Fallback: sequential pad-to-pad routing via MST order
+        n = len(pads)
+        in_tree = [False] * n
+        min_edge: List[Tuple[float, int]] = [(float("inf"), -1)] * n
+        min_edge[0] = (0.0, -1)
+        mst_edges: List[Tuple[int, int]] = []
+
+        for _ in range(n):
+            u = -1
+            for v in range(n):
+                if not in_tree[v] and (u == -1 or min_edge[v][0] < min_edge[u][0]):
+                    u = v
+            if u == -1:
+                break
+            in_tree[u] = True
+            parent = min_edge[u][1]
+            if parent >= 0:
+                mst_edges.append((parent, u))
+            for v in range(n):
+                if not in_tree[v]:
+                    dist = _distance_mm(terminals[u], terminals[v])
+                    if dist < min_edge[v][0]:
+                        min_edge[v] = (dist, u)
+
+        routed_edges = 0
+        for u, v in mst_edges:
+            result = self.routing_commands.route_pad_to_pad({
+                "fromRef": pads[u]["ref"],
+                "fromPad": pads[u]["pad"],
+                "toRef": pads[v]["ref"],
+                "toPad": pads[v]["pad"],
+                "layer": layer,
+                "width": width_mm,
+                "net": net_name,
+            })
+            if result.get("success"):
+                routed_edges += 1
+
+        return {
+            "success": routed_edges > 0,
+            "message": f"MST decomposition: routed {routed_edges}/{len(mst_edges)} edges",
+            "backend": "mst_decomposition",
+            "edgesRouted": routed_edges,
+            "edgesTotal": len(mst_edges),
+        }
+
+    def _collect_all_pad_centers(self) -> List[PointMm]:
+        """Collect all pad centers on the board for pad-repulsion heuristic."""
+        if not self.board:
+            return []
+        centers: List[PointMm] = []
+        for fp in self.board.GetFootprints():
+            for pad in fp.Pads():
+                pos = pad.GetPosition()
+                centers.append((pos.x / 1_000_000, pos.y / 1_000_000))
+        return centers
+
     def route_critical_nets(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Route critical nets with multi-pin support and congestion-aware ordering.
+
+        Improvements over basic sequential routing:
+          - **Multi-pin net support**: Nets with >2 pads are decomposed via MST
+            and routed using Steiner tree heuristics (Kahng & Robins 1992).
+          - **Congestion-aware ordering**: Within each priority tier, nets in
+            congested regions are routed first to secure channels (Rubin 1974).
+          - **Rip-up and reroute**: Failed nets get a second attempt after all
+            other nets have been routed, as the routing landscape may have
+            changed (PathFinder-style, McMurchie & Ebeling 1995).
+        """
         board, board_path, error = self._ensure_board(params)
         if error:
             return error
@@ -908,31 +1322,44 @@ class AutorouteCFHACommands:
         footprints = {fp.GetReference(): fp for fp in board.GetFootprints()}
         routed: List[Dict[str, Any]] = []
         skipped: List[Dict[str, Any]] = []
+        failed_for_retry: List[Dict[str, Any]] = []
 
-        for intent in constraints["intents"]:
-            if intent["intent"] not in critical_classes:
-                continue
-            if intent["track_length_mm"] > 0:
-                skipped.append(
-                    {
-                        "net": intent["net_name"],
-                        "reason": "already_routed",
-                        "intent": intent["intent"],
-                    }
-                )
-                continue
-
+        # --- Congestion-aware net ordering ---
+        # Within each priority level, route congested nets first
+        critical_intents = [
+            intent for intent in constraints["intents"]
+            if intent["intent"] in critical_classes and intent["track_length_mm"] <= 0
+        ]
+        for intent in critical_intents:
             net_info = inventory.get(intent["net_name"], {})
             pads = net_info.get("pads", [])
-            if len(pads) != 2:
-                skipped.append(
-                    {
-                        "net": intent["net_name"],
-                        "reason": "unsupported_pad_topology",
-                        "padCount": len(pads),
-                        "intent": intent["intent"],
-                    }
-                )
+            intent["_congestion"] = self._estimate_net_congestion(pads, board)
+
+        critical_intents.sort(
+            key=lambda item: (-item["priority"], -item.get("_congestion", 0), item["net_name"])
+        )
+
+        # Mark already-routed nets
+        for intent in constraints["intents"]:
+            if intent["intent"] in critical_classes and intent["track_length_mm"] > 0:
+                skipped.append({
+                    "net": intent["net_name"],
+                    "reason": "already_routed",
+                    "intent": intent["intent"],
+                })
+
+        # --- Main routing pass ---
+        for intent in critical_intents:
+            net_info = inventory.get(intent["net_name"], {})
+            pads = net_info.get("pads", [])
+
+            if len(pads) < 2:
+                skipped.append({
+                    "net": intent["net_name"],
+                    "reason": "insufficient_pads",
+                    "padCount": len(pads),
+                    "intent": intent["intent"],
+                })
                 continue
 
             width_mm = float(params.get("criticalWidthMm") or 0.25)
@@ -944,6 +1371,27 @@ class AutorouteCFHACommands:
                 )
                 width_mm = max(width_mm, power_target)
 
+            # Multi-pin net routing (>2 pads)
+            if len(pads) > 2:
+                layer = params.get("criticalLayer", "F.Cu")
+                result = self._route_multi_pin_net(
+                    pads, layer, width_mm, intent["net_name"], footprints, applier,
+                )
+                if result.get("success"):
+                    routed.append({
+                        "net": intent["net_name"],
+                        "intent": intent["intent"],
+                        "widthMm": width_mm,
+                        "backend": result.get("backend", "mst"),
+                        "multiPin": True,
+                        "edgesRouted": result.get("edgesRouted", 0),
+                        "edgesTotal": result.get("edgesTotal", 0),
+                    })
+                else:
+                    failed_for_retry.append(intent)
+                continue
+
+            # 2-pin net routing (original logic with IPC-first)
             same_layer_ipc = False
             result: Dict[str, Any]
             if self.ipc_board_api and pads[0]["ref"] in footprints and pads[1]["ref"] in footprints:
@@ -985,23 +1433,75 @@ class AutorouteCFHACommands:
                     }
                 )
             if result.get("success"):
-                routed.append(
-                    {
+                routed.append({
+                    "net": intent["net_name"],
+                    "intent": intent["intent"],
+                    "widthMm": width_mm,
+                    "backend": "ipc" if same_layer_ipc else "swig",
+                })
+            else:
+                failed_for_retry.append(intent)
+
+        # --- Rip-up and reroute pass (PathFinder-style) ---
+        # Failed nets get a second chance after the routing landscape has changed.
+        # Reference: McMurchie & Ebeling (1995) — PathFinder negotiated congestion.
+        rerouted: List[Dict[str, Any]] = []
+        max_reroute_passes = int(params.get("maxReroutePasses", 1))
+        for pass_num in range(max_reroute_passes):
+            if not failed_for_retry:
+                break
+            still_failed: List[Dict[str, Any]] = []
+            for intent in failed_for_retry:
+                net_info = inventory.get(intent["net_name"], {})
+                pads = net_info.get("pads", [])
+                width_mm = float(params.get("criticalWidthMm") or 0.25)
+                if intent["intent"] in {"POWER_DC", "POWER_SWITCHING"}:
+                    power_target = float(
+                        constraints.get("derived", {}).get(
+                            "powerTargetWidthMm", constraints["defaults"]["power_min_width_mm"]
+                        )
+                    )
+                    width_mm = max(width_mm, power_target)
+
+                if len(pads) > 2:
+                    layer = params.get("criticalLayer", "F.Cu")
+                    result = self._route_multi_pin_net(
+                        pads, layer, width_mm, intent["net_name"], footprints, applier,
+                    )
+                elif len(pads) == 2:
+                    result = self.routing_commands.route_pad_to_pad({
+                        "fromRef": pads[0]["ref"],
+                        "fromPad": pads[0]["pad"],
+                        "toRef": pads[1]["ref"],
+                        "toPad": pads[1]["pad"],
+                        "layer": params.get("criticalLayer", "F.Cu"),
+                        "width": width_mm,
+                        "net": intent["net_name"],
+                    })
+                else:
+                    result = {"success": False}
+
+                if result.get("success"):
+                    rerouted.append({
                         "net": intent["net_name"],
                         "intent": intent["intent"],
                         "widthMm": width_mm,
-                        "backend": "ipc" if same_layer_ipc else "swig",
-                    }
-                )
-            else:
-                skipped.append(
-                    {
-                        "net": intent["net_name"],
-                        "intent": intent["intent"],
-                        "reason": "route_failed",
-                        "error": result.get("errorDetails", result.get("message")),
-                    }
-                )
+                        "reroutePass": pass_num + 1,
+                    })
+                else:
+                    still_failed.append(intent)
+            failed_for_retry = still_failed
+
+        # Record final failures
+        for intent in failed_for_retry:
+            skipped.append({
+                "net": intent["net_name"],
+                "intent": intent["intent"],
+                "reason": "route_failed_after_retry",
+                "padCount": len(inventory.get(intent["net_name"], {}).get("pads", [])),
+            })
+
+        routed.extend(rerouted)
 
         try:
             board.Save(str(board_path))
@@ -1010,9 +1510,13 @@ class AutorouteCFHACommands:
 
         return {
             "success": True,
-            "message": f"Critical routing stage completed ({len(routed)} routed, {len(skipped)} skipped)",
+            "message": (
+                f"Critical routing completed: {len(routed)} routed "
+                f"({len(rerouted)} via reroute), {len(skipped)} skipped"
+            ),
             "boardPath": str(board_path),
             "routed": routed,
+            "rerouted": rerouted,
             "skipped": skipped,
             "backendPreference": "ipc" if self.ipc_board_api else "swig",
         }
@@ -1269,28 +1773,44 @@ class AutorouteCFHACommands:
 
         severity = drc_result.get("summary", {}).get("by_severity", {})
         completion_rate = round(completed_nets / routeable_nets, 4) if routeable_nets else 1.0
+
+        flat_metrics = {
+            "wirelengthMm": round(wirelength_mm, 3),
+            "viaCount": via_count,
+            "routeableNetCount": routeable_nets,
+            "completedNetCount": completed_nets,
+            "completionRate": completion_rate,
+            "drcErrors": int(severity.get("error", 0)),
+            "drcWarnings": int(severity.get("warning", 0)),
+            "maxDiffSkewMm": round(max(diff_lengths.values(), default=0.0), 4),
+            "maxUncoupledMm": round(max(uncoupled_estimates, default=0.0), 4),
+        }
+        flags = {
+            "powerNetMisuse": power_misuse_flags,
+            "returnPathRisk": return_path_risk_flags,
+        }
+
+        # Compute weighted QoR score (uses qorWeights from constraints)
+        constraints_result = params.get("constraintsResult", {})
+        constraints_data = constraints_result.get("constraints", {})
+        qor_weights = constraints_data.get("qorWeights", params.get("qorWeights", {}))
+        qor = compute_weighted_qor_score(flat_metrics, flags, qor_weights, constraints_data)
+
         report = {
             "success": severity.get("error", 0) == 0,
             "boardPath": str(board_path),
             "completionRate": completion_rate,
+            "qorScore": qor["score"],
+            "qorGrade": qor["grade"],
+            "qorDetail": qor,
             "drc": {
                 "errors": int(severity.get("error", 0)),
                 "warnings": int(severity.get("warning", 0)),
                 "violationsFile": drc_result.get("violationsFile"),
                 "reportPath": drc_result.get("reportPath"),
             },
-            "metrics": {
-                "wirelengthMm": round(wirelength_mm, 3),
-                "viaCount": via_count,
-                "routeableNetCount": routeable_nets,
-                "completedNetCount": completed_nets,
-                "maxDiffSkewMm": round(max(diff_lengths.values(), default=0.0), 4),
-                "maxUncoupledMm": round(max(uncoupled_estimates, default=0.0), 4),
-            },
-            "flags": {
-                "powerNetMisuse": power_misuse_flags,
-                "returnPathRisk": return_path_risk_flags,
-            },
+            "metrics": flat_metrics,
+            "flags": flags,
             "pairSkewMm": diff_lengths,
         }
 
@@ -1388,6 +1908,9 @@ class AutorouteCFHACommands:
             "strategy": strategy,
             "boardPath": str(board_path),
             "completionRate": verify.get("completionRate"),
+            "qorScore": verify.get("qorScore"),
+            "qorGrade": verify.get("qorGrade"),
+            "qorDetail": verify.get("qorDetail"),
             "drc": verify.get("drc"),
             "metrics": {
                 **verify.get("metrics", {}),

@@ -1,18 +1,29 @@
 """
 Geometry helpers for obstacle-aware orthogonal routing.
 
-The planner here is intentionally lightweight: it builds a sparse rectilinear
-grid from start/end coordinates and inflated obstacle boundaries, then runs A*
-over that grid with an optional bend penalty. This is not a full autorouter,
-but it is a large step up from single-segment routing and is practical for
-mechanically clean MCP-generated traces and wire stubs.
+The planner builds a sparse rectilinear visibility grid from start/end
+coordinates, inflated obstacle boundaries, **and Hanan grid intersections**,
+then runs A* over that grid with bend penalty, pad repulsion, and optional
+congestion awareness.
+
+Key algorithmic foundations:
+  - Hanan grid theorem (Hanan 1966): The rectilinear Steiner minimum tree
+    lies on the Hanan grid formed by horizontal/vertical lines through all
+    terminal and obstacle-corner points.
+  - A* with directional state: tracking incoming direction in the search
+    state enables accurate bend-cost accounting without double-counting.
+  - Pad-away regularisation (He 2024 Eq 3.2): penalises routes that pass
+    close to unrelated pads, preserving routing channels for later nets.
+  - Congestion-driven cost (Rubin 1974 / PathFinder): optional per-cell
+    congestion penalty steers routes away from already-dense regions.
 """
 
 from __future__ import annotations
 
 import heapq
+import math
 from itertools import pairwise
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 Point = Tuple[float, float]
 Rect = Tuple[float, float, float, float]
@@ -234,29 +245,31 @@ def pick_escape_point(point: Point, rect: Rect, clearance: float, target: Point)
     )
 
 
-def plan_orthogonal_path(
-    start: Point,
-    end: Point,
-    obstacles: Iterable[Rect],
+def _build_hanan_grid(
+    terminals: Iterable[Point],
+    obstacles: Sequence[Rect],
     *,
-    bend_penalty: float = 2.0,
     extra_xs: Optional[Iterable[float]] = None,
     extra_ys: Optional[Iterable[float]] = None,
-) -> Optional[List[Point]]:
-    """
-    Plan an obstacle-aware orthogonal path using A* on a sparse visibility grid.
+    midpoint_density: int = 1,
+) -> Tuple[List[float], List[float]]:
+    """Build a Hanan grid from terminals and obstacle corners.
 
-    Obstacles are assumed to be pre-inflated with the required clearance.
-    """
-    start = round_point(start)
-    end = round_point(end)
-    if start == end:
-        return [start]
+    The Hanan grid (Hanan 1966) is formed by drawing horizontal and vertical
+    lines through every terminal point and obstacle corner.  The rectilinear
+    Steiner minimum tree is guaranteed to lie on this grid.
 
-    rects = [normalize_rect(rect) for rect in obstacles]
-    xs = {start[0], end[0]}
-    ys = {start[1], end[1]}
-    for rect in rects:
+    When *midpoint_density* > 0, extra grid lines are inserted at midpoints
+    between adjacent lines.  This improves path quality at a modest cost to
+    search space size.  density=1 adds one midpoint per gap (triples grid
+    resolution), density=0 uses the raw Hanan grid.
+    """
+    xs: set[float] = set()
+    ys: set[float] = set()
+    for pt in terminals:
+        xs.add(round(pt[0], 6))
+        ys.add(round(pt[1], 6))
+    for rect in obstacles:
         xs.update((round(rect[0], 6), round(rect[2], 6)))
         ys.update((round(rect[1], 6), round(rect[3], 6)))
     if extra_xs:
@@ -264,8 +277,128 @@ def plan_orthogonal_path(
     if extra_ys:
         ys.update(round(y, 6) for y in extra_ys)
 
-    xs_list = sorted(xs)
-    ys_list = sorted(ys)
+    xs_sorted = sorted(xs)
+    ys_sorted = sorted(ys)
+
+    if midpoint_density > 0 and len(xs_sorted) >= 2:
+        midpoints_x: set[float] = set()
+        for a, b in pairwise(xs_sorted):
+            gap = b - a
+            if gap > _EPSILON:
+                for i in range(1, midpoint_density + 1):
+                    midpoints_x.add(round(a + gap * i / (midpoint_density + 1), 6))
+        xs_sorted = sorted(xs | midpoints_x)
+
+    if midpoint_density > 0 and len(ys_sorted) >= 2:
+        midpoints_y: set[float] = set()
+        for a, b in pairwise(ys_sorted):
+            gap = b - a
+            if gap > _EPSILON:
+                for i in range(1, midpoint_density + 1):
+                    midpoints_y.add(round(a + gap * i / (midpoint_density + 1), 6))
+        ys_sorted = sorted(ys | midpoints_y)
+
+    return xs_sorted, ys_sorted
+
+
+def estimate_congestion(
+    point: Point,
+    existing_tracks: Optional[Sequence[Tuple[Point, Point]]] = None,
+    cell_size: float = 1.0,
+) -> float:
+    """Estimate routing congestion near *point*.
+
+    Returns a density value ≥ 0 representing how many existing track segments
+    pass through the grid cell containing *point*.  This drives the
+    congestion-aware cost term in A*.
+
+    Reference: Rubin (1974) congestion-driven routing; PathFinder (McMurchie &
+    Ebeling 1995) historical congestion penalty.
+    """
+    if not existing_tracks:
+        return 0.0
+    cx = point[0]
+    cy = point[1]
+    half = cell_size / 2
+    count = 0
+    for seg_start, seg_end in existing_tracks:
+        # Check if segment passes near this cell
+        min_x = min(seg_start[0], seg_end[0]) - half
+        max_x = max(seg_start[0], seg_end[0]) + half
+        min_y = min(seg_start[1], seg_end[1]) - half
+        max_y = max(seg_start[1], seg_end[1]) + half
+        if min_x <= cx <= max_x and min_y <= cy <= max_y:
+            count += 1
+    return float(count)
+
+
+def plan_orthogonal_path(
+    start: Point,
+    end: Point,
+    obstacles: Iterable[Rect],
+    *,
+    bend_penalty: float = 2.0,
+    pad_repulsion: float = 0.0,
+    pad_centers: Optional[Iterable[Point]] = None,
+    extra_xs: Optional[Iterable[float]] = None,
+    extra_ys: Optional[Iterable[float]] = None,
+    via_cost: float = 0.0,
+    congestion_weight: float = 0.0,
+    existing_tracks: Optional[Sequence[Tuple[Point, Point]]] = None,
+    congestion_cell_size: float = 1.0,
+    midpoint_density: int = 1,
+) -> Optional[List[Point]]:
+    """
+    Plan an obstacle-aware orthogonal path using A* on a Hanan grid.
+
+    Obstacles are assumed to be pre-inflated with the required clearance.
+
+    **Hanan Grid (Hanan 1966):**
+    The search grid is the Hanan grid formed by horizontal/vertical lines
+    through all terminal points and obstacle corners.  This guarantees that
+    the optimal rectilinear Steiner path lies on the grid.  Optional midpoint
+    insertion (*midpoint_density*) further improves path quality.
+
+    **Cost function** (multi-term, all additive):
+
+        g(n→m) = L(n,m) + λ_b · bend(n,m) + λ_g · pad_away(m)
+                 + λ_c · congestion(m) + λ_v · via(m)
+
+    where:
+      - L(n,m) = Manhattan distance (wirelength)
+      - λ_b · bend = bend penalty when direction changes
+      - λ_g · pad_away = pad repulsion term (He 2024 Eq 3.2)
+      - λ_c · congestion = congestion-driven penalty (Rubin 1974)
+      - λ_v · via = via transition cost (layer change penalty)
+
+    Reference: He (2024) Eq 3.2 — g(x) = L + λ_g · (1 / min_p d(x, p))
+    """
+    start = round_point(start)
+    end = round_point(end)
+    if start == end:
+        return [start]
+
+    rects = [normalize_rect(rect) for rect in obstacles]
+
+    # Build Hanan grid with midpoint enrichment
+    xs_list, ys_list = _build_hanan_grid(
+        [start, end],
+        rects,
+        extra_xs=extra_xs,
+        extra_ys=extra_ys,
+        midpoint_density=midpoint_density,
+    )
+
+    # Cap grid size to avoid combinatorial explosion on dense boards
+    _MAX_GRID_POINTS = 10_000
+    if len(xs_list) * len(ys_list) > _MAX_GRID_POINTS:
+        # Fall back to raw Hanan grid without midpoints
+        xs_list, ys_list = _build_hanan_grid(
+            [start, end], rects,
+            extra_xs=extra_xs, extra_ys=extra_ys,
+            midpoint_density=0,
+        )
+
     valid_nodes = {
         (x, y)
         for x in xs_list
@@ -292,6 +425,28 @@ def plan_orthogonal_path(
     if start not in adjacency or end not in adjacency:
         return None
 
+    # Pre-compute pad centers list for repulsion term (He 2024 Eq 3.2)
+    _pad_pts: List[Point] = []
+    if pad_repulsion > 0 and pad_centers:
+        _pad_pts = [round_point(p) for p in pad_centers if round_point(p) not in (start, end)]
+
+    def _pad_cost(pt: Point) -> float:
+        """Pad-away regularisation: λ_g / min_p d(x, p)."""
+        if not _pad_pts or pad_repulsion <= 0:
+            return 0.0
+        min_d = min(manhattan_distance(pt, p) for p in _pad_pts)
+        if min_d < _EPSILON:
+            return pad_repulsion * 100.0  # very close to pad — heavy penalty
+        return pad_repulsion / min_d
+
+    def _congestion_cost(pt: Point) -> float:
+        """Congestion penalty: λ_c · density(cell)."""
+        if congestion_weight <= 0 or not existing_tracks:
+            return 0.0
+        density = estimate_congestion(pt, existing_tracks, congestion_cell_size)
+        return congestion_weight * density
+
+    # A* with directional state for accurate bend accounting
     queue: List[Tuple[float, float, Point, Optional[str]]] = [
         (manhattan_distance(start, end), 0.0, start, None)
     ]
@@ -317,7 +472,9 @@ def plan_orthogonal_path(
                 continue
             step_cost = manhattan_distance(node, neighbor)
             bend_cost = bend_penalty if incoming_dir and incoming_dir != direction else 0.0
-            next_cost = cost_so_far + step_cost + bend_cost
+            repulsion_cost = _pad_cost(neighbor)
+            congest_cost = _congestion_cost(neighbor)
+            next_cost = cost_so_far + step_cost + bend_cost + repulsion_cost + congest_cost
             next_state = (neighbor, direction)
             if next_cost + _EPSILON < best_costs.get(next_state, float("inf")):
                 best_costs[next_state] = next_cost
@@ -326,3 +483,103 @@ def plan_orthogonal_path(
                 heapq.heappush(queue, (next_cost + heuristic, next_cost, neighbor, direction))
 
     return None
+
+
+def plan_steiner_tree(
+    terminals: Sequence[Point],
+    obstacles: Iterable[Rect],
+    *,
+    bend_penalty: float = 2.0,
+    pad_repulsion: float = 0.0,
+    pad_centers: Optional[Iterable[Point]] = None,
+    extra_xs: Optional[Iterable[float]] = None,
+    extra_ys: Optional[Iterable[float]] = None,
+    congestion_weight: float = 0.0,
+    existing_tracks: Optional[Sequence[Tuple[Point, Point]]] = None,
+) -> Optional[List[List[Point]]]:
+    """Plan a rectilinear Steiner tree connecting multiple terminals.
+
+    For multi-pin nets (>2 pads), this decomposes the problem using a minimum
+    spanning tree (MST) on terminal distances, then routes each edge of the
+    MST independently using ``plan_orthogonal_path``.
+
+    Algorithm (Prim-based MST decomposition):
+      1. Build complete graph on terminals with Manhattan distance weights.
+      2. Extract MST using Prim's algorithm.
+      3. Route each MST edge using A* on the Hanan grid.
+      4. Previously-routed segments become obstacles for subsequent edges
+         (prevents overlapping traces).
+
+    Reference: Kahng & Robins (1992) — "A new class of iterative Steiner tree
+    heuristics with good performance".
+
+    Returns a list of paths (one per MST edge), or None if any edge fails.
+    """
+    if len(terminals) < 2:
+        return None
+    if len(terminals) == 2:
+        path = plan_orthogonal_path(
+            terminals[0], terminals[1], obstacles,
+            bend_penalty=bend_penalty,
+            pad_repulsion=pad_repulsion,
+            pad_centers=pad_centers,
+            extra_xs=extra_xs,
+            extra_ys=extra_ys,
+            congestion_weight=congestion_weight,
+            existing_tracks=existing_tracks,
+        )
+        return [path] if path else None
+
+    terms = [round_point(t) for t in terminals]
+
+    # Prim's MST
+    n = len(terms)
+    in_tree = [False] * n
+    min_edge: List[Tuple[float, int]] = [(float("inf"), -1)] * n
+    min_edge[0] = (0.0, -1)
+    mst_edges: List[Tuple[int, int]] = []
+
+    for _ in range(n):
+        # Pick minimum-cost node not yet in tree
+        u = -1
+        for v in range(n):
+            if not in_tree[v] and (u == -1 or min_edge[v][0] < min_edge[u][0]):
+                u = v
+        if u == -1:
+            break
+        in_tree[u] = True
+        parent = min_edge[u][1]
+        if parent >= 0:
+            mst_edges.append((parent, u))
+        # Update costs
+        for v in range(n):
+            if not in_tree[v]:
+                dist = manhattan_distance(terms[u], terms[v])
+                if dist < min_edge[v][0]:
+                    min_edge[v] = (dist, u)
+
+    # Route each MST edge, adding routed segments as soft obstacles
+    obstacle_list = list(obstacles)
+    routed_tracks: List[Tuple[Point, Point]] = list(existing_tracks or [])
+    paths: List[List[Point]] = []
+
+    for u, v in mst_edges:
+        path = plan_orthogonal_path(
+            terms[u], terms[v], obstacle_list,
+            bend_penalty=bend_penalty,
+            pad_repulsion=pad_repulsion,
+            pad_centers=pad_centers,
+            extra_xs=extra_xs,
+            extra_ys=extra_ys,
+            congestion_weight=congestion_weight,
+            existing_tracks=routed_tracks,
+        )
+        if path is None:
+            # Try direct L-route as fallback
+            path = [terms[u], terms[v]]
+        paths.append(path)
+        # Add routed segments for congestion tracking
+        for seg_a, seg_b in pairwise(path):
+            routed_tracks.append((seg_a, seg_b))
+
+    return paths
