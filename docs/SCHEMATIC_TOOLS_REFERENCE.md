@@ -287,12 +287,21 @@ Runs the KiCAD Electrical Rules Check (ERC) on a schematic and returns all viola
 
 Import the schematic netlist into the PCB board — equivalent to pressing F8 in KiCAD (Tools → Update PCB from Schematic). MUST be called after the schematic is complete and before placing or routing components on the PCB. Without this step, the board has no footprints and no net assignments — place_component and route_pad_to_pad will produce an empty, unroutable board.
 
-| Parameter     | Type   | Required | Description                                    |
-| ------------- | ------ | -------- | ---------------------------------------------- |
-| schematicPath | string | Yes      | Absolute path to the .kicad_sch schematic file |
-| boardPath     | string | Yes      | Absolute path to the .kicad_pcb board file     |
+| Parameter                 | Type   | Required | Description                                                                                     |
+| ------------------------- | ------ | -------- | ----------------------------------------------------------------------------------------------- |
+| schematicPath             | string | No       | Absolute path to the .kicad_sch schematic file. If omitted, inferred from the board/project.   |
+| boardPath                 | string | No       | Absolute path to the .kicad_pcb board file. If omitted, uses the currently loaded board.       |
+| autoPlaceMissingFootprints | bool  | No       | Auto-place schematic footprints missing from the PCB. Defaults to true only when the board is blank. |
+| placementStrategy         | string | No       | `routing_aware` (default) clusters connected parts and places connectors near edges; `grid` uses the legacy deterministic grid. |
+| placementEdgeMarginMm     | number | No       | Minimum margin from the board edge for routing-aware auto-placement.                            |
+| placementClusterGapMm     | number | No       | Preferred spacing between routing-aware placement clusters.                                     |
+| placementStartXmm         | number | No       | Grid fallback start X in mm, and the fallback origin when routing-aware placement has leftovers. |
+| placementStartYmm         | number | No       | Grid fallback start Y in mm, and the fallback origin when routing-aware placement has leftovers. |
+| placementPitchXmm         | number | No       | Preferred horizontal spacing between auto-placed footprints in mm.                              |
+| placementPitchYmm         | number | No       | Preferred vertical spacing between auto-placed footprints in mm.                                |
+| placementColumns          | number | No       | Column count used by the deterministic grid fallback.                                           |
 
-**Usage Notes:** This is the F8 equivalent. It synchronizes the schematic design to the PCB, creating footprints on the board and assigning nets. This step is critical in the workflow: design in schematic → sync_schematic_to_board → place and route on PCB.
+**Usage Notes:** This is the F8 equivalent. It synchronizes the schematic design to the PCB, creating footprints on the board and assigning nets. On blank boards, the default `routing_aware` strategy uses connectivity to keep tightly related parts near each other, biases analog connectors upward, biases power/switching connectors downward, and preserves easier breakout/routing channels for high-speed clusters. The response now also includes `auto_place_clusters` and `auto_place_rules`, so agents can inspect which placement rules were applied before routing. Use `placementStrategy: "grid"` when you need the previous simple deterministic staging layout.
 
 ## Example Workflows
 

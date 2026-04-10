@@ -182,6 +182,44 @@ def test_generate_constraints_respects_explicit_empty_exclusion_list(tmp_path):
     assert result["constraints"]["excludeFromFreeRouting"] == []
 
 
+def test_generate_constraints_adds_rf_rules_and_policy(tmp_path):
+    commands = AutorouteCFHACommands()
+    result = commands.generate_routing_constraints(
+        {
+            "intentResult": {
+                "success": True,
+                "boardPath": str(tmp_path / "rf_demo.kicad_pcb"),
+                "profiles": ["rf_mixed_signal"],
+                "interfaces": [],
+                "analysisSummary": {"copperLayers": ["F.Cu", "In1.Cu", "In2.Cu", "B.Cu"]},
+                "byIntent": {
+                    "RF": ["RF_IN"],
+                    "ANALOG_SENSITIVE": ["ADC_IN"],
+                    "POWER_SWITCHING": ["SW"],
+                },
+                "intents": [
+                    {"net_name": "RF_IN", "intent": "RF", "track_length_mm": 0.0},
+                    {"net_name": "ADC_IN", "intent": "ANALOG_SENSITIVE", "track_length_mm": 0.0},
+                    {"net_name": "SW", "intent": "POWER_SWITCHING", "track_length_mm": 0.0},
+                ],
+                "netInventory": {},
+            }
+        }
+    )
+
+    assert result["success"] is True
+    rules = {rule["name"]: rule for rule in result["constraints"]["compiledRules"]}
+    assert rules["cfha_rf_via_limit"]["max"] == 1
+    assert rules["cfha_rf_clearance"]["min"] == 2.0
+    assert rules["cfha_switching_isolation"]["min"] == 2.0
+    assert result["constraints"]["policy"]["criticalOrdering"] == [
+        "intent_priority",
+        "escape_complexity",
+        "local_congestion",
+    ]
+    assert "cfha_rf_clearance" in result["constraints"]["policy"]["compiledRuleFamilies"]
+
+
 def test_autoroute_default_pipeline_returns_artifacts(monkeypatch, tmp_path):
     board = MagicMock()
     board.GetFileName.return_value = str(tmp_path / "demo.kicad_pcb")
@@ -269,3 +307,85 @@ def test_autoroute_default_pipeline_returns_artifacts(monkeypatch, tmp_path):
     assert result["completionRate"] == 1.0
     assert result["artifacts"]["rulesPath"].endswith(".kicad_dru")
     assert result["metrics"]["runtimeSec"] >= 0
+
+
+def test_route_critical_nets_prioritizes_escape_complexity_before_congestion(monkeypatch, tmp_path):
+    def _footprint(ref: str, pad_count: int):
+        footprint = MagicMock()
+        footprint.GetReference.return_value = ref
+        footprint.Pads.return_value = [object()] * pad_count
+        return footprint
+
+    board = MagicMock()
+    board.GetFileName.return_value = str(tmp_path / "demo.kicad_pcb")
+    board.GetFootprints.return_value = [
+        _footprint("J1", 24),
+        _footprint("U1", 64),
+        _footprint("U2", 8),
+        _footprint("U3", 8),
+    ]
+
+    routed_order = []
+    routing_commands = MagicMock()
+
+    def _route(params):
+        routed_order.append(params["net"])
+        return {"success": True}
+
+    routing_commands.route_pad_to_pad.side_effect = _route
+    commands = AutorouteCFHACommands(board=board, routing_commands=routing_commands)
+
+    monkeypatch.setattr(
+        commands,
+        "_ensure_board",
+        lambda params: (board, Path(board.GetFileName()), None),
+    )
+    monkeypatch.setattr(
+        commands,
+        "_collect_inventory",
+        lambda _board: {
+            "USB_CLK": {
+                "pads": [
+                    {"ref": "J1", "pad": "1", "x": 0.0, "y": 0.0},
+                    {"ref": "U1", "pad": "1", "x": 10.0, "y": 0.0},
+                ]
+            },
+            "CTRL": {
+                "pads": [
+                    {"ref": "U2", "pad": "1", "x": 30.0, "y": 20.0},
+                    {"ref": "U3", "pad": "1", "x": 45.0, "y": 20.0},
+                ]
+            },
+        },
+    )
+    monkeypatch.setattr(commands, "_estimate_net_congestion", lambda pads, _board: 0.0)
+
+    result = commands.route_critical_nets(
+        {
+            "constraintsResult": {
+                "success": True,
+                "constraints": {
+                    "criticalClasses": ["HS_SINGLE"],
+                    "defaults": {"power_min_width_mm": 0.8},
+                    "derived": {},
+                    "intents": [
+                        {
+                            "net_name": "CTRL",
+                            "intent": "HS_SINGLE",
+                            "track_length_mm": 0.0,
+                            "priority": 85,
+                        },
+                        {
+                            "net_name": "USB_CLK",
+                            "intent": "HS_SINGLE",
+                            "track_length_mm": 0.0,
+                            "priority": 85,
+                        },
+                    ],
+                },
+            }
+        }
+    )
+
+    assert result["success"] is True
+    assert routed_order == ["USB_CLK", "CTRL"]

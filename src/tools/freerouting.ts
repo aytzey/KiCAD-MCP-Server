@@ -18,6 +18,32 @@ export function registerFreeroutingTools(server: McpServer, callKicadScript: Fun
       .array(z.string())
       .optional()
       .describe("Critical intent classes routed before bulk routing"),
+    powerCurrentA: z
+      .number()
+      .optional()
+      .describe("Optional DC current in amps used to derive IPC-2221 minimum power trace widths"),
+    copperOz: z
+      .number()
+      .optional()
+      .describe("Copper weight in oz used for IPC-2221 power-width synthesis (default: 1.0 oz)"),
+    tempRiseC: z
+      .number()
+      .optional()
+      .describe("Allowed temperature rise in Celsius for IPC-2221 power-width synthesis (default: 10 C)"),
+    maxLengthMm: z
+      .number()
+      .optional()
+      .describe("Optional absolute length ceiling for HS single-ended nets"),
+    matchedLengthGroups: z
+      .array(
+        z.object({
+          nets: z.array(z.string()).describe("Net names that should be matched together"),
+          maxSkewMm: z.number().optional().describe("Maximum skew inside the group in mm"),
+          type: z.string().optional().describe("Group type label such as diff_pair or bus"),
+        }),
+      )
+      .optional()
+      .describe("Optional explicit matched-length groups such as DDR or address/data buses"),
     excludeFromFreeRouting: z
       .array(z.string())
       .optional()
@@ -48,10 +74,26 @@ export function registerFreeroutingTools(server: McpServer, callKicadScript: Fun
       ),
     maxPasses: z.number().optional().describe("Maximum Freerouting passes for the bulk stage"),
     timeout: z.number().optional().describe("Freerouting timeout in seconds"),
+    maxReroutePasses: z
+      .number()
+      .optional()
+      .describe("Number of retry passes for failed critical nets after the main routing pass"),
     orthorouteExecutable: z
       .string()
       .optional()
       .describe("Optional external OrthoRoute executable path"),
+    refillZones: z
+      .boolean()
+      .optional()
+      .describe("Refill copper zones during post-route cleanup"),
+    reportPath: z
+      .string()
+      .optional()
+      .describe("Optional DRC report output path used by QoR verification"),
+    qorReportPath: z
+      .string()
+      .optional()
+      .describe("Optional JSON QoR report output path"),
   };
 
   // Default autoroute now points to the hybrid CFHA orchestrator.
@@ -135,6 +177,20 @@ export function registerFreeroutingTools(server: McpServer, callKicadScript: Fun
       profiles: z.array(z.string()).optional(),
       interfaces: z.array(z.string()).optional(),
       criticalClasses: z.array(z.string()).optional(),
+      powerCurrentA: z.number().optional().describe("Optional DC current in amps for IPC-2221 power-width synthesis"),
+      copperOz: z.number().optional().describe("Copper weight in oz for IPC-2221 power-width synthesis"),
+      tempRiseC: z.number().optional().describe("Allowed temperature rise in Celsius for IPC-2221 power-width synthesis"),
+      maxLengthMm: z.number().optional().describe("Optional length ceiling for HS single-ended nets"),
+      matchedLengthGroups: z
+        .array(
+          z.object({
+            nets: z.array(z.string()),
+            maxSkewMm: z.number().optional(),
+            type: z.string().optional(),
+          }),
+        )
+        .optional()
+        .describe("Optional matched-length groups such as buses that need bounded skew"),
       excludeFromFreeRouting: z.array(z.string()).optional(),
       seed: z.number().optional(),
       outputPath: z.string().optional().describe("Optional path for the generated constraints JSON"),
@@ -172,6 +228,7 @@ export function registerFreeroutingTools(server: McpServer, callKicadScript: Fun
       criticalClasses: z.array(z.string()).optional().describe("Critical classes to route in this stage"),
       criticalLayer: z.string().optional().describe("Preferred layer for critical routing (default: F.Cu)"),
       criticalWidthMm: z.number().optional().describe("Preferred width override for critical routing"),
+      maxReroutePasses: z.number().optional().describe("Retry count for critical nets that fail in the first pass"),
       profiles: z.array(z.string()).optional(),
       interfaces: z.array(z.string()).optional(),
     },

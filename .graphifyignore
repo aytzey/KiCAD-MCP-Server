@@ -1,0 +1,3 @@
+# Avoid recursive graph inputs and local graphify scratch files.
+graphify-out/
+.graphify_*

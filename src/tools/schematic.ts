@@ -1135,7 +1135,7 @@ Note: operates on .kicad_sch files only. To modify a PCB footprint use edit_comp
   // Sync schematic to PCB board (equivalent to KiCAD F8 / "Update PCB from Schematic")
   server.tool(
     "sync_schematic_to_board",
-    "Import the schematic netlist into the PCB board — equivalent to pressing F8 in KiCAD (Tools → Update PCB from Schematic). On blank boards this can auto-place missing footprints from the schematic before assigning nets; on existing boards it syncs net assignments to the footprints already on the PCB.",
+    "Import the schematic netlist into the PCB board — equivalent to pressing F8 in KiCAD (Tools → Update PCB from Schematic). On blank boards this can auto-place missing footprints from the schematic before assigning nets using either a routing-aware cluster strategy or a simple deterministic grid; on existing boards it syncs net assignments to the footprints already on the PCB.",
     {
       schematicPath: z
         .string()
@@ -1148,12 +1148,52 @@ Note: operates on .kicad_sch files only. To modify a PCB footprint use edit_comp
       autoPlaceMissingFootprints: z
         .boolean()
         .optional()
-        .describe("If true, auto-place schematic footprints missing from the PCB using a deterministic grid. Defaults to true only when the board is blank."),
+        .describe("If true, auto-place schematic footprints missing from the PCB. Defaults to true only when the board is blank."),
+      placementStrategy: z
+        .enum(["routing_aware", "grid"])
+        .optional()
+        .describe("Auto-placement strategy for missing footprints. routing_aware clusters connected parts and keeps connectors near edges; grid preserves the legacy deterministic grid behavior."),
+      placementEdgeMarginMm: z
+        .number()
+        .optional()
+        .describe("Keep auto-placed components at least this far from the board outline when routing-aware placement is used."),
+      placementClusterGapMm: z
+        .number()
+        .optional()
+        .describe("Preferred spacing between routing-aware placement clusters."),
+      placementStartXmm: z
+        .number()
+        .optional()
+        .describe("Grid fallback start X in mm, and the fallback origin when routing-aware placement has leftovers."),
+      placementStartYmm: z
+        .number()
+        .optional()
+        .describe("Grid fallback start Y in mm, and the fallback origin when routing-aware placement has leftovers."),
+      placementPitchXmm: z
+        .number()
+        .optional()
+        .describe("Preferred horizontal spacing between auto-placed footprints in mm."),
+      placementPitchYmm: z
+        .number()
+        .optional()
+        .describe("Preferred vertical spacing between auto-placed footprints in mm."),
+      placementColumns: z
+        .number()
+        .optional()
+        .describe("Column count used by the deterministic grid fallback."),
     },
     async (args: {
       schematicPath?: string;
       boardPath?: string;
       autoPlaceMissingFootprints?: boolean;
+      placementStrategy?: "routing_aware" | "grid";
+      placementEdgeMarginMm?: number;
+      placementClusterGapMm?: number;
+      placementStartXmm?: number;
+      placementStartYmm?: number;
+      placementPitchXmm?: number;
+      placementPitchYmm?: number;
+      placementColumns?: number;
     }) => {
       const result = await callKicadScript("sync_schematic_to_board", args);
       return {

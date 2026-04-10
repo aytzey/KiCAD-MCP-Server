@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "kicad": {
+      "command": "node",
+      "args": ["/home/aytzey/Desktop/Windows150GB/KiCAD-MCP-Server/dist/index.js"],
+      "env": {
+        "NODE_ENV": "production",
+        "PYTHONPATH": "/usr/lib/python3/dist-packages:/usr/share/kicad/scripting/plugins",
+        "LOG_LEVEL": "info",
+        "KICAD_AUTO_LAUNCH": "false"
+      }
+    }
+  }
+}

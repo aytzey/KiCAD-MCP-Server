@@ -1086,6 +1086,35 @@ AUTOROUTE_TOOLS = [
                 "profiles": {"type": "array", "items": {"type": "string"}},
                 "interfaces": {"type": "array", "items": {"type": "string"}},
                 "criticalClasses": {"type": "array", "items": {"type": "string"}},
+                "powerCurrentA": {
+                    "type": "number",
+                    "description": "Optional DC current in amps used to derive IPC-2221 minimum power trace widths",
+                },
+                "copperOz": {
+                    "type": "number",
+                    "description": "Copper weight in oz for IPC-2221 power-width synthesis",
+                },
+                "tempRiseC": {
+                    "type": "number",
+                    "description": "Allowed temperature rise in Celsius for IPC-2221 power-width synthesis",
+                },
+                "maxLengthMm": {
+                    "type": "number",
+                    "description": "Optional absolute length ceiling for HS single-ended nets",
+                },
+                "matchedLengthGroups": {
+                    "type": "array",
+                    "description": "Optional explicit matched-length groups such as DDR or address/data buses",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "nets": {"type": "array", "items": {"type": "string"}},
+                            "maxSkewMm": {"type": "number"},
+                            "type": {"type": "string"},
+                        },
+                        "required": ["nets"],
+                    },
+                },
                 "excludeFromFreeRouting": {
                     "type": "array",
                     "items": {"type": "string"},
@@ -1094,7 +1123,24 @@ AUTOROUTE_TOOLS = [
                 "freeroutingJar": {"type": "string", "description": "Path to freerouting.jar"},
                 "maxPasses": {"type": "integer", "minimum": 1},
                 "timeout": {"type": "integer", "minimum": 1},
+                "maxReroutePasses": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Retry count for critical nets that fail in the first pass",
+                },
                 "orthorouteExecutable": {"type": "string", "description": "Optional external OrthoRoute executable"},
+                "refillZones": {
+                    "type": "boolean",
+                    "description": "Refill copper zones during post-route cleanup",
+                },
+                "reportPath": {
+                    "type": "string",
+                    "description": "Optional DRC report output path used by QoR verification",
+                },
+                "qorReportPath": {
+                    "type": "string",
+                    "description": "Optional JSON QoR report output path",
+                },
             },
         },
     },
@@ -1114,13 +1160,33 @@ AUTOROUTE_TOOLS = [
                 "profiles": {"type": "array", "items": {"type": "string"}},
                 "interfaces": {"type": "array", "items": {"type": "string"}},
                 "criticalClasses": {"type": "array", "items": {"type": "string"}},
+                "powerCurrentA": {"type": "number"},
+                "copperOz": {"type": "number"},
+                "tempRiseC": {"type": "number"},
+                "maxLengthMm": {"type": "number"},
+                "matchedLengthGroups": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "nets": {"type": "array", "items": {"type": "string"}},
+                            "maxSkewMm": {"type": "number"},
+                            "type": {"type": "string"},
+                        },
+                        "required": ["nets"],
+                    },
+                },
                 "excludeFromFreeRouting": {
                     "type": "array",
                     "items": {"type": "string"},
                     "description": "Net names to keep out of the bulk router. Pass [] to exclude nothing explicitly.",
                 },
                 "freeroutingJar": {"type": "string"},
+                "maxReroutePasses": {"type": "integer", "minimum": 1},
                 "orthorouteExecutable": {"type": "string"},
+                "refillZones": {"type": "boolean"},
+                "reportPath": {"type": "string"},
+                "qorReportPath": {"type": "string"},
             },
         },
     },
@@ -1164,6 +1230,22 @@ AUTOROUTE_TOOLS = [
                 "profiles": {"type": "array", "items": {"type": "string"}},
                 "interfaces": {"type": "array", "items": {"type": "string"}},
                 "criticalClasses": {"type": "array", "items": {"type": "string"}},
+                "powerCurrentA": {"type": "number"},
+                "copperOz": {"type": "number"},
+                "tempRiseC": {"type": "number"},
+                "maxLengthMm": {"type": "number"},
+                "matchedLengthGroups": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "nets": {"type": "array", "items": {"type": "string"}},
+                            "maxSkewMm": {"type": "number"},
+                            "type": {"type": "string"},
+                        },
+                        "required": ["nets"],
+                    },
+                },
                 "excludeFromFreeRouting": {
                     "type": "array",
                     "items": {"type": "string"},
@@ -1196,6 +1278,7 @@ AUTOROUTE_TOOLS = [
                 "criticalClasses": {"type": "array", "items": {"type": "string"}},
                 "criticalLayer": {"type": "string"},
                 "criticalWidthMm": {"type": "number"},
+                "maxReroutePasses": {"type": "integer", "minimum": 1},
             },
         },
     },
@@ -1776,7 +1859,41 @@ SCHEMATIC_TOOLS = [
                 },
                 "autoPlaceMissingFootprints": {
                     "type": "boolean",
-                    "description": "If true, auto-place schematic footprints missing from the PCB using a deterministic grid. Defaults to true only when the board is blank.",
+                    "description": "If true, auto-place schematic footprints missing from the PCB. Defaults to true only when the board is blank.",
+                },
+                "placementStrategy": {
+                    "type": "string",
+                    "enum": ["routing_aware", "grid"],
+                    "description": "Auto-placement strategy for missing footprints. routing_aware clusters connected parts and pushes connectors toward edges; grid preserves the legacy deterministic grid behavior.",
+                },
+                "placementEdgeMarginMm": {
+                    "type": "number",
+                    "description": "Minimum distance to keep from the board outline when routing-aware auto-placement is used.",
+                },
+                "placementClusterGapMm": {
+                    "type": "number",
+                    "description": "Preferred spacing between routing-aware placement clusters.",
+                },
+                "placementStartXmm": {
+                    "type": "number",
+                    "description": "Grid fallback start X in mm, and the fallback origin when routing-aware placement has leftovers.",
+                },
+                "placementStartYmm": {
+                    "type": "number",
+                    "description": "Grid fallback start Y in mm, and the fallback origin when routing-aware placement has leftovers.",
+                },
+                "placementPitchXmm": {
+                    "type": "number",
+                    "description": "Preferred horizontal spacing between auto-placed footprints in mm.",
+                },
+                "placementPitchYmm": {
+                    "type": "number",
+                    "description": "Preferred vertical spacing between auto-placed footprints in mm.",
+                },
+                "placementColumns": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Column count used by the deterministic grid fallback.",
                 },
             },
         },

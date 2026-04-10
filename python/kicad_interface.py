@@ -9,10 +9,12 @@ JSON and returns responses via stdout also as JSON.
 
 import json
 import logging
+import math
 import os
+import re
 import sys
 import traceback
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from resources.resource_definitions import RESOURCE_DEFINITIONS, handle_resource_read
 
@@ -915,16 +917,206 @@ class KiCADInterface:
                 }
             )
 
-        components.sort(key=lambda item: item["reference"])
+        components.sort(key=lambda item: self._reference_sort_key(item["reference"]))
         return components
 
-    def _build_auto_place_plan(
+    def _reference_sort_key(self, reference: str) -> Tuple[str, int, str]:
+        """Return a stable natural-sort key for designators like U2 < U10."""
+        match = re.match(r"^([A-Za-z]+)(\d+)(.*)$", reference or "")
+        if not match:
+            return ((reference or "").upper(), 0, "")
+        prefix, number, suffix = match.groups()
+        return (prefix.upper(), int(number), suffix.upper())
+
+    def _component_prefix(self, reference: str) -> str:
+        match = re.match(r"^([A-Za-z]+)", reference or "")
+        return match.group(1).upper() if match else (reference or "").upper()
+
+    def _net_kind(self, net_name: str) -> str:
+        upper = (net_name or "").upper()
+        if any(token in upper for token in ("GND", "PGND", "AGND", "DGND", "EARTH")):
+            return "ground"
+        if any(token in upper for token in ("SW", "PHASE", "LX", "BST", "GATE")):
+            return "power_switching"
+        if any(token in upper for token in ("VIN", "VCC", "VBAT", "VDD", "3V3", "5V", "12V", "24V")):
+            return "power"
+        if any(token in upper for token in ("RF", "ANT", "LNA", "PA")):
+            return "rf"
+        if any(token in upper for token in ("ADC", "DAC", "VREF", "SENSE", "MIC", "AUDIO", "ANALOG")):
+            return "analog"
+        if any(token in upper for token in ("USB", "PCIE", "DDR", "HDMI", "ETH", "MIPI", "LVDS", "CLK", "CLOCK")):
+            return "high_speed"
+        return "signal"
+
+    def _net_connectivity_weight(self, net_name: str, fanout: int) -> float:
+        """Down-weight global power nets and up-weight high-speed point-to-point links."""
+        kind = self._net_kind(net_name)
+        if kind == "ground":
+            return 0.05 if fanout > 2 else 0.2
+        if kind == "power":
+            return 0.15 if fanout > 2 else 0.5
+        if kind == "power_switching":
+            return 1.1 if fanout <= 3 else 0.8
+        if kind == "rf":
+            return 2.2 if fanout <= 4 else 1.4
+        if kind == "analog":
+            return 1.6 if fanout <= 4 else 1.1
+        if kind == "high_speed":
+            return 2.0 if fanout <= 4 else 1.2
+        if fanout <= 2:
+            return 1.4
+        if fanout <= 4:
+            return 1.0
+        return 0.5
+
+    def _component_signal_profile(self, nets: Set[str]) -> str:
+        kinds = {self._net_kind(net) for net in nets}
+        if "rf" in kinds:
+            return "rf"
+        if "high_speed" in kinds:
+            return "high_speed"
+        if "analog" in kinds:
+            return "analog"
+        if "power_switching" in kinds:
+            return "power_switching"
+        if "power" in kinds:
+            return "power"
+        if kinds == {"ground"}:
+            return "ground"
+        return "generic"
+
+    def _build_component_connectivity(
         self,
         schematic_components: List[Dict[str, str]],
-        existing_refs: set,
+        netlist: Optional[Dict[str, Any]],
+    ) -> Tuple[Dict[str, Set[str]], Dict[str, Dict[str, float]]]:
+        refs = {item["reference"] for item in schematic_components}
+        component_nets: Dict[str, Set[str]] = {ref: set() for ref in refs}
+        adjacency: Dict[str, Dict[str, float]] = {ref: {} for ref in refs}
+        if not netlist:
+            return component_nets, adjacency
+
+        for net_entry in netlist.get("nets", []):
+            net_name = net_entry.get("name", "")
+            members = sorted(
+                {
+                    connection.get("component")
+                    for connection in net_entry.get("connections", [])
+                    if connection.get("component") in refs
+                },
+                key=self._reference_sort_key,
+            )
+            if not members:
+                continue
+
+            for ref in members:
+                component_nets[ref].add(net_name)
+
+            weight = self._net_connectivity_weight(net_name, len(members))
+            for ref in members:
+                for other in members:
+                    if other == ref:
+                        continue
+                    adjacency[ref][other] = adjacency[ref].get(other, 0.0) + weight
+
+        return component_nets, adjacency
+
+    def _classify_auto_place_role(
+        self,
+        component: Dict[str, str],
+        component_nets: Dict[str, Set[str]],
+        adjacency: Dict[str, Dict[str, float]],
+    ) -> str:
+        reference = component["reference"]
+        prefix = self._component_prefix(reference)
+        footprint = (component.get("footprint") or "").upper()
+        nets = component_nets.get(reference, set())
+        degree = len(adjacency.get(reference, {}))
+        has_power = any(self._net_kind(net) == "power" for net in nets)
+        has_ground = any(self._net_kind(net) == "ground" for net in nets)
+        has_high_speed = any(self._net_kind(net) == "high_speed" for net in nets)
+        signal_profile = self._component_signal_profile(nets)
+
+        if prefix in {"J", "P", "X"} or any(
+            token in footprint for token in ("CONNECTOR", "HEADER", "USB", "RJ", "FFC", "FPC")
+        ):
+            return "connector"
+        if prefix in {"U", "Q"} or any(
+            token in footprint for token in ("QFN", "QFP", "BGA", "SOP", "SOIC", "TQFP", "LQFP", "MODULE", "IC")
+        ):
+            if has_power and has_ground and any(
+                token in "".join(sorted(nets)).upper() for token in ("SW", "PHASE", "LX", "BST", "GATE")
+            ):
+                return "power_anchor"
+            return "anchor"
+        if signal_profile == "power_switching":
+            return "power_anchor"
+        if prefix in {"L", "D"} and has_power:
+            return "power_anchor"
+        if prefix == "C" and has_power and has_ground:
+            return "decoupling"
+        if prefix in {"R", "C", "L", "FB"}:
+            return "passive"
+        if signal_profile in {"rf", "analog"}:
+            return "anchor"
+        if has_high_speed or degree >= 3:
+            return "anchor"
+        return "support"
+
+    def _auto_place_anchor_score(
+        self,
+        component: Dict[str, Any],
+        component_nets: Dict[str, Set[str]],
+        adjacency: Dict[str, Dict[str, float]],
+    ) -> float:
+        role_weight = {
+            "connector": 120.0,
+            "power_anchor": 110.0,
+            "anchor": 95.0,
+            "decoupling": 45.0,
+            "passive": 25.0,
+            "support": 20.0,
+        }
+        signal_weight = {
+            "rf": 16.0,
+            "high_speed": 14.0,
+            "analog": 11.0,
+            "power_switching": 10.0,
+            "power": 6.0,
+        }
+        ref = component["reference"]
+        return (
+            role_weight.get(component["role"], 20.0)
+            + signal_weight.get(component.get("signalProfile", "generic"), 0.0)
+            + len(component_nets.get(ref, set())) * 4.0
+            + sum(adjacency.get(ref, {}).values())
+        )
+
+    def _grid_position_sequence(
+        self,
+        start_x: float,
+        start_y: float,
+        pitch_x: float,
+        pitch_y: float,
+        columns: int,
+        count: int,
+    ) -> List[Tuple[float, float]]:
+        positions: List[Tuple[float, float]] = []
+        for slot in range(count):
+            column = slot % columns
+            row = slot // columns
+            positions.append(
+                (round(start_x + column * pitch_x, 4), round(start_y + row * pitch_y, 4))
+            )
+        return positions
+
+    def _build_grid_auto_place_plan(
+        self,
+        schematic_components: List[Dict[str, str]],
+        existing_refs: Set[str],
         params: Dict[str, Any],
-    ) -> Dict[str, List[Dict[str, Any]]]:
-        """Build a deterministic grid placement plan for schematic components missing on the PCB."""
+    ) -> Dict[str, Any]:
+        """Original deterministic grid planner used as a safe fallback."""
         start_x = float(params.get("placementStartXmm", 25.0))
         start_y = float(params.get("placementStartYmm", 25.0))
         pitch_x = float(params.get("placementPitchXmm", 20.0))
@@ -967,13 +1159,580 @@ class KiCADInterface:
                 }
             )
 
-        return {"placements": placements, "skipped": skipped}
+        return {
+            "strategy": "grid",
+            "placements": placements,
+            "skipped": skipped,
+            "clusters": [],
+            "rules": [
+                {
+                    "name": "deterministic_grid",
+                    "description": "Place missing footprints on a stable row/column grid using placementStart/Pitch/Columns.",
+                }
+            ],
+        }
 
-    def _auto_place_missing_footprints(self, schematic, board_path: str, board, params: Dict[str, Any]):
+    def _get_auto_place_bounds(
+        self,
+        board,
+        params: Dict[str, Any],
+        count: int,
+    ) -> Tuple[float, float, float, float]:
+        edge_margin = float(params.get("placementEdgeMarginMm", 3.0))
+        try:
+            bbox = board.GetBoardEdgesBoundingBox()
+            left = bbox.GetLeft() / 1_000_000 + edge_margin
+            top = bbox.GetTop() / 1_000_000 + edge_margin
+            right = bbox.GetRight() / 1_000_000 - edge_margin
+            bottom = bbox.GetBottom() / 1_000_000 - edge_margin
+            if right > left and bottom > top:
+                return (left, top, right, bottom)
+        except Exception:
+            pass
+
+        start_x = float(params.get("placementStartXmm", 25.0))
+        start_y = float(params.get("placementStartYmm", 25.0))
+        pitch_x = float(params.get("placementPitchXmm", 20.0))
+        pitch_y = float(params.get("placementPitchYmm", 15.0))
+        columns = max(1, int(params.get("placementColumns", 6)))
+        rows = max(1, math.ceil(max(count, 1) / columns))
+        width = max(columns * pitch_x + edge_margin * 2, 60.0)
+        height = max(rows * pitch_y + edge_margin * 2, 40.0)
+        return (start_x, start_y, start_x + width, start_y + height)
+
+    def _cluster_spiral_offsets(
+        self,
+        pitch_x: float,
+        pitch_y: float,
+        count: int,
+    ) -> List[Tuple[float, float]]:
+        offsets = [(0.0, 0.0)]
+        ring = 1
+        while len(offsets) < count:
+            ring_offsets: List[Tuple[float, float]] = []
+            for dx in range(-ring, ring + 1):
+                for dy in range(-ring, ring + 1):
+                    if max(abs(dx), abs(dy)) != ring:
+                        continue
+                    ring_offsets.append((dx * pitch_x, dy * pitch_y))
+            ring_offsets.sort(
+                key=lambda item: (
+                    abs(item[0]) + abs(item[1]),
+                    abs(item[1]),
+                    abs(item[0]),
+                    item[1],
+                    item[0],
+                )
+            )
+            offsets.extend(ring_offsets)
+            ring += 1
+        return offsets[:count]
+
+    def _cluster_signal_profile(self, members: List[Dict[str, Any]]) -> str:
+        counts: Dict[str, int] = {}
+        for member in members:
+            profile = member.get("signalProfile", "generic")
+            counts[profile] = counts.get(profile, 0) + 1
+        if not counts:
+            return "generic"
+        priority = {
+            "rf": 7,
+            "high_speed": 6,
+            "analog": 5,
+            "power_switching": 4,
+            "power": 3,
+            "ground": 2,
+            "generic": 1,
+        }
+        return max(
+            counts,
+            key=lambda profile: (counts[profile], priority.get(profile, 0), profile),
+        )
+
+    def _cluster_rules_applied(
+        self,
+        anchor: Optional[Dict[str, Any]],
+        members: List[Dict[str, Any]],
+        signal_profile: str,
+    ) -> List[str]:
+        rules = ["cluster_by_connectivity", "keep_anchor_locality"]
+        if anchor and anchor.get("role") == "connector":
+            rules.append("connectors_on_edge")
+        if any(member.get("role") == "decoupling" for member in members):
+            rules.append("decoupling_close_to_anchor")
+        if signal_profile in {"high_speed", "rf"}:
+            rules.append("reserve_breakout_corridor")
+        if signal_profile == "analog":
+            rules.append("keep_analog_cluster_quiet")
+        if signal_profile in {"power", "power_switching"}:
+            rules.append("bias_power_cluster_away_from_sensitive_edges")
+        return rules
+
+    def _center_out_values(self, start: float, end: float, count: int) -> List[float]:
+        if count <= 0:
+            return []
+        if count == 1:
+            return [round((start + end) / 2, 4)]
+        step = (end - start) / (count + 1)
+        values = [start + step * (index + 1) for index in range(count)]
+        center = (start + end) / 2
+        return [
+            round(value, 4)
+            for value in sorted(values, key=lambda value: (abs(value - center), value))
+        ]
+
+    def _build_connector_slot_plan(
+        self,
+        connectors: List[Dict[str, Any]],
+        bounds: Tuple[float, float, float, float],
+        pitch_x: float,
+        pitch_y: float,
+        edge_band: float,
+    ) -> Dict[str, Dict[str, Any]]:
+        left, top, right, bottom = bounds
+        profile_priority = {
+            "rf": 0,
+            "high_speed": 1,
+            "generic": 2,
+            "ground": 3,
+            "analog": 4,
+            "power_switching": 5,
+            "power": 6,
+        }
+        ordered = sorted(
+            connectors,
+            key=lambda item: (
+                profile_priority.get(item.get("signalProfile", "generic"), 99),
+                -item.get("anchorScore", 0.0),
+                self._reference_sort_key(item["reference"]),
+            ),
+        )
+        top_connectors = [item for item in ordered if item.get("signalProfile") == "analog"]
+        bottom_connectors = [
+            item
+            for item in ordered
+            if item.get("signalProfile") in {"power", "power_switching"}
+        ]
+        side_connectors = [
+            item for item in ordered if item not in top_connectors and item not in bottom_connectors
+        ]
+
+        slot_plan: Dict[str, Dict[str, Any]] = {}
+        side_ys = self._center_out_values(top + pitch_y, bottom - pitch_y, len(side_connectors))
+        for index, (connector, center_y) in enumerate(zip(side_connectors, side_ys)):
+            edge = "left" if index % 2 == 0 else "right"
+            center_x = left if edge == "left" else right
+            slot_plan[connector["reference"]] = {
+                "edge": edge,
+                "anchorPoint": (center_x, center_y),
+                "inwardCenter": (
+                    round(center_x + (pitch_x if edge == "left" else -pitch_x), 4),
+                    center_y,
+                ),
+                "memberBounds": (
+                    left if edge == "left" else max(left, right - edge_band),
+                    max(top, center_y - pitch_y * 1.5),
+                    min(right, left + edge_band) if edge == "left" else right,
+                    min(bottom, center_y + pitch_y * 1.5),
+                ),
+            }
+
+        top_xs = self._center_out_values(left + pitch_x, right - pitch_x, len(top_connectors))
+        for connector, center_x in zip(top_connectors, top_xs):
+            slot_plan[connector["reference"]] = {
+                "edge": "top",
+                "anchorPoint": (center_x, top),
+                "inwardCenter": (center_x, round(min(bottom, top + pitch_y), 4)),
+                "memberBounds": (
+                    max(left, center_x - pitch_x * 1.5),
+                    top,
+                    min(right, center_x + pitch_x * 1.5),
+                    min(bottom, top + edge_band),
+                ),
+            }
+
+        bottom_xs = self._center_out_values(left + pitch_x, right - pitch_x, len(bottom_connectors))
+        for connector, center_x in zip(bottom_connectors, bottom_xs):
+            slot_plan[connector["reference"]] = {
+                "edge": "bottom",
+                "anchorPoint": (center_x, bottom),
+                "inwardCenter": (center_x, round(max(top, bottom - pitch_y), 4)),
+                "memberBounds": (
+                    max(left, center_x - pitch_x * 1.5),
+                    max(top, bottom - edge_band),
+                    min(right, center_x + pitch_x * 1.5),
+                    bottom,
+                ),
+            }
+
+        return slot_plan
+
+    def _place_cluster_members(
+        self,
+        center_x: float,
+        center_y: float,
+        bounds: Tuple[float, float, float, float],
+        members: List[Dict[str, Any]],
+        pitch_x: float,
+        pitch_y: float,
+    ) -> List[Tuple[Dict[str, Any], Tuple[float, float]]]:
+        offsets = self._cluster_spiral_offsets(pitch_x, pitch_y, len(members))
+        used: Set[Tuple[float, float]] = set()
+        placed: List[Tuple[Dict[str, Any], Tuple[float, float]]] = []
+        for member, (dx, dy) in zip(members, offsets):
+            raw_x = center_x + dx
+            raw_y = center_y + dy
+            x = round(min(max(raw_x, bounds[0]), bounds[2]), 4)
+            y = round(min(max(raw_y, bounds[1]), bounds[3]), 4)
+            if (x, y) in used:
+                continue
+            used.add((x, y))
+            placed.append((member, (x, y)))
+        return placed
+
+    def _build_auto_place_plan(
+        self,
+        schematic_components: List[Dict[str, str]],
+        existing_refs: Set[str],
+        params: Dict[str, Any],
+        *,
+        netlist: Optional[Dict[str, Any]] = None,
+        board=None,
+    ) -> Dict[str, Any]:
+        """Build a deterministic placement plan with routing-aware clustering when net data exists."""
+        strategy = str(params.get("placementStrategy", "routing_aware")).lower()
+        if strategy not in {"routing_aware", "grid"}:
+            strategy = "routing_aware"
+
+        grid_fallback = self._build_grid_auto_place_plan(schematic_components, existing_refs, params)
+        if strategy == "grid" or not netlist:
+            return grid_fallback
+
+        pending = [item for item in grid_fallback["placements"]]
+        skipped = list(grid_fallback["skipped"])
+        if len(pending) <= 1:
+            return {
+                "strategy": "routing_aware",
+                "placements": pending,
+                "skipped": skipped,
+                "clusters": [],
+                "rules": [
+                    {
+                        "name": "singleton_direct_place",
+                        "description": "Only one missing footprint needed placement, so clustering was unnecessary.",
+                    }
+                ],
+            }
+
+        pitch_x = float(params.get("placementPitchXmm", 20.0))
+        pitch_y = float(params.get("placementPitchYmm", 15.0))
+        cluster_gap = float(params.get("placementClusterGapMm", max(pitch_x, pitch_y, 6.0)))
+        bounds = self._get_auto_place_bounds(board, params, len(pending))
+        left, top, right, bottom = bounds
+        width = max(right - left, pitch_x * 3)
+        height = max(bottom - top, pitch_y * 3)
+        edge_band = min(max(pitch_x * 2.0, width * 0.18), width * 0.3)
+
+        component_nets, adjacency = self._build_component_connectivity(pending, netlist)
+        components_by_ref: Dict[str, Dict[str, Any]] = {}
+        for component in pending:
+            reference = component["reference"]
+            meta = dict(component)
+            meta["signalProfile"] = self._component_signal_profile(component_nets.get(reference, set()))
+            meta["role"] = self._classify_auto_place_role(meta, component_nets, adjacency)
+            meta["anchorScore"] = self._auto_place_anchor_score(meta, component_nets, adjacency)
+            components_by_ref[reference] = meta
+
+        ranked = sorted(
+            components_by_ref.values(),
+            key=lambda item: (-item["anchorScore"], self._reference_sort_key(item["reference"])),
+        )
+        anchors = [
+            item
+            for item in ranked
+            if item["role"] in {"connector", "power_anchor", "anchor"}
+        ]
+        if not anchors:
+            promote_count = max(1, min(3, int(math.sqrt(len(ranked)))))
+            anchors = ranked[:promote_count]
+            for item in anchors:
+                item["role"] = "anchor"
+
+        anchor_refs = {item["reference"] for item in anchors}
+        connectors = [
+            item for item in anchors if item["role"] == "connector"
+        ]
+        central_anchors = [
+            item for item in anchors if item["reference"] not in {c["reference"] for c in connectors}
+        ]
+
+        cluster_members: Dict[str, List[Dict[str, Any]]] = {item["reference"]: [item] for item in anchors}
+        for item in ranked:
+            if item["reference"] in anchor_refs:
+                continue
+            candidate_refs = sorted(anchor_refs, key=self._reference_sort_key)
+            best_ref = min(candidate_refs, key=lambda ref: len(cluster_members.get(ref, [])))
+            best_score = -1.0
+            for ref in candidate_refs:
+                score = adjacency.get(item["reference"], {}).get(ref, 0.0)
+                if score > best_score or (
+                    math.isclose(score, best_score) and self._reference_sort_key(ref) < self._reference_sort_key(best_ref)
+                ):
+                    best_score = score
+                    best_ref = ref
+            cluster_members.setdefault(best_ref, []).append(item)
+
+        placements: List[Dict[str, Any]] = []
+        clusters: List[Dict[str, Any]] = []
+        placed_refs: Set[str] = set()
+        plan_rules = [
+            {
+                "name": "connectivity_clustering",
+                "description": "Assign passives and support parts to the anchor with the strongest weighted net affinity.",
+            },
+            {
+                "name": "profiled_edge_connectors",
+                "description": "Keep connectors on board edges, with analog connectors biased to the top edge and power/switching connectors biased to the bottom edge.",
+            },
+            {
+                "name": "anchor_locality",
+                "description": "Place decoupling and support components closest to their anchor to reduce loop area and preserve routing channels.",
+            },
+        ]
+        if any(
+            item.get("signalProfile") in {"analog", "power_switching", "power", "rf"}
+            for item in ranked
+        ):
+            plan_rules.append(
+                {
+                    "name": "signal_profile_separation",
+                    "description": "Bias analog/RF clusters away from switching power regions while keeping high-speed clusters edge-friendly.",
+                }
+            )
+
+        connector_count = len(connectors)
+        if connector_count:
+            connector_meta = self._build_connector_slot_plan(
+                connectors,
+                bounds,
+                pitch_x,
+                pitch_y,
+                edge_band,
+            )
+
+            for connector in connectors:
+                ref = connector["reference"]
+                slot = connector_meta[ref]
+                center_x, center_y = slot["anchorPoint"]
+                inward_center_x, inward_center_y = slot["inwardCenter"]
+                cluster_bounds = slot["memberBounds"]
+                local_members = sorted(
+                    cluster_members.get(ref, []),
+                    key=lambda item: (
+                        0 if item["reference"] == ref else 1,
+                        {"decoupling": 0, "passive": 1, "support": 2, "anchor": 3, "power_anchor": 3, "connector": 4}.get(item["role"], 5),
+                        -adjacency.get(item["reference"], {}).get(ref, 0.0),
+                        self._reference_sort_key(item["reference"]),
+                    ),
+                )
+                cluster_profile = self._cluster_signal_profile(local_members)
+                for member, (x, y) in self._place_cluster_members(
+                    inward_center_x,
+                    inward_center_y,
+                    cluster_bounds,
+                    local_members,
+                    pitch_x,
+                    pitch_y,
+                ):
+                    if member["reference"] == ref:
+                        x = round(center_x, 4)
+                        y = round(center_y, 4)
+                    placements.append(
+                        {
+                            "reference": member["reference"],
+                            "value": member.get("value", ""),
+                            "footprint": member["footprint"],
+                            "position": {"x": x, "y": y, "unit": "mm"},
+                            "rotation": 0,
+                            "layer": "F.Cu",
+                        }
+                    )
+                    placed_refs.add(member["reference"])
+                clusters.append(
+                    {
+                        "anchor": ref,
+                        "role": connector["role"],
+                        "signalProfile": cluster_profile,
+                        "edge": slot["edge"],
+                        "members": [item["reference"] for item in local_members],
+                        "rulesApplied": self._cluster_rules_applied(
+                            connector, local_members, cluster_profile
+                        ),
+                    }
+                )
+
+        remaining_anchors = [
+            item
+            for item in sorted(
+                central_anchors,
+                key=lambda entry: (
+                    {
+                        "rf": 0,
+                        "analog": 1,
+                        "high_speed": 2,
+                        "generic": 3,
+                        "ground": 4,
+                        "power": 5,
+                        "power_switching": 6,
+                    }.get(entry.get("signalProfile", "generic"), 3),
+                    -entry["anchorScore"],
+                    self._reference_sort_key(entry["reference"]),
+                ),
+            )
+            if item["reference"] not in placed_refs
+        ]
+        if remaining_anchors:
+            central_left = min(right, left + edge_band + cluster_gap) if connector_count else left
+            central_right = max(left, right - edge_band - cluster_gap) if connector_count else right
+            central_width = max(central_right - central_left, pitch_x * 3)
+            columns = max(
+                1,
+                min(
+                    len(remaining_anchors),
+                    int(round(math.sqrt(len(remaining_anchors) * central_width / max(height, 1.0)))) or 1,
+                ),
+            )
+            rows = max(1, math.ceil(len(remaining_anchors) / columns))
+            cell_width = central_width / columns
+            cell_height = height / rows
+
+            for idx, anchor in enumerate(remaining_anchors):
+                col = idx % columns
+                row = idx // columns
+                cell_bounds = (
+                    central_left + col * cell_width,
+                    top + row * cell_height,
+                    central_left + (col + 1) * cell_width,
+                    top + (row + 1) * cell_height,
+                )
+                center_x = round((cell_bounds[0] + cell_bounds[2]) / 2, 4)
+                center_y = round((cell_bounds[1] + cell_bounds[3]) / 2, 4)
+                local_members = sorted(
+                    cluster_members.get(anchor["reference"], []),
+                    key=lambda item: (
+                        0 if item["reference"] == anchor["reference"] else 1,
+                        {"decoupling": 0, "passive": 1, "support": 2, "anchor": 3, "power_anchor": 3, "connector": 4}.get(item["role"], 5),
+                        -adjacency.get(item["reference"], {}).get(anchor["reference"], 0.0),
+                        self._reference_sort_key(item["reference"]),
+                    ),
+                )
+                cluster_profile = self._cluster_signal_profile(local_members)
+                inner_bounds = (
+                    cell_bounds[0] + pitch_x * 0.5,
+                    cell_bounds[1] + pitch_y * 0.5,
+                    cell_bounds[2] - pitch_x * 0.5,
+                    cell_bounds[3] - pitch_y * 0.5,
+                )
+                for member, (x, y) in self._place_cluster_members(
+                    center_x,
+                    center_y,
+                    inner_bounds,
+                    local_members,
+                    pitch_x,
+                    pitch_y,
+                ):
+                    placements.append(
+                        {
+                            "reference": member["reference"],
+                            "value": member.get("value", ""),
+                            "footprint": member["footprint"],
+                            "position": {"x": x, "y": y, "unit": "mm"},
+                            "rotation": 0,
+                            "layer": "F.Cu",
+                        }
+                    )
+                    placed_refs.add(member["reference"])
+                clusters.append(
+                    {
+                        "anchor": anchor["reference"],
+                        "role": anchor["role"],
+                        "signalProfile": cluster_profile,
+                        "edge": "core",
+                        "members": [item["reference"] for item in local_members],
+                        "rulesApplied": self._cluster_rules_applied(
+                            anchor, local_members, cluster_profile
+                        ),
+                    }
+                )
+
+        leftovers = [
+            item for item in ranked if item["reference"] not in placed_refs
+        ]
+        if leftovers:
+            fallback_positions = self._grid_position_sequence(
+                float(params.get("placementStartXmm", left)),
+                float(params.get("placementStartYmm", top)),
+                pitch_x,
+                pitch_y,
+                max(1, int(params.get("placementColumns", 6))),
+                len(leftovers),
+            )
+            for item, (x, y) in zip(leftovers, fallback_positions):
+                placements.append(
+                    {
+                        "reference": item["reference"],
+                        "value": item.get("value", ""),
+                        "footprint": item["footprint"],
+                        "position": {"x": x, "y": y, "unit": "mm"},
+                        "rotation": 0,
+                        "layer": "F.Cu",
+                    }
+                )
+            clusters.append(
+                {
+                    "anchor": None,
+                    "role": "fallback",
+                    "signalProfile": "mixed",
+                    "edge": "fallback",
+                    "members": [item["reference"] for item in leftovers],
+                    "rulesApplied": ["fallback_grid_recovery"],
+                }
+            )
+            plan_rules.append(
+                {
+                    "name": "fallback_grid_recovery",
+                    "description": "Any members that could not stay inside their preferred local cluster bands fall back to deterministic grid slots.",
+                }
+            )
+
+        placements.sort(key=lambda item: self._reference_sort_key(item["reference"]))
+        return {
+            "strategy": "routing_aware",
+            "placements": placements,
+            "skipped": skipped,
+            "clusters": clusters,
+            "rules": plan_rules,
+        }
+
+    def _auto_place_missing_footprints(
+        self,
+        schematic,
+        board_path: str,
+        board,
+        params: Dict[str, Any],
+        *,
+        netlist: Optional[Dict[str, Any]] = None,
+    ):
         """Place schematic footprints that are missing from the PCB so sync can assign nets."""
         existing_refs = {fp.GetReference() for fp in board.GetFootprints()}
         schematic_components = self._collect_schematic_footprint_components(schematic)
-        plan = self._build_auto_place_plan(schematic_components, existing_refs, params)
+        plan = self._build_auto_place_plan(
+            schematic_components,
+            existing_refs,
+            params,
+            netlist=netlist,
+            board=board,
+        )
 
         placed: List[Dict[str, Any]] = []
         errors: List[Dict[str, str]] = []
@@ -1006,6 +1765,9 @@ class KiCADInterface:
             "placed": placed,
             "skipped": plan["skipped"],
             "errors": errors,
+            "strategy": plan.get("strategy", "grid"),
+            "clusters": plan.get("clusters", []),
+            "rules": plan.get("rules", []),
         }
 
     def _handle_sync_schematic_to_board(self, params):
@@ -1070,10 +1832,10 @@ class KiCADInterface:
             auto_place_enabled = self._should_auto_place_missing_footprints(
                 params, existing_footprint_count
             )
-            auto_place_result = {"placed": [], "skipped": [], "errors": []}
+            auto_place_result = {"placed": [], "skipped": [], "errors": [], "rules": [], "clusters": []}
             if auto_place_enabled:
                 auto_place_result = self._auto_place_missing_footprints(
-                    schematic, board_path, board, params
+                    schematic, board_path, board, params, netlist=netlist
                 )
 
             # Build (reference, pad_number) -> net_name map
@@ -1139,7 +1901,10 @@ class KiCADInterface:
                 "pads_assigned": assigned_pads,
                 "unmatched_pads_sample": unmatched[:10],
                 "auto_place_triggered": auto_place_enabled,
+                "auto_place_strategy": auto_place_result.get("strategy"),
                 "auto_placed_references": [item["reference"] for item in auto_place_result["placed"]],
+                "auto_place_clusters": auto_place_result.get("clusters", []),
+                "auto_place_rules": auto_place_result.get("rules", []),
                 "auto_place_skipped": auto_place_result["skipped"],
                 "auto_place_errors": auto_place_result["errors"],
             }

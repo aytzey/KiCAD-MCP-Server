@@ -945,6 +945,18 @@ class AutorouteCFHACommands:
                 }
             )
 
+        rf_condition = _condition_for_nets(by_intent.get("RF", []))
+        if rf_condition:
+            compiled_rules.append(
+                {
+                    "name": "cfha_rf_via_limit",
+                    "condition": rf_condition,
+                    "constraint": "via_count",
+                    "max": merged_defaults["rf_via_limit"],
+                    "metadata": {"reason": "RF nets should minimize discontinuities and reference-plane breaks"},
+                }
+            )
+
         power_condition = _condition_for_nets(by_intent.get("POWER_DC", []))
         if power_condition:
             compiled_rules.append(
@@ -1030,31 +1042,39 @@ class AutorouteCFHACommands:
         # --- Analog/RF isolation ---
         # Analog-sensitive and RF nets need extra clearance from digital signals.
         # Reference: Henry Ott "Electromagnetic Compatibility Engineering" Ch 18.
-        analog_rf_nets = by_intent.get("ANALOG_SENSITIVE", []) + by_intent.get("RF", [])
         analog_guard = float(merged_defaults.get("analog_guard_mm", 1.0))
-        if analog_rf_nets and analog_guard > 0:
-            analog_condition = _condition_for_nets(analog_rf_nets)
-            if analog_condition:
-                compiled_rules.append({
-                    "name": "cfha_analog_isolation",
-                    "condition": analog_condition,
-                    "constraint": "clearance",
-                    "min": analog_guard,
-                    "metadata": {"reason": "Analog/RF isolation from digital signals"},
-                })
+        analog_condition = _condition_for_nets(by_intent.get("ANALOG_SENSITIVE", []))
+        if analog_condition and analog_guard > 0:
+            compiled_rules.append({
+                "name": "cfha_analog_isolation",
+                "condition": analog_condition,
+                "constraint": "clearance",
+                "min": analog_guard,
+                "metadata": {"reason": "Analog isolation from noisy digital or switching nets"},
+            })
+
+        rf_guard = float(merged_defaults.get("rf_guard_mm", analog_guard))
+        if rf_condition and rf_guard > 0:
+            compiled_rules.append({
+                "name": "cfha_rf_clearance",
+                "condition": rf_condition,
+                "constraint": "clearance",
+                "min": rf_guard,
+                "metadata": {"reason": "RF keepout / guard corridor to limit coupling and impedance discontinuities"},
+            })
 
         # --- Power switching noise isolation ---
         # Switching power nets (LX, PHASE, BST) should be kept away from
         # sensitive analog/RF traces.
         switching_nets = by_intent.get("POWER_SWITCHING", [])
-        if switching_nets and analog_rf_nets:
+        if switching_nets:
             switching_condition = _condition_for_nets(switching_nets)
             if switching_condition:
                 compiled_rules.append({
                     "name": "cfha_switching_isolation",
                     "condition": switching_condition,
                     "constraint": "clearance",
-                    "min": max(analog_guard, 1.5),
+                    "min": max(analog_guard, rf_guard, 1.5),
                     "metadata": {"reason": "Switching noise isolation from sensitive nets"},
                 })
 
@@ -1095,6 +1115,19 @@ class AutorouteCFHACommands:
                 "criticalClasses",
                 ["RF", "HS_DIFF", "HS_SINGLE", "POWER_SWITCHING", "ANALOG_SENSITIVE"],
             ),
+            "policy": {
+                "criticalOrdering": [
+                    "intent_priority",
+                    "escape_complexity",
+                    "local_congestion",
+                ],
+                "placementCoupling": {
+                    "expectEdgeConnectors": True,
+                    "expectLocalDecoupling": True,
+                    "reserveConnectorBreakouts": True,
+                },
+                "compiledRuleFamilies": [rule["name"] for rule in compiled_rules],
+            },
             "qorWeights": params.get(
                 "qorWeights",
                 {
@@ -1171,6 +1204,50 @@ class AutorouteCFHACommands:
                         total_nearby += 1
                         break
         return float(total_nearby)
+
+    def _estimate_escape_complexity(
+        self,
+        net_name: str,
+        pads: List[Dict[str, Any]],
+        footprints: Dict[str, Any],
+    ) -> float:
+        """Estimate how urgently a net should reserve escape channels.
+
+        Ordered-escape routing literature consistently prioritizes dense pin
+        arrays, differential pairs, and blockage-sensitive connector breakouts.
+        This heuristic collapses those signals into a single ordering term so
+        critical nets that are hardest to escape are routed before easier nets.
+        """
+        if len(pads) < 2:
+            return 0.0
+
+        unique_refs = sorted({pad["ref"] for pad in pads})
+        score = 0.0
+        for ref in unique_refs:
+            footprint = footprints.get(ref)
+            if footprint is None:
+                continue
+            try:
+                pad_count = sum(1 for _ in footprint.Pads())
+            except Exception:
+                pad_count = 0
+
+            score += min(pad_count, 64) / 8.0
+            ref_upper = ref.upper()
+            if ref_upper.startswith(("J", "P", "X")):
+                score += 2.0
+            if pad_count >= 16:
+                score += 2.0
+            if pad_count >= 48:
+                score += 2.0
+
+        if _diff_partner_name(net_name):
+            score += 2.5
+        if len(unique_refs) > 2:
+            score += (len(unique_refs) - 2) * 1.5
+        if _best_intent(net_name) in {"HS_DIFF", "HS_SINGLE", "RF"}:
+            score += 1.0
+        return round(score, 4)
 
     def _route_multi_pin_net(
         self,
@@ -1297,6 +1374,9 @@ class AutorouteCFHACommands:
         Improvements over basic sequential routing:
           - **Multi-pin net support**: Nets with >2 pads are decomposed via MST
             and routed using Steiner tree heuristics (Kahng & Robins 1992).
+          - **Escape-aware ordering**: Nets attached to dense connectors and
+            pin arrays route before easy nets so breakout channels are reserved
+            while the board is still open (Jiao & Dong 2018).
           - **Congestion-aware ordering**: Within each priority tier, nets in
             congested regions are routed first to secure channels (Rubin 1974).
           - **Rip-up and reroute**: Failed nets get a second attempt after all
@@ -1334,9 +1414,17 @@ class AutorouteCFHACommands:
             net_info = inventory.get(intent["net_name"], {})
             pads = net_info.get("pads", [])
             intent["_congestion"] = self._estimate_net_congestion(pads, board)
+            intent["_escape_complexity"] = self._estimate_escape_complexity(
+                intent["net_name"], pads, footprints
+            )
 
         critical_intents.sort(
-            key=lambda item: (-item["priority"], -item.get("_congestion", 0), item["net_name"])
+            key=lambda item: (
+                -item["priority"],
+                -item.get("_escape_complexity", 0),
+                -item.get("_congestion", 0),
+                item["net_name"],
+            )
         )
 
         # Mark already-routed nets
