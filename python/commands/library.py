@@ -52,6 +52,10 @@ class LibraryManager:
                 logger.info(f"Loading project fp-lib-table from: {project_table}")
                 self._parse_fp_lib_table(project_table)
 
+        discovered = self._discover_pretty_libraries()
+        if discovered:
+            logger.info(f"Discovered {discovered} footprint libraries from .pretty directories")
+
         logger.info(f"Loaded {len(self.libraries)} footprint libraries")
 
     def _get_global_fp_lib_table(self) -> Optional[Path]:
@@ -192,6 +196,70 @@ class LibraryManager:
                 return path
 
         return None
+
+    def _candidate_footprint_roots(self) -> List[Path]:
+        """Return directories that may contain KiCad .pretty libraries.
+
+        Some Linux installations work without a user fp-lib-table. In that
+        case, footprint discovery should still work by scanning the standard
+        KiCad footprint roots directly.
+        """
+        roots: List[Path] = []
+        for env_name in (
+            "KICAD10_FOOTPRINT_DIR",
+            "KICAD9_FOOTPRINT_DIR",
+            "KICAD8_FOOTPRINT_DIR",
+            "KICAD_FOOTPRINT_DIR",
+            "KISYSMOD",
+        ):
+            value = os.environ.get(env_name)
+            if value:
+                roots.append(Path(os.path.expanduser(value)))
+
+        detected_root = self._find_kicad_footprint_dir()
+        if detected_root:
+            roots.append(Path(detected_root))
+
+        roots.extend(
+            [
+                Path("/usr/share/kicad/footprints"),
+                Path("/usr/local/share/kicad/footprints"),
+                Path.home() / "Documents" / "KiCad" / "footprints",
+            ]
+        )
+
+        if self.project_path:
+            roots.append(self.project_path)
+
+        unique_roots: List[Path] = []
+        seen: set[str] = set()
+        for root in roots:
+            key = str(root)
+            if key in seen:
+                continue
+            seen.add(key)
+            if root.is_dir():
+                unique_roots.append(root)
+        return unique_roots
+
+    def _discover_pretty_libraries(self) -> int:
+        """Index .pretty directories when fp-lib-table metadata is unavailable."""
+        discovered = 0
+        for root in self._candidate_footprint_roots():
+            try:
+                pretty_dirs = sorted(path for path in root.glob("*.pretty") if path.is_dir())
+            except OSError:
+                logger.debug(f"Failed to scan footprint root: {root}", exc_info=True)
+                continue
+
+            for pretty_dir in pretty_dirs:
+                nickname = pretty_dir.stem
+                if nickname in self.libraries:
+                    continue
+                self.libraries[nickname] = str(pretty_dir)
+                discovered += 1
+
+        return discovered
 
     def _find_kicad_3rdparty_dir(self) -> Optional[str]:
         """

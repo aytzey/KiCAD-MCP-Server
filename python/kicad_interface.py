@@ -985,6 +985,56 @@ class KiCADInterface:
             return "ground"
         return "generic"
 
+    def _component_reference_profile(self, nets: Set[str]) -> str:
+        kinds = {self._net_kind(net) for net in nets}
+        has_ground = "ground" in kinds
+        has_sensitive_signal = "high_speed" in kinds or "rf" in kinds
+        if has_sensitive_signal and has_ground:
+            return "ground_continuity"
+        if has_sensitive_signal:
+            return "signal_integrity"
+        if "analog" in kinds and has_ground:
+            return "quiet_reference"
+        return "generic"
+
+    def _reference_domain_class(self, domain: str) -> str:
+        upper = (domain or "").upper()
+        if not upper or upper == "GENERIC":
+            return "generic"
+        if any(token in upper for token in ("AGND", "EARTH", "CHASSIS", "SHIELD")):
+            return "quiet"
+        if "PGND" in upper or "POWER_GND" in upper:
+            return "noisy"
+        if "GND" in upper:
+            return "common"
+        return "generic"
+
+    def _component_reference_domain(self, nets: Set[str]) -> str:
+        ground_nets = sorted(
+            {
+                net
+                for net in nets
+                if self._net_kind(net) == "ground"
+            }
+        )
+        if not ground_nets:
+            return "generic"
+
+        def _ground_domain_sort_key(net_name: str) -> Tuple[int, int, str]:
+            class_priority = {
+                "quiet": 0,
+                "common": 1,
+                "noisy": 2,
+                "generic": 3,
+            }
+            return (
+                class_priority.get(self._reference_domain_class(net_name), 3),
+                len(net_name),
+                net_name.upper(),
+            )
+
+        return min(ground_nets, key=_ground_domain_sort_key)
+
     def _build_component_connectivity(
         self,
         schematic_components: List[Dict[str, str]],
@@ -1200,6 +1250,100 @@ class KiCADInterface:
         height = max(rows * pitch_y + edge_margin * 2, 40.0)
         return (start_x, start_y, start_x + width, start_y + height)
 
+    def _zone_bbox_mm(self, zone) -> Optional[Tuple[float, float, float, float]]:
+        try:
+            bbox = zone.GetBoundingBox()
+            left = bbox.GetLeft() / 1_000_000
+            top = bbox.GetTop() / 1_000_000
+            right = bbox.GetRight() / 1_000_000
+            bottom = bbox.GetBottom() / 1_000_000
+        except Exception:
+            return None
+        if right <= left or bottom <= top:
+            return None
+        return (left, top, right, bottom)
+
+    def _collect_reference_zone_affinity(
+        self,
+        board,
+        bounds: Tuple[float, float, float, float],
+    ) -> Dict[str, Dict[str, Any]]:
+        if board is None or not hasattr(board, "Zones"):
+            return {}
+
+        left, top, right, bottom = bounds
+        center_x = (left + right) / 2
+        affinity: Dict[str, Dict[str, Any]] = {}
+        try:
+            zones = list(board.Zones())
+        except Exception:
+            return {}
+
+        for zone in zones:
+            try:
+                net_name = zone.GetNetname()
+            except Exception:
+                continue
+            if self._net_kind(net_name) != "ground":
+                continue
+
+            bbox = self._zone_bbox_mm(zone)
+            if not bbox:
+                continue
+            zone_left, zone_top, zone_right, zone_bottom = bbox
+            overlap_top = max(top, zone_top)
+            overlap_bottom = min(bottom, zone_bottom)
+            if overlap_bottom <= overlap_top:
+                continue
+            height = overlap_bottom - overlap_top
+            left_width = max(0.0, min(zone_right, center_x) - max(zone_left, left))
+            right_width = max(0.0, min(zone_right, right) - max(zone_left, center_x))
+            left_area = left_width * height
+            right_area = right_width * height
+            zone_center_x = (zone_left + zone_right) / 2
+
+            entry = affinity.setdefault(
+                net_name,
+                {
+                    "referenceDomain": net_name,
+                    "referenceDomainClass": self._reference_domain_class(net_name),
+                    "leftArea": 0.0,
+                    "rightArea": 0.0,
+                    "zoneCount": 0,
+                    "centroidSamples": [],
+                },
+            )
+            entry["leftArea"] += left_area
+            entry["rightArea"] += right_area
+            entry["zoneCount"] += 1
+            entry["centroidSamples"].append(zone_center_x)
+
+        for domain, entry in affinity.items():
+            left_area = float(entry["leftArea"])
+            right_area = float(entry["rightArea"])
+            total_area = left_area + right_area
+            centroid_x = (
+                sum(entry["centroidSamples"]) / len(entry["centroidSamples"])
+                if entry["centroidSamples"]
+                else center_x
+            )
+            if total_area > 0:
+                bias = round((right_area - left_area) / total_area, 4)
+            else:
+                bias = round((centroid_x - center_x) / max(right - left, 1e-6), 4)
+            if abs(bias) < 0.15:
+                preferred_edge = "balanced"
+            else:
+                preferred_edge = "right" if bias > 0 else "left"
+            entry["preferredEdge"] = preferred_edge
+            entry["edgeBias"] = bias
+            entry["centroidXmm"] = round(centroid_x, 4)
+            entry["leftArea"] = round(left_area, 4)
+            entry["rightArea"] = round(right_area, 4)
+            entry.pop("centroidSamples", None)
+
+        return affinity
+
     def _cluster_spiral_offsets(
         self,
         pitch_x: float,
@@ -1249,11 +1393,54 @@ class KiCADInterface:
             key=lambda profile: (counts[profile], priority.get(profile, 0), profile),
         )
 
+    def _cluster_reference_profile(self, members: List[Dict[str, Any]]) -> str:
+        counts: Dict[str, int] = {}
+        for member in members:
+            profile = member.get("referenceProfile", "generic")
+            counts[profile] = counts.get(profile, 0) + 1
+        if not counts:
+            return "generic"
+        priority = {
+            "ground_continuity": 4,
+            "signal_integrity": 3,
+            "quiet_reference": 2,
+            "generic": 1,
+        }
+        return max(
+            counts,
+            key=lambda profile: (counts[profile], priority.get(profile, 0), profile),
+        )
+
+    def _cluster_reference_domain(self, members: List[Dict[str, Any]]) -> str:
+        counts: Dict[str, int] = {}
+        for member in members:
+            domain = member.get("referenceDomain", "generic")
+            if domain != "generic":
+                counts[domain] = counts.get(domain, 0) + 1
+        if not counts:
+            return "generic"
+        class_priority = {
+            "quiet": 3,
+            "common": 2,
+            "noisy": 1,
+            "generic": 0,
+        }
+        return max(
+            counts,
+            key=lambda domain: (
+                counts[domain],
+                class_priority.get(self._reference_domain_class(domain), 0),
+                domain.upper(),
+            ),
+        )
+
     def _cluster_rules_applied(
         self,
         anchor: Optional[Dict[str, Any]],
         members: List[Dict[str, Any]],
         signal_profile: str,
+        reference_profile: str = "generic",
+        reference_domain: str = "generic",
     ) -> List[str]:
         rules = ["cluster_by_connectivity", "keep_anchor_locality"]
         if anchor and anchor.get("role") == "connector":
@@ -1266,19 +1453,290 @@ class KiCADInterface:
             rules.append("keep_analog_cluster_quiet")
         if signal_profile in {"power", "power_switching"}:
             rules.append("bias_power_cluster_away_from_sensitive_edges")
+        if reference_profile == "ground_continuity":
+            rules.append("prefer_reference_continuity")
+        reference_domain_class = self._reference_domain_class(reference_domain)
+        if reference_domain_class == "quiet":
+            rules.append("prefer_quiet_reference_domain")
+        elif reference_domain_class == "noisy":
+            rules.append("demote_noisy_reference_domain")
         return rules
 
-    def _center_out_values(self, start: float, end: float, count: int) -> List[float]:
+    def _signal_profile_separation_target(
+        self,
+        profile_a: str,
+        profile_b: str,
+        pitch_x: float,
+        pitch_y: float,
+        *,
+        reference_profile_a: str = "generic",
+        reference_profile_b: str = "generic",
+        reference_domain_a: str = "generic",
+        reference_domain_b: str = "generic",
+    ) -> float:
+        pair = frozenset({profile_a, profile_b})
+        if len(pair) <= 1 or "generic" in pair or "ground" in pair or "mixed" in pair:
+            return 0.0
+
+        targets = {
+            frozenset({"analog", "power_switching"}): max(18.0, pitch_x * 2.2, pitch_y * 2.4),
+            frozenset({"rf", "power_switching"}): max(18.0, pitch_x * 2.2, pitch_y * 2.4),
+            frozenset({"analog", "power"}): max(14.0, pitch_x * 1.8, pitch_y * 2.0),
+            frozenset({"rf", "power"}): max(14.0, pitch_x * 1.8, pitch_y * 2.0),
+            frozenset({"high_speed", "power_switching"}): max(14.0, pitch_x * 2.0, pitch_y * 2.0),
+            frozenset({"high_speed", "power"}): max(12.0, pitch_x * 1.6, pitch_y * 1.8),
+            frozenset({"analog", "high_speed"}): max(10.0, pitch_x * 1.4, pitch_y * 1.6),
+            frozenset({"analog", "rf"}): max(10.0, pitch_x * 1.4, pitch_y * 1.6),
+        }
+        target = float(targets.get(pair, 0.0))
+        if target > 0 and {reference_profile_a, reference_profile_b} & {"ground_continuity", "signal_integrity"}:
+            if "power_switching" in pair:
+                target += max(4.0, pitch_x * 0.5, pitch_y * 0.6)
+            elif "power" in pair:
+                target += max(2.0, pitch_x * 0.25, pitch_y * 0.3)
+        domain_pair = {
+            self._reference_domain_class(reference_domain_a),
+            self._reference_domain_class(reference_domain_b),
+        }
+        if target > 0 and "quiet" in domain_pair and "noisy" in domain_pair:
+            target += max(4.0, pitch_x * 0.5, pitch_y * 0.6)
+        elif target > 0 and reference_domain_a not in {"generic", ""} and reference_domain_b not in {"generic", ""}:
+            if reference_domain_a != reference_domain_b and "quiet" in domain_pair:
+                target += max(2.0, pitch_x * 0.25, pitch_y * 0.3)
+        return round(target, 4)
+
+    def _cluster_connectivity_weight(
+        self,
+        members_a: List[str],
+        members_b: List[str],
+        adjacency: Dict[str, Dict[str, float]],
+    ) -> float:
+        weight = 0.0
+        for left in members_a:
+            for right in members_b:
+                weight += float(adjacency.get(left, {}).get(right, 0.0))
+        return round(weight, 4)
+
+    def _cluster_centroid(
+        self,
+        cluster: Dict[str, Any],
+        placements_by_ref: Dict[str, Dict[str, float]],
+    ) -> Tuple[float, float]:
+        refs = [ref for ref in cluster.get("members", []) if ref in placements_by_ref]
+        if not refs:
+            anchor_ref = cluster.get("anchor")
+            if anchor_ref and anchor_ref in placements_by_ref:
+                position = placements_by_ref[anchor_ref]
+                return (float(position["x"]), float(position["y"]))
+            return (0.0, 0.0)
+
+        x_avg = sum(float(placements_by_ref[ref]["x"]) for ref in refs) / len(refs)
+        y_avg = sum(float(placements_by_ref[ref]["y"]) for ref in refs) / len(refs)
+        return (round(x_avg, 4), round(y_avg, 4))
+
+    def _translate_cluster_members(
+        self,
+        cluster: Dict[str, Any],
+        placements_by_ref: Dict[str, Dict[str, float]],
+        dx: float,
+        dy: float,
+    ) -> Tuple[float, float]:
+        refs = [ref for ref in cluster.get("members", []) if ref in placements_by_ref]
+        bounds = cluster.get("legalBounds")
+        if not refs or not bounds:
+            return (0.0, 0.0)
+
+        left, top, right, bottom = [float(value) for value in bounds]
+        min_x = min(float(placements_by_ref[ref]["x"]) for ref in refs)
+        max_x = max(float(placements_by_ref[ref]["x"]) for ref in refs)
+        min_y = min(float(placements_by_ref[ref]["y"]) for ref in refs)
+        max_y = max(float(placements_by_ref[ref]["y"]) for ref in refs)
+
+        adj_dx = float(dx)
+        adj_dy = float(dy)
+        if min_x + adj_dx < left:
+            adj_dx += left - (min_x + adj_dx)
+        if max_x + adj_dx > right:
+            adj_dx -= (max_x + adj_dx) - right
+        if min_y + adj_dy < top:
+            adj_dy += top - (min_y + adj_dy)
+        if max_y + adj_dy > bottom:
+            adj_dy -= (max_y + adj_dy) - bottom
+
+        if math.isclose(adj_dx, 0.0, abs_tol=1e-6) and math.isclose(adj_dy, 0.0, abs_tol=1e-6):
+            return (0.0, 0.0)
+
+        for ref in refs:
+            position = placements_by_ref[ref]
+            position["x"] = round(float(position["x"]) + adj_dx, 4)
+            position["y"] = round(float(position["y"]) + adj_dy, 4)
+
+        return (round(adj_dx, 4), round(adj_dy, 4))
+
+    def _legalize_cluster_separation(
+        self,
+        placements: List[Dict[str, Any]],
+        clusters: List[Dict[str, Any]],
+        pitch_x: float,
+        pitch_y: float,
+        adjacency: Dict[str, Dict[str, float]],
+        components_by_ref: Dict[str, Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        placements_by_ref = {
+            item["reference"]: item["position"]
+            for item in placements
+            if item.get("reference") and item.get("position")
+        }
+        active_clusters = [
+            cluster
+            for cluster in clusters
+            if cluster.get("anchor") and cluster.get("members") and cluster.get("signalProfile")
+        ]
+        if len(active_clusters) < 2:
+            return []
+
+        stability_weight = {
+            "rf": 40.0,
+            "analog": 35.0,
+            "high_speed": 25.0,
+            "power": 15.0,
+            "power_switching": 10.0,
+            "generic": 0.0,
+        }
+        adjustments: List[Dict[str, Any]] = []
+        max_step = max(pitch_x, pitch_y) * 1.5
+
+        for _ in range(max(1, len(active_clusters) * 2)):
+            moved_in_pass = False
+            for index, cluster_a in enumerate(active_clusters):
+                for cluster_b in active_clusters[index + 1 :]:
+                    target = self._signal_profile_separation_target(
+                        cluster_a.get("signalProfile", "generic"),
+                        cluster_b.get("signalProfile", "generic"),
+                        pitch_x,
+                        pitch_y,
+                        reference_profile_a=cluster_a.get("referenceProfile", "generic"),
+                        reference_profile_b=cluster_b.get("referenceProfile", "generic"),
+                        reference_domain_a=cluster_a.get("referenceDomain", "generic"),
+                        reference_domain_b=cluster_b.get("referenceDomain", "generic"),
+                    )
+                    if target <= 0:
+                        continue
+
+                    affinity = self._cluster_connectivity_weight(
+                        cluster_a.get("members", []),
+                        cluster_b.get("members", []),
+                        adjacency,
+                    )
+                    if affinity >= 1.5:
+                        continue
+
+                    ax, ay = self._cluster_centroid(cluster_a, placements_by_ref)
+                    bx, by = self._cluster_centroid(cluster_b, placements_by_ref)
+                    distance = math.hypot(bx - ax, by - ay)
+                    if distance >= target - 0.25:
+                        continue
+
+                    movable_a = bool(cluster_a.get("movable"))
+                    movable_b = bool(cluster_b.get("movable"))
+                    if not movable_a and not movable_b:
+                        continue
+
+                    if movable_a and not movable_b:
+                        move_cluster, keep_cluster = cluster_a, cluster_b
+                    elif movable_b and not movable_a:
+                        move_cluster, keep_cluster = cluster_b, cluster_a
+                    else:
+                        score_a = float(
+                            components_by_ref.get(cluster_a["anchor"], {}).get("anchorScore", 0.0)
+                        ) + stability_weight.get(cluster_a.get("signalProfile", "generic"), 0.0)
+                        score_b = float(
+                            components_by_ref.get(cluster_b["anchor"], {}).get("anchorScore", 0.0)
+                        ) + stability_weight.get(cluster_b.get("signalProfile", "generic"), 0.0)
+                        move_cluster, keep_cluster = (
+                            (cluster_a, cluster_b) if score_a <= score_b else (cluster_b, cluster_a)
+                        )
+
+                    move_x, move_y = self._cluster_centroid(move_cluster, placements_by_ref)
+                    keep_x, keep_y = self._cluster_centroid(keep_cluster, placements_by_ref)
+                    dir_x = move_x - keep_x
+                    dir_y = move_y - keep_y
+                    if math.isclose(dir_x, 0.0, abs_tol=1e-6) and math.isclose(dir_y, 0.0, abs_tol=1e-6):
+                        if move_cluster.get("signalProfile") in {"analog", "rf"}:
+                            dir_y = -1.0
+                        elif keep_cluster.get("signalProfile") in {"analog", "rf"}:
+                            dir_y = 1.0
+                        else:
+                            dir_x = (
+                                1.0
+                                if self._reference_sort_key(move_cluster["anchor"])
+                                > self._reference_sort_key(keep_cluster["anchor"])
+                                else -1.0
+                            )
+
+                    step = min(max(target - distance, max(pitch_x, pitch_y) * 0.5), max_step)
+                    if abs(dir_x) >= abs(dir_y):
+                        delta_x = step if dir_x >= 0 else -step
+                        delta_y = 0.0
+                    else:
+                        delta_x = 0.0
+                        delta_y = step if dir_y >= 0 else -step
+
+                    actual_dx, actual_dy = self._translate_cluster_members(
+                        move_cluster,
+                        placements_by_ref,
+                        delta_x,
+                        delta_y,
+                    )
+                    if math.isclose(actual_dx, 0.0, abs_tol=1e-6) and math.isclose(actual_dy, 0.0, abs_tol=1e-6):
+                        continue
+
+                    move_cluster.setdefault("separationAdjustments", []).append(
+                        {
+                            "awayFrom": keep_cluster.get("anchor"),
+                            "delta": {"x": actual_dx, "y": actual_dy, "unit": "mm"},
+                            "targetDistanceMm": round(target, 4),
+                        }
+                    )
+                    if "maximize_net_separation" not in move_cluster.get("rulesApplied", []):
+                        move_cluster.setdefault("rulesApplied", []).append("maximize_net_separation")
+                    adjustments.append(
+                        {
+                            "movedAnchor": move_cluster.get("anchor"),
+                            "awayFrom": keep_cluster.get("anchor"),
+                            "delta": {"x": actual_dx, "y": actual_dy, "unit": "mm"},
+                            "targetDistanceMm": round(target, 4),
+                        }
+                    )
+                    moved_in_pass = True
+
+            if not moved_in_pass:
+                break
+
+        return adjustments
+
+    def _distributed_values(self, start: float, end: float, count: int) -> List[float]:
         if count <= 0:
             return []
         if count == 1:
             return [round((start + end) / 2, 4)]
         step = (end - start) / (count + 1)
-        values = [start + step * (index + 1) for index in range(count)]
+        return [round(start + step * (index + 1), 4) for index in range(count)]
+
+    def _center_out_values(self, start: float, end: float, count: int) -> List[float]:
+        values = self._distributed_values(start, end, count)
         center = (start + end) / 2
         return [
             round(value, 4)
             for value in sorted(values, key=lambda value: (abs(value - center), value))
+        ]
+
+    def _edge_out_values(self, start: float, end: float, count: int) -> List[float]:
+        values = self._distributed_values(start, end, count)
+        center = (start + end) / 2
+        return [
+            round(value, 4)
+            for value in sorted(values, key=lambda value: (-abs(value - center), value))
         ]
 
     def _build_connector_slot_plan(
@@ -1288,8 +1746,12 @@ class KiCADInterface:
         pitch_x: float,
         pitch_y: float,
         edge_band: float,
+        *,
+        reference_zone_affinity: Optional[Dict[str, Dict[str, Any]]] = None,
     ) -> Dict[str, Dict[str, Any]]:
         left, top, right, bottom = bounds
+        edge_inset = min(2.0, max(1.0, min(pitch_x, pitch_y) * 0.25))
+        reference_zone_affinity = reference_zone_affinity or {}
         profile_priority = {
             "rf": 0,
             "high_speed": 1,
@@ -1318,51 +1780,144 @@ class KiCADInterface:
         ]
 
         slot_plan: Dict[str, Dict[str, Any]] = {}
-        side_ys = self._center_out_values(top + pitch_y, bottom - pitch_y, len(side_connectors))
-        for index, (connector, center_y) in enumerate(zip(side_connectors, side_ys)):
-            edge = "left" if index % 2 == 0 else "right"
-            center_x = left if edge == "left" else right
+        side_candidates = self._distributed_values(top + pitch_y, bottom - pitch_y, len(side_connectors))
+        side_center = (top + bottom) / 2
+
+        def _side_priority(item: Dict[str, Any]) -> Tuple[int, int, float, Tuple[str, int, str]]:
+            domain_class = item.get("referenceDomainClass") or self._reference_domain_class(
+                item.get("referenceDomain", "generic")
+            )
+            domain_priority = {
+                "quiet": 0,
+                "common": 1,
+                "generic": 2,
+                "noisy": 3,
+            }
+            reference_profile_priority = {
+                "ground_continuity": 0,
+                "signal_integrity": 1,
+                "quiet_reference": 2,
+                "generic": 3,
+            }
+            return (
+                domain_priority.get(domain_class, 2),
+                reference_profile_priority.get(item.get("referenceProfile", "generic"), 3),
+                -item.get("anchorScore", 0.0),
+                self._reference_sort_key(item["reference"]),
+            )
+
+        center_side_connectors = sorted(
+            [
+                item
+                for item in side_connectors
+                if (item.get("referenceDomainClass") or self._reference_domain_class(item.get("referenceDomain", "generic")))
+                != "noisy"
+            ],
+            key=_side_priority,
+        )
+        noisy_side_connectors = sorted(
+            [
+                item
+                for item in side_connectors
+                if (item.get("referenceDomainClass") or self._reference_domain_class(item.get("referenceDomain", "generic")))
+                == "noisy"
+            ],
+            key=lambda item: (
+                -item.get("anchorScore", 0.0),
+                self._reference_sort_key(item["reference"]),
+            ),
+        )
+        center_side_ys = sorted(
+            side_candidates,
+            key=lambda value: (abs(value - side_center), value),
+        )[: len(center_side_connectors)]
+        remaining_side_ys = [value for value in side_candidates if value not in set(center_side_ys)]
+        noisy_side_ys = sorted(
+            remaining_side_ys,
+            key=lambda value: (-abs(value - side_center), value),
+        )
+
+        def _place_side_connector(
+            connector: Dict[str, Any],
+            center_y: float,
+            index: int,
+        ) -> None:
+            domain_affinity = reference_zone_affinity.get(connector.get("referenceDomain", "generic"), {})
+            preferred_edge = domain_affinity.get("preferredEdge")
+            edge = preferred_edge if preferred_edge in {"left", "right"} else ("left" if index % 2 == 0 else "right")
+            center_x = round(left + edge_inset, 4) if edge == "left" else round(right - edge_inset, 4)
+            domain_class = connector.get("referenceDomainClass") or self._reference_domain_class(
+                connector.get("referenceDomain", "generic")
+            )
+            if connector.get("referenceProfile") == "ground_continuity" and domain_class == "quiet":
+                corridor_multiplier = 1.6
+            elif connector.get("referenceProfile") == "ground_continuity":
+                corridor_multiplier = 1.4
+            elif domain_class == "noisy":
+                corridor_multiplier = 0.9
+            else:
+                corridor_multiplier = 1.0
+            corridor_depth = pitch_x * corridor_multiplier
             slot_plan[connector["reference"]] = {
                 "edge": edge,
                 "anchorPoint": (center_x, center_y),
                 "inwardCenter": (
-                    round(center_x + (pitch_x if edge == "left" else -pitch_x), 4),
+                    round(center_x + (corridor_depth if edge == "left" else -corridor_depth), 4),
                     center_y,
                 ),
                 "memberBounds": (
                     left if edge == "left" else max(left, right - edge_band),
                     max(top, center_y - pitch_y * 1.5),
-                    min(right, left + edge_band) if edge == "left" else right,
+                    min(right, left + edge_band + corridor_depth * 0.5) if edge == "left" else right,
                     min(bottom, center_y + pitch_y * 1.5),
                 ),
+                "referenceProfile": connector.get("referenceProfile", "generic"),
+                "referenceDomain": connector.get("referenceDomain", "generic"),
+                "referenceDomainClass": domain_class,
+                "referenceEdgePreference": preferred_edge or "balanced",
+                "referenceZoneBias": round(float(domain_affinity.get("edgeBias", 0.0)), 4),
             }
+
+        side_index = 0
+        for connector, center_y in zip(center_side_connectors, center_side_ys):
+            _place_side_connector(connector, center_y, side_index)
+            side_index += 1
+        for connector, center_y in zip(noisy_side_connectors, noisy_side_ys):
+            _place_side_connector(connector, center_y, side_index)
+            side_index += 1
 
         top_xs = self._center_out_values(left + pitch_x, right - pitch_x, len(top_connectors))
         for connector, center_x in zip(top_connectors, top_xs):
             slot_plan[connector["reference"]] = {
                 "edge": "top",
-                "anchorPoint": (center_x, top),
-                "inwardCenter": (center_x, round(min(bottom, top + pitch_y), 4)),
+                "anchorPoint": (center_x, round(top + edge_inset, 4)),
+                "inwardCenter": (center_x, round(min(bottom, top + edge_inset + pitch_y), 4)),
                 "memberBounds": (
                     max(left, center_x - pitch_x * 1.5),
                     top,
                     min(right, center_x + pitch_x * 1.5),
                     min(bottom, top + edge_band),
                 ),
+                "referenceProfile": connector.get("referenceProfile", "generic"),
+                "referenceDomain": connector.get("referenceDomain", "generic"),
+                "referenceDomainClass": connector.get("referenceDomainClass", "generic"),
             }
 
         bottom_xs = self._center_out_values(left + pitch_x, right - pitch_x, len(bottom_connectors))
         for connector, center_x in zip(bottom_connectors, bottom_xs):
             slot_plan[connector["reference"]] = {
                 "edge": "bottom",
-                "anchorPoint": (center_x, bottom),
-                "inwardCenter": (center_x, round(max(top, bottom - pitch_y), 4)),
+                "anchorPoint": (center_x, round(bottom - edge_inset, 4)),
+                "inwardCenter": (center_x, round(max(top, bottom - edge_inset - pitch_y), 4)),
                 "memberBounds": (
                     max(left, center_x - pitch_x * 1.5),
                     max(top, bottom - edge_band),
                     min(right, center_x + pitch_x * 1.5),
                     bottom,
                 ),
+                "referenceProfile": connector.get("referenceProfile", "generic"),
+                "referenceDomain": connector.get("referenceDomain", "generic"),
+                "referenceDomainClass": connector.get("referenceDomainClass", "generic"),
             }
 
         return slot_plan
@@ -1432,6 +1987,7 @@ class KiCADInterface:
         width = max(right - left, pitch_x * 3)
         height = max(bottom - top, pitch_y * 3)
         edge_band = min(max(pitch_x * 2.0, width * 0.18), width * 0.3)
+        reference_zone_affinity = self._collect_reference_zone_affinity(board, bounds)
 
         component_nets, adjacency = self._build_component_connectivity(pending, netlist)
         components_by_ref: Dict[str, Dict[str, Any]] = {}
@@ -1439,6 +1995,9 @@ class KiCADInterface:
             reference = component["reference"]
             meta = dict(component)
             meta["signalProfile"] = self._component_signal_profile(component_nets.get(reference, set()))
+            meta["referenceProfile"] = self._component_reference_profile(component_nets.get(reference, set()))
+            meta["referenceDomain"] = self._component_reference_domain(component_nets.get(reference, set()))
+            meta["referenceDomainClass"] = self._reference_domain_class(meta["referenceDomain"])
             meta["role"] = self._classify_auto_place_role(meta, component_nets, adjacency)
             meta["anchorScore"] = self._auto_place_anchor_score(meta, component_nets, adjacency)
             components_by_ref[reference] = meta
@@ -1509,6 +2068,29 @@ class KiCADInterface:
                     "description": "Bias analog/RF clusters away from switching power regions while keeping high-speed clusters edge-friendly.",
                 }
             )
+        if any(item.get("referenceProfile") == "ground_continuity" for item in connectors):
+            plan_rules.append(
+                {
+                    "name": "reference_continuity_corridors",
+                    "description": "Keep ground-coupled high-speed or RF connectors on quiet side-edge slots with deeper inward breakout corridors and stronger separation from switching-power clusters.",
+                }
+            )
+        if any(item.get("referenceDomainClass") == "quiet" for item in connectors) and any(
+            item.get("referenceDomainClass") == "noisy" for item in connectors
+        ):
+            plan_rules.append(
+                {
+                    "name": "reference_domain_partitioning",
+                    "description": "Prefer quiet AGND or earth-referenced connectors near the central side corridor and demote PGND-coupled connectors toward more peripheral edge slots.",
+                }
+            )
+        if reference_zone_affinity:
+            plan_rules.append(
+                {
+                    "name": "reference_zone_alignment",
+                    "description": "When the board already contains ground-domain zones, align connector left or right edge choice with the side that preserves the strongest local reference-plane continuity.",
+                }
+            )
 
         connector_count = len(connectors)
         if connector_count:
@@ -1518,6 +2100,7 @@ class KiCADInterface:
                 pitch_x,
                 pitch_y,
                 edge_band,
+                reference_zone_affinity=reference_zone_affinity,
             )
 
             for connector in connectors:
@@ -1536,6 +2119,13 @@ class KiCADInterface:
                     ),
                 )
                 cluster_profile = self._cluster_signal_profile(local_members)
+                reference_profile = self._cluster_reference_profile(local_members)
+                reference_domain = self._cluster_reference_domain(local_members)
+                rules_applied = self._cluster_rules_applied(
+                    connector, local_members, cluster_profile, reference_profile, reference_domain
+                )
+                if slot.get("referenceEdgePreference") in {"left", "right"} and slot.get("referenceEdgePreference") == slot.get("edge"):
+                    rules_applied.append("align_with_reference_zone_edge")
                 for member, (x, y) in self._place_cluster_members(
                     inward_center_x,
                     inward_center_y,
@@ -1563,11 +2153,16 @@ class KiCADInterface:
                         "anchor": ref,
                         "role": connector["role"],
                         "signalProfile": cluster_profile,
+                        "referenceProfile": reference_profile,
+                        "referenceDomain": reference_domain,
+                        "referenceDomainClass": self._reference_domain_class(reference_domain),
+                        "referenceEdgePreference": slot.get("referenceEdgePreference", "balanced"),
+                        "referenceZoneBias": slot.get("referenceZoneBias", 0.0),
                         "edge": slot["edge"],
                         "members": [item["reference"] for item in local_members],
-                        "rulesApplied": self._cluster_rules_applied(
-                            connector, local_members, cluster_profile
-                        ),
+                        "movable": False,
+                        "legalBounds": slot["memberBounds"],
+                        "rulesApplied": rules_applied,
                     }
                 )
 
@@ -1595,6 +2190,7 @@ class KiCADInterface:
             central_left = min(right, left + edge_band + cluster_gap) if connector_count else left
             central_right = max(left, right - edge_band - cluster_gap) if connector_count else right
             central_width = max(central_right - central_left, pitch_x * 3)
+            core_bounds = (central_left, top, central_right, bottom)
             columns = max(
                 1,
                 min(
@@ -1627,6 +2223,8 @@ class KiCADInterface:
                     ),
                 )
                 cluster_profile = self._cluster_signal_profile(local_members)
+                reference_profile = self._cluster_reference_profile(local_members)
+                reference_domain = self._cluster_reference_domain(local_members)
                 inner_bounds = (
                     cell_bounds[0] + pitch_x * 0.5,
                     cell_bounds[1] + pitch_y * 0.5,
@@ -1657,10 +2255,15 @@ class KiCADInterface:
                         "anchor": anchor["reference"],
                         "role": anchor["role"],
                         "signalProfile": cluster_profile,
+                        "referenceProfile": reference_profile,
+                        "referenceDomain": reference_domain,
+                        "referenceDomainClass": self._reference_domain_class(reference_domain),
                         "edge": "core",
                         "members": [item["reference"] for item in local_members],
+                        "movable": True,
+                        "legalBounds": core_bounds,
                         "rulesApplied": self._cluster_rules_applied(
-                            anchor, local_members, cluster_profile
+                            anchor, local_members, cluster_profile, reference_profile, reference_domain
                         ),
                     }
                 )
@@ -1693,8 +2296,13 @@ class KiCADInterface:
                     "anchor": None,
                     "role": "fallback",
                     "signalProfile": "mixed",
+                    "referenceProfile": "generic",
+                    "referenceDomain": "generic",
+                    "referenceDomainClass": "generic",
                     "edge": "fallback",
                     "members": [item["reference"] for item in leftovers],
+                    "movable": False,
+                    "legalBounds": bounds,
                     "rulesApplied": ["fallback_grid_recovery"],
                 }
             )
@@ -1704,6 +2312,28 @@ class KiCADInterface:
                     "description": "Any members that could not stay inside their preferred local cluster bands fall back to deterministic grid slots.",
                 }
             )
+
+        separation_adjustments = self._legalize_cluster_separation(
+            placements,
+            clusters,
+            pitch_x,
+            pitch_y,
+            adjacency,
+            components_by_ref,
+        )
+        if separation_adjustments:
+            plan_rules.append(
+                {
+                    "name": "net_separation_legalization",
+                    "description": "Apply local post-placement shifts that preserve cluster structure while increasing margin between noisy and sensitive signal regions.",
+                }
+            )
+
+        for cluster in clusters:
+            cluster.pop("movable", None)
+            cluster.pop("legalBounds", None)
+            if not cluster.get("separationAdjustments"):
+                cluster.pop("separationAdjustments", None)
 
         placements.sort(key=lambda item: self._reference_sort_key(item["reference"]))
         return {

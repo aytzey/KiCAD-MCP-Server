@@ -814,8 +814,8 @@ class SchematicHandlers:
             from pathlib import Path
 
             schematic_path = params.get("schematicPath")
-            component_ref = params.get("componentRef")
-            pin_name = params.get("pinName")
+            component_ref = params.get("componentRef") or params.get("reference")
+            pin_name = params.get("pinName") or params.get("pinNumber")
             net_name = params.get("netName")
 
             if not all([schematic_path, component_ref, pin_name, net_name]):
@@ -1740,6 +1740,63 @@ class SchematicHandlers:
                     "success": False,
                     "message": "kicad-cli not found",
                     "errorDetails": "Install KiCAD 8.0+ or add kicad-cli to PATH.",
+                }
+
+            cli_supports_erc = False
+            if self.design_rule_commands is not None:
+                cli_supports_erc = self.design_rule_commands._cli_supports_subcommand(
+                    kicad_cli, "sch", "erc"
+                )
+            if not cli_supports_erc:
+                logger.info(
+                    "Installed kicad-cli does not expose 'sch erc'; falling back to schematic analysis"
+                )
+                from commands.schematic_analysis import check_wire_collisions, find_unconnected_pins
+
+                unconnected = find_unconnected_pins(schematic_path)
+                collisions = check_wire_collisions(schematic_path)
+                violations = []
+                severity_counts = {"error": 0, "warning": 0, "info": 0}
+
+                for pin in unconnected.get("unconnectedPins", []):
+                    violations.append(
+                        {
+                            "type": "unconnected_pin",
+                            "severity": "error",
+                            "message": (
+                                f"Pin {pin['reference']}/{pin['pin']}"
+                                + (f" ({pin['pinName']})" if pin.get("pinName") else "")
+                                + " is not connected"
+                            ),
+                            "location": pin.get("position", {}),
+                        }
+                    )
+                    severity_counts["error"] += 1
+
+                for collision in collisions.get("collisions", []):
+                    component = collision.get("component", {})
+                    location = component.get("position", {})
+                    violations.append(
+                        {
+                            "type": "wire_collision",
+                            "severity": "error",
+                            "message": (
+                                f"Wire passes through component body {component.get('reference', '?')}"
+                            ),
+                            "location": location,
+                        }
+                    )
+                    severity_counts["error"] += 1
+
+                return {
+                    "success": True,
+                    "message": f"ERC fallback complete: {len(violations)} violation(s)",
+                    "summary": {
+                        "total": len(violations),
+                        "by_severity": severity_counts,
+                    },
+                    "violations": violations,
+                    "backend": "static_analysis",
                 }
 
             with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as tmp:

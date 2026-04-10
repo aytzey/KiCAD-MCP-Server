@@ -2,8 +2,15 @@
 Design rules command implementations for KiCAD interface
 """
 
+import json
 import logging
 import os
+import platform
+import re
+import shutil
+import subprocess
+import tempfile
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import pcbnew
@@ -17,6 +24,107 @@ class DesignRuleCommands:
     def __init__(self, board: Optional[pcbnew.BOARD] = None):
         """Initialize with optional board instance"""
         self.board = board
+
+    @staticmethod
+    def _parse_drc_report_text(report_text: str) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        """Parse KiCad text DRC reports into the same summary shape as CLI JSON."""
+        violations: List[Dict[str, Any]] = []
+        severity_counts = {"error": 0, "warning": 0, "info": 0}
+        violation_counts: Dict[str, int] = {}
+
+        current: Optional[Dict[str, Any]] = None
+        line_re = re.compile(r"^\[(?P<type>[^\]]+)\]:\s*(?P<message>.+)$")
+        severity_re = re.compile(r"Severity:\s*(?P<severity>\w+)", re.IGNORECASE)
+        location_re = re.compile(
+            r"@\((?P<x>-?\d+(?:\.\d+)?)\s*mm,\s*(?P<y>-?\d+(?:\.\d+)?)\s*mm\)"
+        )
+
+        def _flush() -> None:
+            nonlocal current
+            if not current:
+                return
+            violations.append(current)
+            vtype = current.get("type", "unknown")
+            violation_counts[vtype] = violation_counts.get(vtype, 0) + 1
+            severity = str(current.get("severity", "error")).lower()
+            if severity not in severity_counts:
+                severity_counts[severity] = 0
+            severity_counts[severity] += 1
+            current = None
+
+        for raw_line in report_text.splitlines():
+            line = raw_line.rstrip()
+            match = line_re.match(line)
+            if match:
+                _flush()
+                current = {
+                    "type": match.group("type"),
+                    "severity": "error",
+                    "message": match.group("message").strip(),
+                    "location": {},
+                }
+                continue
+
+            if current is None:
+                continue
+
+            severity_match = severity_re.search(line)
+            if severity_match:
+                current["severity"] = severity_match.group("severity").lower()
+
+            location_match = location_re.search(line)
+            if location_match and not current.get("location"):
+                current["location"] = {
+                    "x": float(location_match.group("x")),
+                    "y": float(location_match.group("y")),
+                    "unit": "mm",
+                }
+
+        _flush()
+        return violations, {"by_severity": severity_counts, "by_type": violation_counts}
+
+    def _cli_supports_subcommand(
+        self, kicad_cli: str, parent: str, subcommand: str
+    ) -> bool:
+        """Detect whether the installed kicad-cli exposes a given subcommand."""
+        try:
+            probe = subprocess.run(
+                [kicad_cli, parent],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        except Exception:
+            return False
+
+        output = f"{probe.stdout or ''}\n{probe.stderr or ''}".lower()
+        return subcommand.lower() in output
+
+    def _write_violations_file(
+        self,
+        board_file: str,
+        violations: List[Dict[str, Any]],
+        summary: Dict[str, Any],
+        *,
+        timestamp: str = "unknown",
+    ) -> str:
+        board_dir = os.path.dirname(board_file)
+        board_name = os.path.splitext(os.path.basename(board_file))[0]
+        violations_file = os.path.join(board_dir, f"{board_name}_drc_violations.json")
+        with open(violations_file, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "board": board_file,
+                    "timestamp": timestamp,
+                    "total_violations": len(violations),
+                    "violation_counts": summary.get("by_type", {}),
+                    "severity_counts": summary.get("by_severity", {}),
+                    "violations": violations,
+                },
+                f,
+                indent=2,
+            )
+        return violations_file
 
     def set_design_rules(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Set design rules for the PCB"""
@@ -172,12 +280,6 @@ class DesignRuleCommands:
 
     def run_drc(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Run Design Rule Check using kicad-cli"""
-        import json
-        import platform
-        import shutil
-        import subprocess
-        import tempfile
-
         try:
             if not self.board:
                 return {
@@ -206,137 +308,163 @@ class DesignRuleCommands:
                     "errorDetails": "KiCAD CLI tool not found in system. Install KiCAD 8.0+ or set PATH.",
                 }
 
-            # Create temporary JSON output file
-            with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as tmp:
-                json_output = tmp.name
+            if self._cli_supports_subcommand(kicad_cli, "pcb", "drc"):
+                with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as tmp:
+                    json_output = tmp.name
 
-            try:
-                # Build command
-                cmd = [
-                    kicad_cli,
-                    "pcb",
-                    "drc",
-                    "--format",
-                    "json",
-                    "--output",
-                    json_output,
-                    "--units",
-                    "mm",
-                    board_file,
-                ]
-
-                logger.info(f"Running DRC command: {' '.join(cmd)}")
-
-                # Run DRC
-                result = subprocess.run(
-                    cmd,
-                    capture_output=True,
-                    text=True,
-                    timeout=600,  # 10 minute timeout for large boards (21MB PCB needs time)
-                )
-
-                if result.returncode != 0:
-                    logger.error(f"DRC command failed: {result.stderr}")
-                    return {
-                        "success": False,
-                        "message": "DRC command failed",
-                        "errorDetails": result.stderr,
-                    }
-
-                # Read JSON output
-                with open(json_output, "r", encoding="utf-8") as f:
-                    drc_data = json.load(f)
-
-                # Parse violations from kicad-cli output
-                violations = []
-                violation_counts: dict[str, int] = {}
-                severity_counts = {"error": 0, "warning": 0, "info": 0}
-
-                for violation in drc_data.get("violations", []):
-                    vtype = violation.get("type", "unknown")
-                    vseverity = violation.get("severity", "error")
-
-                    # Extract location from first item's pos (kicad-cli JSON format)
-                    items = violation.get("items", [])
-                    loc_x, loc_y = 0, 0
-                    if items and "pos" in items[0]:
-                        loc_x = items[0]["pos"].get("x", 0)
-                        loc_y = items[0]["pos"].get("y", 0)
-
-                    violations.append(
-                        {
-                            "type": vtype,
-                            "severity": vseverity,
-                            "message": violation.get("description", ""),
-                            "location": {
-                                "x": loc_x,
-                                "y": loc_y,
-                                "unit": "mm",
-                            },
-                        }
-                    )
-
-                    # Count violations by type
-                    violation_counts[vtype] = violation_counts.get(vtype, 0) + 1
-
-                    # Count by severity
-                    if vseverity in severity_counts:
-                        severity_counts[vseverity] += 1
-
-                # Determine where to save the violations file
-                board_dir = os.path.dirname(board_file)
-                board_name = os.path.splitext(os.path.basename(board_file))[0]
-                violations_file = os.path.join(board_dir, f"{board_name}_drc_violations.json")
-
-                # Always save violations to JSON file (for large result sets)
-                with open(violations_file, "w", encoding="utf-8") as f:
-                    json.dump(
-                        {
-                            "board": board_file,
-                            "timestamp": drc_data.get("date", "unknown"),
-                            "total_violations": len(violations),
-                            "violation_counts": violation_counts,
-                            "severity_counts": severity_counts,
-                            "violations": violations,
-                        },
-                        f,
-                        indent=2,
-                    )
-
-                # Save text report if requested
-                if report_path:
-                    report_path = os.path.abspath(os.path.expanduser(report_path))
-                    cmd_report = [
+                try:
+                    cmd = [
                         kicad_cli,
                         "pcb",
                         "drc",
                         "--format",
-                        "report",
+                        "json",
                         "--output",
-                        report_path,
+                        json_output,
                         "--units",
                         "mm",
                         board_file,
                     ]
-                    subprocess.run(cmd_report, capture_output=True, timeout=600)
 
-                # Return summary only (not full violations list)
-                return {
-                    "success": True,
-                    "message": f"Found {len(violations)} DRC violations",
-                    "summary": {
+                    logger.info(f"Running DRC command: {' '.join(cmd)}")
+
+                    result = subprocess.run(
+                        cmd,
+                        capture_output=True,
+                        text=True,
+                        timeout=600,
+                    )
+
+                    if result.returncode != 0:
+                        logger.error(f"DRC command failed: {result.stderr}")
+                        return {
+                            "success": False,
+                            "message": "DRC command failed",
+                            "errorDetails": result.stderr,
+                        }
+
+                    with open(json_output, "r", encoding="utf-8") as f:
+                        drc_data = json.load(f)
+
+                    violations = []
+                    violation_counts: dict[str, int] = {}
+                    severity_counts = {"error": 0, "warning": 0, "info": 0}
+
+                    for violation in drc_data.get("violations", []):
+                        vtype = violation.get("type", "unknown")
+                        vseverity = str(violation.get("severity", "error")).lower()
+                        items = violation.get("items", [])
+                        loc_x, loc_y = 0, 0
+                        if items and "pos" in items[0]:
+                            loc_x = items[0]["pos"].get("x", 0)
+                            loc_y = items[0]["pos"].get("y", 0)
+
+                        violations.append(
+                            {
+                                "type": vtype,
+                                "severity": vseverity,
+                                "message": violation.get("description", ""),
+                                "location": {
+                                    "x": loc_x,
+                                    "y": loc_y,
+                                    "unit": "mm",
+                                },
+                            }
+                        )
+                        violation_counts[vtype] = violation_counts.get(vtype, 0) + 1
+                        if vseverity not in severity_counts:
+                            severity_counts[vseverity] = 0
+                        severity_counts[vseverity] += 1
+
+                    summary = {
                         "total": len(violations),
                         "by_severity": severity_counts,
                         "by_type": violation_counts,
-                    },
+                    }
+                    violations_file = self._write_violations_file(
+                        board_file,
+                        violations,
+                        summary,
+                        timestamp=drc_data.get("date", "unknown"),
+                    )
+
+                    if report_path:
+                        report_path = os.path.abspath(os.path.expanduser(report_path))
+                        cmd_report = [
+                            kicad_cli,
+                            "pcb",
+                            "drc",
+                            "--format",
+                            "report",
+                            "--output",
+                            report_path,
+                            "--units",
+                            "mm",
+                            board_file,
+                        ]
+                        subprocess.run(cmd_report, capture_output=True, timeout=600)
+
+                    return {
+                        "success": True,
+                        "message": f"Found {len(violations)} DRC violations",
+                        "summary": summary,
+                        "violationsFile": violations_file,
+                        "reportPath": report_path if report_path else None,
+                    }
+
+                finally:
+                    if os.path.exists(json_output):
+                        os.unlink(json_output)
+
+            logger.info(
+                "Installed kicad-cli does not expose 'pcb drc'; falling back to pcbnew.WriteDRCReport"
+            )
+            report_tmp = None
+            if report_path:
+                report_path = os.path.abspath(os.path.expanduser(report_path))
+                report_output = report_path
+            else:
+                report_tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".rpt", delete=False)
+                report_output = report_tmp.name
+                report_tmp.close()
+
+            try:
+                ok = pcbnew.WriteDRCReport(
+                    self.board,
+                    report_output,
+                    pcbnew.EDA_UNITS_MILLIMETRES,
+                    True,
+                )
+                if not ok or not os.path.exists(report_output):
+                    return {
+                        "success": False,
+                        "message": "DRC fallback failed",
+                        "errorDetails": "pcbnew.WriteDRCReport did not produce a report",
+                    }
+
+                report_text = Path(report_output).read_text(encoding="utf-8", errors="replace")
+                violations, parsed_summary = self._parse_drc_report_text(report_text)
+                summary = {
+                    "total": len(violations),
+                    "by_severity": parsed_summary.get("by_severity", {}),
+                    "by_type": parsed_summary.get("by_type", {}),
+                }
+                violations_file = self._write_violations_file(
+                    board_file,
+                    violations,
+                    summary,
+                )
+                return {
+                    "success": True,
+                    "message": f"Found {len(violations)} DRC violations",
+                    "summary": summary,
                     "violationsFile": violations_file,
                     "reportPath": report_path if report_path else None,
+                    "backend": "pcbnew-report",
                 }
-
             finally:
-                # Clean up temp JSON file
-                if os.path.exists(json_output):
-                    os.unlink(json_output)
+                if report_tmp is not None and os.path.exists(report_output):
+                    os.unlink(report_output)
 
         except subprocess.TimeoutExpired:
             logger.error("DRC command timed out")

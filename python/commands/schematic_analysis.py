@@ -308,6 +308,31 @@ def _line_segment_intersects_aabb(
     return True
 
 
+def _point_on_segment(
+    point: Tuple[float, float],
+    start: Tuple[float, float],
+    end: Tuple[float, float],
+    tolerance: float = 0.05,
+) -> bool:
+    """Return True when *point* lies on or very near the segment start→end."""
+    px, py = point
+    x1, y1 = start
+    x2, y2 = end
+    dx = x2 - x1
+    dy = y2 - y1
+    seg_len_sq = dx * dx + dy * dy
+    if seg_len_sq < 1e-12:
+        return math.hypot(px - x1, py - y1) <= tolerance
+
+    t = ((px - x1) * dx + (py - y1) * dy) / seg_len_sq
+    if t < 0.0 or t > 1.0:
+        return False
+
+    proj_x = x1 + t * dx
+    proj_y = y1 + t * dy
+    return math.hypot(px - proj_x, py - proj_y) <= tolerance
+
+
 def _point_in_rect(
     px: float,
     py: float,
@@ -696,6 +721,78 @@ def get_elements_in_region(
 
 
 # ---------------------------------------------------------------------------
+# Tool 5: find_unconnected_pins
+# ---------------------------------------------------------------------------
+
+
+def find_unconnected_pins(schematic_path: Path) -> Dict[str, Any]:
+    """
+    Find symbol pins that are not touched by any wire or label.
+
+    This is intentionally conservative and is used as a fallback ERC signal on
+    KiCad installations whose CLI lacks `sch erc`.
+    """
+    schematic_path = Path(schematic_path)
+    sexp_data = _load_sexp(schematic_path)
+    symbols = _parse_symbols(sexp_data)
+    wires = _parse_wires(sexp_data)
+    labels = _parse_labels(sexp_data)
+    lib_defs = _extract_lib_symbols(sexp_data)
+    pin_tolerance = 0.05
+
+    unconnected: List[Dict[str, Any]] = []
+
+    for sym in symbols:
+        ref = sym["reference"]
+        if not ref or sym["is_power"] or ref.startswith("_TEMPLATE"):
+            continue
+
+        lib_data = lib_defs.get(sym["lib_id"], {})
+        pin_defs = lib_data.get("pins", {})
+        if not pin_defs:
+            continue
+
+        pin_positions = _compute_pin_positions_direct(sym, pin_defs)
+        for pin_num, pin_xy in pin_positions.items():
+            is_connected = False
+
+            for wire in wires:
+                if (
+                    _point_on_segment(tuple(pin_xy), wire["start"], wire["end"], tolerance=pin_tolerance)
+                    or math.hypot(pin_xy[0] - wire["start"][0], pin_xy[1] - wire["start"][1]) <= pin_tolerance
+                    or math.hypot(pin_xy[0] - wire["end"][0], pin_xy[1] - wire["end"][1]) <= pin_tolerance
+                ):
+                    is_connected = True
+                    break
+
+            if not is_connected:
+                for label in labels:
+                    if math.hypot(pin_xy[0] - label["x"], pin_xy[1] - label["y"]) <= pin_tolerance:
+                        is_connected = True
+                        break
+
+            if is_connected:
+                continue
+
+            pin_meta = pin_defs.get(pin_num, {})
+            unconnected.append(
+                {
+                    "reference": ref,
+                    "pin": pin_num,
+                    "pinName": pin_meta.get("name", ""),
+                    "position": {
+                        "x": round(pin_xy[0], 4),
+                        "y": round(pin_xy[1], 4),
+                        "unit": "mm",
+                    },
+                    "libId": sym["lib_id"],
+                }
+            )
+
+    return {"count": len(unconnected), "unconnectedPins": unconnected}
+
+
+# ---------------------------------------------------------------------------
 # Tool 5: check_wire_collisions
 # ---------------------------------------------------------------------------
 
@@ -853,3 +950,9 @@ def find_wires_crossing_symbols(schematic_path: Path) -> List[Dict[str, Any]]:
             )
 
     return collisions
+
+
+def check_wire_collisions(schematic_path: Path) -> Dict[str, Any]:
+    """Wrapper used by the handler layer."""
+    collisions = find_wires_crossing_symbols(Path(schematic_path))
+    return {"count": len(collisions), "collisions": collisions}

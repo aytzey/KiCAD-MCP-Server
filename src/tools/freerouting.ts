@@ -44,6 +44,24 @@ export function registerFreeroutingTools(server: McpServer, callKicadScript: Fun
       )
       .optional()
       .describe("Optional explicit matched-length groups such as DDR or address/data buses"),
+    inferMatchedLengthGroups: z
+      .boolean()
+      .optional()
+      .describe("Infer bus-style matched-length groups automatically from interface-aware net naming"),
+    autoMatchedLengthMaxSkewMm: z
+      .number()
+      .optional()
+      .describe("Override the default skew target used for auto-inferred matched-length groups"),
+    autoMatchedLengthMinGroupSize: z
+      .number()
+      .int()
+      .optional()
+      .describe("Minimum net count for an auto-inferred matched-length bus group"),
+    autoMatchedLengthMaxGroupSize: z
+      .number()
+      .int()
+      .optional()
+      .describe("Maximum net count for an auto-inferred matched-length bus group"),
     excludeFromFreeRouting: z
       .array(z.string())
       .optional()
@@ -86,6 +104,30 @@ export function registerFreeroutingTools(server: McpServer, callKicadScript: Fun
       .boolean()
       .optional()
       .describe("Refill copper zones during post-route cleanup"),
+    autoCreateReferenceZones: z
+      .boolean()
+      .optional()
+      .describe("Create a deterministic ground reference zone automatically when high-speed nets exist but no ground plane is present"),
+    referenceZoneNet: z
+      .string()
+      .optional()
+      .describe("Optional ground net name to use for an automatically created reference zone"),
+    referenceZoneLayer: z
+      .string()
+      .optional()
+      .describe("Optional layer override for an automatically created reference zone"),
+    referenceZoneInsetMm: z
+      .number()
+      .optional()
+      .describe("Inset from the board edge used for an automatically created reference zone"),
+    referenceZoneClearanceMm: z
+      .number()
+      .optional()
+      .describe("Clearance used for an automatically created reference zone"),
+    referenceZoneMinWidthMm: z
+      .number()
+      .optional()
+      .describe("Minimum copper width used for an automatically created reference zone"),
     reportPath: z
       .string()
       .optional()
@@ -116,7 +158,7 @@ export function registerFreeroutingTools(server: McpServer, callKicadScript: Fun
 
   server.tool(
     "autoroute_cfha",
-    "Run the full constraint-first hybrid autorouting orchestrator explicitly.",
+    "Run the full constraint-first hybrid autorouting orchestrator explicitly, including pre-route reference planning before critical routing.",
     orchestrationArgs,
     async (args: any) => {
       const result = await callKicadScript("autoroute_cfha", args);
@@ -171,7 +213,7 @@ export function registerFreeroutingTools(server: McpServer, callKicadScript: Fun
 
   server.tool(
     "generate_routing_constraints",
-    "Stage 2 constraint synthesis. Builds the canonical JSON routing schema that becomes the single source of truth for runtime intents, KiCad custom rules, and backend orchestration defaults.",
+    "Stage 2 constraint synthesis. Builds the canonical JSON routing schema that becomes the single source of truth for runtime intents, KiCad custom rules, backend orchestration defaults, and pre-route reference planning.",
     {
       boardPath: z.string().optional().describe("Path to .kicad_pcb file (default: current board)"),
       profiles: z.array(z.string()).optional(),
@@ -222,7 +264,7 @@ export function registerFreeroutingTools(server: McpServer, callKicadScript: Fun
 
   server.tool(
     "route_critical_nets",
-    "Stage 4 critical routing. Uses the embedded orthoroute-compatible critical router with IPC-first application when available, falling back to SWIG only when live IPC control is not available.",
+    "Stage 4 critical routing. Uses the embedded orthoroute-compatible critical router with IPC-first application when available, falling back to SWIG only when live IPC control is not available, and inherits the preferred critical layer from reference planning when the caller does not force one.",
     {
       boardPath: z.string().optional().describe("Path to .kicad_pcb file (default: current board)"),
       criticalClasses: z.array(z.string()).optional().describe("Critical classes to route in this stage"),
@@ -264,10 +306,24 @@ export function registerFreeroutingTools(server: McpServer, callKicadScript: Fun
 
   server.tool(
     "post_tune_routes",
-    "Stage 6 post-processing. Rebuilds connectivity, optionally refills zones, and reserves a stable hook for future skew cleanup, meander relaxation, RF smoothing, and stitching-via insertion.",
+    "Stage 6 post-processing. Rebuilds connectivity, optionally inserts conservative replacement meanders for explicit matched-length bus groups, optionally refills zones, and heals residual support-net disconnects by bridging same-layer ground/power islands before falling back to conservative stitching vias.",
     {
       boardPath: z.string().optional().describe("Path to .kicad_pcb file (default: current board)"),
+      matchedLengthGroups: z.array(z.object({ nets: z.array(z.string()), maxSkewMm: z.number().optional(), type: z.string().optional() })).optional().describe("Explicit matched-length groups to tune during post-processing"),
+      autoTuneMatchedLengths: z.boolean().optional().describe("Attempt deterministic post-route matched-length compensation on explicit bus groups"),
+      matchedLengthMinExtraMm: z.number().optional().describe("Do not insert meanders when the required extra length is below this floor"),
+      matchedLengthMaxGroupSize: z.number().int().optional().describe("Skip explicit groups larger than this size during post-route tuning"),
       refillZones: z.boolean().optional().describe("Refill zones during post-processing"),
+      autoCreateReferenceZones: z.boolean().optional().describe("Create a deterministic ground reference zone when high-speed nets exist but no ground plane is present"),
+      referenceZoneNet: z.string().optional().describe("Optional ground net name to use for an automatically created reference zone"),
+      referenceZoneLayer: z.string().optional().describe("Optional layer override for an automatically created reference zone"),
+      referenceZoneInsetMm: z.number().optional().describe("Inset from the board edge used for an automatically created reference zone"),
+      referenceZoneClearanceMm: z.number().optional().describe("Clearance used for an automatically created reference zone"),
+      referenceZoneMinWidthMm: z.number().optional().describe("Minimum copper width used for an automatically created reference zone"),
+      autoHealSupportNets: z.boolean().optional().describe("Attempt conservative ground/power healing after routing"),
+      healingPasses: z.number().int().optional().describe("Maximum support-net healing passes"),
+      maxHealingViasPerNet: z.number().int().optional().describe("Upper bound for fallback stitch vias per net"),
+      healingReportPath: z.string().optional().describe("Optional DRC report path used by the healing loop"),
     },
     async (args: any) => {
       const result = await callKicadScript("post_tune_routes", args);
@@ -279,7 +335,7 @@ export function registerFreeroutingTools(server: McpServer, callKicadScript: Fun
 
   server.tool(
     "verify_routing_qor",
-    "Stage 7 verification. Runs DRC and produces QoR metrics including completion rate, wire length, via count, differential skew estimates, uncoupled estimates, and return-path/power misuse flags.",
+    "Stage 7 verification. Runs DRC and produces QoR metrics including completion rate, wire length, via count, differential skew estimates, explicit matched-length group skew, uncoupled estimates, and return-path/power misuse flags.",
     {
       boardPath: z.string().optional().describe("Path to .kicad_pcb file (default: current board)"),
       reportPath: z.string().optional().describe("Optional DRC text report path"),

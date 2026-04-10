@@ -17,7 +17,10 @@ from typing import Any, Dict, List, Optional
 logger = logging.getLogger("kicad_interface")
 
 KICAD9_FORMAT_VERSION = "20250114"  # .kicad_sch schematic files
-KICAD9_FOOTPRINT_VERSION = "20241229"  # .kicad_mod footprint files
+# Emit a KiCad 7/8-compatible footprint syntax so generated libraries load on
+# the system installations we encounter in MCP test environments as well as on
+# newer KiCad builds.
+KICAD9_FOOTPRINT_VERSION = "20211014"
 
 
 def _fmt(v: float) -> str:
@@ -105,15 +108,16 @@ class FootprintCreator:
         lines: List[str] = []
 
         # ---- header ----
-        lines.append(f'(footprint "{name}"')
-        lines.append(f"  (version {KICAD9_FOOTPRINT_VERSION})")
-        lines.append(f'  (generator "kicad-mcp")')
-        lines.append(f'  (generator_version "9.0")')
+        lines.append(
+            f'(footprint "{name}" (version {KICAD9_FOOTPRINT_VERSION}) (generator pcbnew)'
+        )
         lines.append(f'  (layer "F.Cu")')
         if description:
             lines.append(f'  (descr "{_esc(description)}")')
         if tags:
             lines.append(f'  (tags "{_esc(tags)}")')
+        if any(pad.get("type", "smd").lower() in {"thru_hole", "np_thru_hole"} for pad in pads):
+            lines.append("  (attr through_hole)")
         lines.append("")
 
         # ---- reference / value text ----
@@ -122,20 +126,23 @@ class FootprintCreator:
         val_x = value_position.get("x", 0.0) if value_position else 0.0
         val_y = value_position.get("y", 1.27) if value_position else 1.27
 
-        lines.append(f'  (property "Reference" "REF**" (at {_fmt(ref_x)} {_fmt(ref_y)} 0)')
-        lines.append(f'    (layer "F.SilkS")')
-        lines.append(f'    (uuid "{_new_uuid()}")')
+        lines.append(
+            f'  (fp_text reference "REF**" (at {_fmt(ref_x)} {_fmt(ref_y)}) (layer "F.SilkS")'
+        )
         lines.append(f"    (effects (font (size 1 1) (thickness 0.15)))")
+        lines.append(f'    (tstamp "{_new_uuid()}")')
         lines.append(f"  )")
-        lines.append(f'  (property "Value" "{_esc(name)}" (at {_fmt(val_x)} {_fmt(val_y)} 0)')
-        lines.append(f'    (layer "F.Fab")')
-        lines.append(f'    (uuid "{_new_uuid()}")')
+        lines.append(
+            f'  (fp_text value "{_esc(name)}" (at {_fmt(val_x)} {_fmt(val_y)}) (layer "F.Fab")'
+        )
         lines.append(f"    (effects (font (size 1 1) (thickness 0.15)))")
+        lines.append(f'    (tstamp "{_new_uuid()}")')
         lines.append(f"  )")
-        lines.append(f'  (property "Datasheet" "" (at 0 0 0)')
-        lines.append(f'    (layer "F.Fab")')
-        lines.append(f'    (uuid "{_new_uuid()}")')
+        lines.append(
+            '  (fp_text user "${REFERENCE}" (at 0 0) (layer "F.Fab")'
+        )
         lines.append(f"    (effects (font (size 1 1) (thickness 0.15)))")
+        lines.append(f'    (tstamp "{_new_uuid()}")')
         lines.append(f"  )")
         lines.append("")
 
@@ -481,7 +488,7 @@ def _pad_lines(pad: Dict[str, Any]) -> List[str]:
     if shape == "roundrect":
         lines.append(f"    (roundrect_rratio {_fmt(rr_ratio)})")
 
-    lines.append(f'    (uuid "{_new_uuid()}")')
+    lines.append(f'    (tstamp "{_new_uuid()}")')
     lines.append(f"  )")
     return lines
 
@@ -492,14 +499,17 @@ def _rect_lines(rect: Dict[str, Any], layer: str, default_width: float = 0.05) -
     x2 = _fmt(rect.get("x2", 1.0))
     y2 = _fmt(rect.get("y2", 1.0))
     w = _fmt(rect.get("width", default_width))
-    return [
-        f"  (fp_rect",
-        f"    (start {x1} {y1})",
-        f"    (end {x2} {y2})",
-        f"    (stroke (width {w}) (type default))",
-        f"    (fill none)",
-        f'    (layer "{layer}")',
-        f'    (uuid "{_new_uuid()}")',
-        f"  )",
-        "",
+    segments = [
+        ((x1, y1), (x2, y1)),
+        ((x2, y1), (x2, y2)),
+        ((x2, y2), (x1, y2)),
+        ((x1, y2), (x1, y1)),
     ]
+    lines: List[str] = []
+    for start, end in segments:
+        lines.append(
+            f'  (fp_line (start {start[0]} {start[1]}) (end {end[0]} {end[1]}) '
+            f'(layer "{layer}") (width {w}) (tstamp "{_new_uuid()}"))'
+        )
+    lines.append("")
+    return lines

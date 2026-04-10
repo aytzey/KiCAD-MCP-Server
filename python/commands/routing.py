@@ -251,6 +251,157 @@ class RoutingCommands:
         best = candidates[best_idx]
         return (round(best[0], 6), round(best[1], 6))
 
+    @staticmethod
+    def _pair_midpoint(
+        pos_point: Tuple[float, float],
+        neg_point: Tuple[float, float],
+    ) -> Tuple[float, float]:
+        return (
+            round((pos_point[0] + neg_point[0]) / 2.0, 6),
+            round((pos_point[1] + neg_point[1]) / 2.0, 6),
+        )
+
+    @staticmethod
+    def _offset_pair_about_center(
+        center: Tuple[float, float],
+        guide_point: Tuple[float, float],
+        gap: float,
+    ) -> Tuple[Tuple[float, float], Tuple[float, float]]:
+        dx = guide_point[0] - center[0]
+        dy = guide_point[1] - center[1]
+        seg_len = math.hypot(dx, dy)
+        if seg_len < 1e-9:
+            dx = 1.0
+            dy = 0.0
+            seg_len = 1.0
+        px = -dy / seg_len
+        py = dx / seg_len
+        half_gap = gap / 2.0
+        return (
+            (round(center[0] + px * half_gap, 6), round(center[1] + py * half_gap, 6)),
+            (round(center[0] - px * half_gap, 6), round(center[1] - py * half_gap, 6)),
+        )
+
+    @staticmethod
+    def _point_hits_obstacle(
+        point: Tuple[float, float],
+        obstacles: List[Tuple[float, float, float, float]],
+    ) -> bool:
+        x, y = point
+        return any(rect[0] < x < rect[2] and rect[1] < y < rect[3] for rect in obstacles)
+
+    def _select_paired_via_positions(
+        self,
+        *,
+        anchor_mid: Tuple[float, float],
+        guide_point: Tuple[float, float],
+        from_layer: str,
+        to_layer: str,
+        gap: float,
+        width_mm: float,
+        ignored_refs: Optional[List[str]] = None,
+        net: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        keepout_margin = self._get_clearance_mm() + width_mm / 2.0
+        obstacles = self._collect_routing_obstacles(
+            from_layer,
+            keepout_margin,
+            ignored_refs=ignored_refs,
+            net=net,
+        ) + self._collect_routing_obstacles(
+            to_layer,
+            keepout_margin,
+            ignored_refs=ignored_refs,
+            net=net,
+        )
+
+        dx = guide_point[0] - anchor_mid[0]
+        dy = guide_point[1] - anchor_mid[1]
+        seg_len = math.hypot(dx, dy)
+        if seg_len < 1e-9:
+            dx = 1.0
+            dy = 0.0
+            seg_len = 1.0
+        ux = dx / seg_len
+        uy = dy / seg_len
+        px = -uy
+        py = ux
+        base_offset = max(gap * 1.5, width_mm * 6.0, keepout_margin * 2.0, 0.8)
+
+        preferred_center = (
+            round(anchor_mid[0] + ux * base_offset, 6),
+            round(anchor_mid[1] + uy * base_offset, 6),
+        )
+        candidate_centers = [
+            preferred_center,
+            (
+                round(anchor_mid[0] + ux * base_offset * 1.5, 6),
+                round(anchor_mid[1] + uy * base_offset * 1.5, 6),
+            ),
+            (
+                round(anchor_mid[0] + ux * base_offset * 2.0, 6),
+                round(anchor_mid[1] + uy * base_offset * 2.0, 6),
+            ),
+            (
+                round(preferred_center[0] + px * gap / 2.0, 6),
+                round(preferred_center[1] + py * gap / 2.0, 6),
+            ),
+            (
+                round(preferred_center[0] - px * gap / 2.0, 6),
+                round(preferred_center[1] - py * gap / 2.0, 6),
+            ),
+            self._find_best_via_position(
+                anchor_mid,
+                preferred_center,
+                from_layer,
+                to_layer,
+                keepout_margin,
+                list(ignored_refs or []),
+                net,
+            ),
+        ]
+
+        unique_centers: List[Tuple[float, float]] = []
+        seen = set()
+        for center in candidate_centers:
+            key = (round(center[0], 4), round(center[1], 4))
+            if key in seen:
+                continue
+            seen.add(key)
+            unique_centers.append(center)
+
+        ranked: List[Dict[str, Any]] = []
+        for center in unique_centers:
+            pos_via, neg_via = self._offset_pair_about_center(center, guide_point, gap)
+            blocked_count = int(self._point_hits_obstacle(pos_via, obstacles)) + int(
+                self._point_hits_obstacle(neg_via, obstacles)
+            )
+            wirelength = (
+                abs(center[0] - anchor_mid[0])
+                + abs(center[1] - anchor_mid[1])
+                + abs(guide_point[0] - center[0])
+                + abs(guide_point[1] - center[1])
+            )
+            ranked.append(
+                {
+                    "center": center,
+                    "posVia": pos_via,
+                    "negVia": neg_via,
+                    "blockedCount": blocked_count,
+                    "wirelengthScore": round(wirelength, 4),
+                }
+            )
+
+        ranked.sort(key=lambda item: (item["blockedCount"], item["wirelengthScore"]))
+        selected = ranked[0]
+        return {
+            "center": selected["center"],
+            "posVia": selected["posVia"],
+            "negVia": selected["negVia"],
+            "blockedCount": selected["blockedCount"],
+            "candidates": ranked,
+        }
+
     def _collect_routing_obstacles(
         self,
         layer: str,
@@ -1749,12 +1900,21 @@ class RoutingCommands:
 
             start_pos = params.get("startPos")
             end_pos = params.get("endPos")
+            start_pos_pos = params.get("startPosPos")
+            start_pos_neg = params.get("startPosNeg")
+            end_pos_pos = params.get("endPosPos")
+            end_pos_neg = params.get("endPosNeg")
             net_pos = params.get("netPos")
             net_neg = params.get("netNeg")
             layer = params.get("layer", "F.Cu")
+            start_layer = params.get("startLayer", layer)
+            end_layer = params.get("endLayer", layer)
+            start_ref = params.get("startRef")
+            end_ref = params.get("endRef")
             width = params.get("width")
             gap = params.get("gap")
             max_skew_mm = float(params.get("maxSkewMm", 0.25))
+            allow_layer_transitions = bool(params.get("allowLayerTransitions", True))
 
             if not start_pos or not end_pos or not net_pos or not net_neg:
                 return {
@@ -1789,17 +1949,208 @@ class RoutingCommands:
 
             width_mm = self._get_track_width_mm(width)
             scale = 1000000
+            start_mid_mm = (start_point.x / scale, start_point.y / scale)
+            end_mid_mm = (end_point.x / scale, end_point.y / scale)
+
+            def _point_spec_to_mm(point_spec: Optional[Dict[str, Any]]) -> Optional[Tuple[float, float]]:
+                if not point_spec:
+                    return None
+                point = self._get_point(point_spec)
+                return (point.x / scale, point.y / scale)
+
+            route_start_pos_mm = _point_spec_to_mm(start_pos_pos)
+            route_start_neg_mm = _point_spec_to_mm(start_pos_neg)
+            route_end_pos_mm = _point_spec_to_mm(end_pos_pos)
+            route_end_neg_mm = _point_spec_to_mm(end_pos_neg)
+            transition_via_count = 0
+            start_transition: Optional[Dict[str, Any]] = None
+            end_transition: Optional[Dict[str, Any]] = None
+
+            def _route_pair_transition(
+                *,
+                pos_point: Tuple[float, float],
+                neg_point: Tuple[float, float],
+                from_layer_name: str,
+                to_layer_name: str,
+                site_mid: Tuple[float, float],
+                guide_mid: Tuple[float, float],
+                site_ref: Optional[str],
+                transition_name: str,
+            ) -> Dict[str, Any]:
+                if from_layer_name == to_layer_name:
+                    return {
+                        "success": True,
+                        "pos": pos_point,
+                        "neg": neg_point,
+                        "viaCount": 0,
+                        "name": transition_name,
+                    }
+                if not allow_layer_transitions:
+                    return {
+                        "success": False,
+                        "message": "Differential pair layer transitions are disabled",
+                        "errorDetails": {
+                            "transition": transition_name,
+                            "fromLayer": from_layer_name,
+                            "toLayer": to_layer_name,
+                        },
+                    }
+
+                ignored_refs = [site_ref] if site_ref else []
+                via_plan = self._select_paired_via_positions(
+                    anchor_mid=site_mid,
+                    guide_point=guide_mid,
+                    from_layer=from_layer_name,
+                    to_layer=to_layer_name,
+                    gap=gap,
+                    width_mm=width_mm,
+                    ignored_refs=ignored_refs,
+                    net=net_pos,
+                )
+                pos_via = via_plan["posVia"]
+                neg_via = via_plan["negVia"]
+
+                pos_trace = self.route_trace(
+                    {
+                        "start": {"x": pos_point[0], "y": pos_point[1], "unit": "mm"},
+                        "end": {"x": pos_via[0], "y": pos_via[1], "unit": "mm"},
+                        "layer": from_layer_name,
+                        "width": width_mm,
+                        "net": net_pos,
+                        "ignoreRefs": ignored_refs,
+                    }
+                )
+                neg_trace = self.route_trace(
+                    {
+                        "start": {"x": neg_point[0], "y": neg_point[1], "unit": "mm"},
+                        "end": {"x": neg_via[0], "y": neg_via[1], "unit": "mm"},
+                        "layer": from_layer_name,
+                        "width": width_mm,
+                        "net": net_neg,
+                        "ignoreRefs": ignored_refs,
+                    }
+                )
+                pos_via_result = self.add_via(
+                    {
+                        "position": {"x": pos_via[0], "y": pos_via[1], "unit": "mm"},
+                        "net": net_pos,
+                        "from_layer": from_layer_name,
+                        "to_layer": to_layer_name,
+                    }
+                )
+                neg_via_result = self.add_via(
+                    {
+                        "position": {"x": neg_via[0], "y": neg_via[1], "unit": "mm"},
+                        "net": net_neg,
+                        "from_layer": from_layer_name,
+                        "to_layer": to_layer_name,
+                    }
+                )
+                if not (
+                    pos_trace.get("success")
+                    and neg_trace.get("success")
+                    and pos_via_result.get("success")
+                    and neg_via_result.get("success")
+                ):
+                    return {
+                        "success": False,
+                        "message": f"Failed to create {transition_name} differential-pair transition",
+                        "errorDetails": {
+                            "transition": transition_name,
+                            "posTrace": pos_trace,
+                            "negTrace": neg_trace,
+                            "posVia": pos_via_result,
+                            "negVia": neg_via_result,
+                        },
+                    }
+                return {
+                    "success": True,
+                    "name": transition_name,
+                    "fromLayer": from_layer_name,
+                    "toLayer": to_layer_name,
+                    "center": {"x": via_plan["center"][0], "y": via_plan["center"][1], "unit": "mm"},
+                    "pos": pos_via,
+                    "neg": neg_via,
+                    "viaCount": 2,
+                    "blockedCandidates": via_plan["blockedCount"],
+                }
+
+            if start_layer != layer:
+                if route_start_pos_mm is None or route_start_neg_mm is None:
+                    return {
+                        "success": False,
+                        "message": "Missing start pair geometry for differential-pair transition",
+                        "errorDetails": "startPosPos and startPosNeg are required when startLayer != layer",
+                    }
+                start_transition = _route_pair_transition(
+                    pos_point=route_start_pos_mm,
+                    neg_point=route_start_neg_mm,
+                    from_layer_name=start_layer,
+                    to_layer_name=layer,
+                    site_mid=start_mid_mm,
+                    guide_mid=end_mid_mm,
+                    site_ref=start_ref,
+                    transition_name="start",
+                )
+                if not start_transition.get("success"):
+                    return start_transition
+                route_start_pos_mm = start_transition["pos"]
+                route_start_neg_mm = start_transition["neg"]
+                transition_via_count += int(start_transition.get("viaCount", 0))
+
+            if end_layer != layer:
+                if route_end_pos_mm is None or route_end_neg_mm is None:
+                    return {
+                        "success": False,
+                        "message": "Missing end pair geometry for differential-pair transition",
+                        "errorDetails": "endPosPos and endPosNeg are required when endLayer != layer",
+                    }
+                end_transition = _route_pair_transition(
+                    pos_point=route_end_pos_mm,
+                    neg_point=route_end_neg_mm,
+                    from_layer_name=end_layer,
+                    to_layer_name=layer,
+                    site_mid=end_mid_mm,
+                    guide_mid=start_mid_mm,
+                    site_ref=end_ref,
+                    transition_name="end",
+                )
+                if not end_transition.get("success"):
+                    return end_transition
+                route_end_pos_mm = end_transition["pos"]
+                route_end_neg_mm = end_transition["neg"]
+                transition_via_count += int(end_transition.get("viaCount", 0))
+
+            route_start_mid_mm = (
+                self._pair_midpoint(route_start_pos_mm, route_start_neg_mm)
+                if route_start_pos_mm is not None and route_start_neg_mm is not None
+                else start_mid_mm
+            )
+            route_end_mid_mm = (
+                self._pair_midpoint(route_end_pos_mm, route_end_neg_mm)
+                if route_end_pos_mm is not None and route_end_neg_mm is not None
+                else end_mid_mm
+            )
+            if route_start_pos_mm is None or route_start_neg_mm is None:
+                route_start_pos_mm, route_start_neg_mm = self._offset_pair_about_center(
+                    route_start_mid_mm,
+                    route_end_mid_mm,
+                    gap,
+                )
+            if route_end_pos_mm is None or route_end_neg_mm is None:
+                route_end_pos_mm, route_end_neg_mm = self._offset_pair_about_center(
+                    route_end_mid_mm,
+                    route_start_mid_mm,
+                    gap,
+                )
 
             # Plan reference path (positive trace) with obstacle avoidance
-            start_mm = (start_point.x / scale, start_point.y / scale)
-            end_mm = (end_point.x / scale, end_point.y / scale)
-
             ref_path = self._plan_trace_points(
-                start_mm, end_mm, layer, width_mm,
+                route_start_mid_mm, route_end_mid_mm, layer, width_mm,
                 net=net_pos, pad_repulsion=1.0,
             )
             if not ref_path or len(ref_path) < 2:
-                ref_path = [start_mm, end_mm]
+                ref_path = [route_start_mid_mm, route_end_mid_mm]
 
             # Generate coupled negative path by offsetting perpendicular to
             # each segment.  At bends, adjust offset direction so the gap
@@ -1837,31 +2188,34 @@ class RoutingCommands:
                     round(pt[1] - py * half_gap, 6),
                 ))
 
+            pos_path[0] = route_start_pos_mm
+            neg_path[0] = route_start_neg_mm
+            pos_path[-1] = route_end_pos_mm
+            neg_path[-1] = route_end_neg_mm
+
             # Create tracks for both P and N
             pos_tracks = []
             neg_tracks = []
-            trace_width_nm = int(width_mm * scale)
 
             for idx in range(len(pos_path) - 1):
-                # Positive trace
-                p_track = pcbnew.PCB_TRACK(self.board)
-                p_track.SetStart(pcbnew.VECTOR2I(int(pos_path[idx][0] * scale), int(pos_path[idx][1] * scale)))
-                p_track.SetEnd(pcbnew.VECTOR2I(int(pos_path[idx + 1][0] * scale), int(pos_path[idx + 1][1] * scale)))
-                p_track.SetLayer(layer_id)
-                p_track.SetWidth(trace_width_nm)
-                p_track.SetNet(net_pos_obj)
-                self.board.Add(p_track)
-                pos_tracks.append(p_track)
-
-                # Negative trace
-                n_track = pcbnew.PCB_TRACK(self.board)
-                n_track.SetStart(pcbnew.VECTOR2I(int(neg_path[idx][0] * scale), int(neg_path[idx][1] * scale)))
-                n_track.SetEnd(pcbnew.VECTOR2I(int(neg_path[idx + 1][0] * scale), int(neg_path[idx + 1][1] * scale)))
-                n_track.SetLayer(layer_id)
-                n_track.SetWidth(trace_width_nm)
-                n_track.SetNet(net_neg_obj)
-                self.board.Add(n_track)
-                neg_tracks.append(n_track)
+                pos_tracks.append(
+                    self._add_track_segment(
+                        pcbnew.VECTOR2I(int(pos_path[idx][0] * scale), int(pos_path[idx][1] * scale)),
+                        pcbnew.VECTOR2I(int(pos_path[idx + 1][0] * scale), int(pos_path[idx + 1][1] * scale)),
+                        layer_id,
+                        width_mm,
+                        net_pos,
+                    )
+                )
+                neg_tracks.append(
+                    self._add_track_segment(
+                        pcbnew.VECTOR2I(int(neg_path[idx][0] * scale), int(neg_path[idx][1] * scale)),
+                        pcbnew.VECTOR2I(int(neg_path[idx + 1][0] * scale), int(neg_path[idx + 1][1] * scale)),
+                        layer_id,
+                        width_mm,
+                        net_neg,
+                    )
+                )
 
             # Compute length skew for reporting
             pos_length = manhattan_path_length(pos_path)
@@ -1895,6 +2249,10 @@ class RoutingCommands:
                     "maxSkewMm": max_skew_mm,
                     "segments": len(pos_tracks),
                     "obstacleAware": True,
+                    "viaCount": transition_via_count,
+                    "pairedTransitions": transition_via_count > 0,
+                    "startTransition": start_transition,
+                    "endTransition": end_transition,
                 },
             }
 
