@@ -1217,6 +1217,7 @@ class KiCADInterface:
             "placements": placements,
             "skipped": skipped,
             "clusters": [],
+            "routingCorridors": [],
             "rules": [
                 {
                     "name": "deterministic_grid",
@@ -1925,6 +1926,117 @@ class KiCADInterface:
 
         return slot_plan
 
+    def _routing_corridor_for_connector_cluster(
+        self,
+        anchor_ref: str,
+        slot: Dict[str, Any],
+        members: List[Dict[str, Any]],
+        cluster_profile: str,
+        reference_profile: str,
+        reference_domain: str,
+        bounds: Tuple[float, float, float, float],
+        pitch_x: float,
+        pitch_y: float,
+    ) -> Optional[Dict[str, Any]]:
+        if cluster_profile not in {"high_speed", "rf"} and reference_profile not in {
+            "ground_continuity",
+            "signal_integrity",
+        }:
+            return None
+
+        edge = str(slot.get("edge") or "")
+        if edge not in {"left", "right", "top", "bottom"}:
+            return None
+
+        left, top, right, bottom = bounds
+        anchor_x, anchor_y = [float(value) for value in slot.get("anchorPoint", (0.0, 0.0))]
+        inward_x, inward_y = [float(value) for value in slot.get("inwardCenter", (anchor_x, anchor_y))]
+        member_refs = [str(item["reference"]) for item in members if item.get("reference")]
+        member_count = max(1, len(member_refs))
+
+        if edge in {"left", "right"}:
+            depth_mm = max(abs(inward_x - anchor_x), pitch_x)
+            width_mm = max(4.0, pitch_y * (1.15 + min(member_count, 5) * 0.18))
+            if edge == "left":
+                rect = {
+                    "left": round(max(left, anchor_x), 4),
+                    "top": round(max(top, anchor_y - width_mm / 2), 4),
+                    "right": round(min(right, anchor_x + depth_mm), 4),
+                    "bottom": round(min(bottom, anchor_y + width_mm / 2), 4),
+                }
+                direction = "east"
+            else:
+                rect = {
+                    "left": round(max(left, anchor_x - depth_mm), 4),
+                    "top": round(max(top, anchor_y - width_mm / 2), 4),
+                    "right": round(min(right, anchor_x), 4),
+                    "bottom": round(min(bottom, anchor_y + width_mm / 2), 4),
+                }
+                direction = "west"
+        else:
+            depth_mm = max(abs(inward_y - anchor_y), pitch_y)
+            width_mm = max(4.0, pitch_x * (1.15 + min(member_count, 5) * 0.18))
+            if edge == "top":
+                rect = {
+                    "left": round(max(left, anchor_x - width_mm / 2), 4),
+                    "top": round(max(top, anchor_y), 4),
+                    "right": round(min(right, anchor_x + width_mm / 2), 4),
+                    "bottom": round(min(bottom, anchor_y + depth_mm), 4),
+                }
+                direction = "south"
+            else:
+                rect = {
+                    "left": round(max(left, anchor_x - width_mm / 2), 4),
+                    "top": round(max(top, anchor_y - depth_mm), 4),
+                    "right": round(min(right, anchor_x + width_mm / 2), 4),
+                    "bottom": round(min(bottom, anchor_y), 4),
+                }
+                direction = "north"
+
+        profile_priority = {"rf": 100.0, "high_speed": 90.0}
+        priority = profile_priority.get(cluster_profile, 70.0)
+        if reference_profile == "ground_continuity":
+            priority += 12.0
+        elif reference_profile == "signal_integrity":
+            priority += 8.0
+        domain_class = self._reference_domain_class(reference_domain)
+        if domain_class == "quiet":
+            priority += 8.0
+        elif domain_class == "noisy":
+            priority -= 8.0
+        priority += min(10.0, member_count * 1.5)
+
+        corridor_id = "routing_corridor_" + re.sub(r"[^A-Za-z0-9_]+", "_", anchor_ref).strip("_")
+        min_pitch = max(1.0, min(pitch_x, pitch_y))
+        congestion_budget_mm = max(depth_mm, (width_mm * depth_mm) / min_pitch * 0.45)
+        rules = ["reserve_breakout_corridor"]
+        if reference_profile in {"ground_continuity", "signal_integrity"}:
+            rules.append("preserve_reference_entry")
+        if domain_class == "quiet":
+            rules.append("protect_quiet_reference_domain")
+
+        return {
+            "id": corridor_id,
+            "anchor": anchor_ref,
+            "members": member_refs,
+            "edge": edge,
+            "direction": direction,
+            "signalProfile": cluster_profile,
+            "referenceProfile": reference_profile,
+            "referenceDomain": reference_domain,
+            "referenceDomainClass": domain_class,
+            "centerline": [
+                {"x": round(anchor_x, 4), "y": round(anchor_y, 4), "unit": "mm"},
+                {"x": round(inward_x, 4), "y": round(inward_y, 4), "unit": "mm"},
+            ],
+            "rect": {**rect, "unit": "mm"},
+            "widthMm": round(width_mm, 4),
+            "depthMm": round(depth_mm, 4),
+            "priority": round(priority, 4),
+            "congestionBudgetMm": round(congestion_budget_mm, 4),
+            "rules": rules,
+        }
+
     def _place_cluster_members(
         self,
         center_x: float,
@@ -1974,6 +2086,7 @@ class KiCADInterface:
                 "placements": pending,
                 "skipped": skipped,
                 "clusters": [],
+                "routingCorridors": [],
                 "rules": [
                     {
                         "name": "singleton_direct_place",
@@ -2046,6 +2159,7 @@ class KiCADInterface:
 
         placements: List[Dict[str, Any]] = []
         clusters: List[Dict[str, Any]] = []
+        routing_corridors: List[Dict[str, Any]] = []
         placed_refs: Set[str] = set()
         plan_rules = [
             {
@@ -2129,6 +2243,20 @@ class KiCADInterface:
                 )
                 if slot.get("referenceEdgePreference") in {"left", "right"} and slot.get("referenceEdgePreference") == slot.get("edge"):
                     rules_applied.append("align_with_reference_zone_edge")
+                routing_corridor = self._routing_corridor_for_connector_cluster(
+                    ref,
+                    slot,
+                    local_members,
+                    cluster_profile,
+                    reference_profile,
+                    reference_domain,
+                    bounds,
+                    pitch_x,
+                    pitch_y,
+                )
+                if routing_corridor:
+                    routing_corridors.append(routing_corridor)
+                    rules_applied.append("emit_routing_corridor_reservation")
                 for member, (x, y) in self._place_cluster_members(
                     inward_center_x,
                     inward_center_y,
@@ -2166,6 +2294,14 @@ class KiCADInterface:
                         "movable": False,
                         "legalBounds": slot["memberBounds"],
                         "rulesApplied": rules_applied,
+                        **(
+                            {
+                                "routingCorridorId": routing_corridor["id"],
+                                "routingCorridorPriority": routing_corridor["priority"],
+                            }
+                            if routing_corridor
+                            else {}
+                        ),
                     }
                 )
 
@@ -2331,6 +2467,13 @@ class KiCADInterface:
                     "description": "Apply local post-placement shifts that preserve cluster structure while increasing margin between noisy and sensitive signal regions.",
                 }
             )
+        if routing_corridors:
+            plan_rules.append(
+                {
+                    "name": "routing_corridor_reservations",
+                    "description": "Emit numeric breakout-corridor reservations so constraint generation, critical routing, and QoR verification can consume placement intent directly.",
+                }
+            )
 
         for cluster in clusters:
             cluster.pop("movable", None)
@@ -2344,6 +2487,7 @@ class KiCADInterface:
             "placements": placements,
             "skipped": skipped,
             "clusters": clusters,
+            "routingCorridors": routing_corridors,
             "rules": plan_rules,
         }
 
@@ -2400,6 +2544,7 @@ class KiCADInterface:
             "errors": errors,
             "strategy": plan.get("strategy", "grid"),
             "clusters": plan.get("clusters", []),
+            "routingCorridors": plan.get("routingCorridors", []),
             "rules": plan.get("rules", []),
         }
 
@@ -2465,7 +2610,14 @@ class KiCADInterface:
             auto_place_enabled = self._should_auto_place_missing_footprints(
                 params, existing_footprint_count
             )
-            auto_place_result = {"placed": [], "skipped": [], "errors": [], "rules": [], "clusters": []}
+            auto_place_result = {
+                "placed": [],
+                "skipped": [],
+                "errors": [],
+                "rules": [],
+                "clusters": [],
+                "routingCorridors": [],
+            }
             if auto_place_enabled:
                 auto_place_result = self._auto_place_missing_footprints(
                     schematic, board_path, board, params, netlist=netlist
@@ -2537,6 +2689,7 @@ class KiCADInterface:
                 "auto_place_strategy": auto_place_result.get("strategy"),
                 "auto_placed_references": [item["reference"] for item in auto_place_result["placed"]],
                 "auto_place_clusters": auto_place_result.get("clusters", []),
+                "auto_place_routing_corridors": auto_place_result.get("routingCorridors", []),
                 "auto_place_rules": auto_place_result.get("rules", []),
                 "auto_place_skipped": auto_place_result["skipped"],
                 "auto_place_errors": auto_place_result["errors"],

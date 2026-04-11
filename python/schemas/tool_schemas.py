@@ -1188,6 +1188,11 @@ AUTOROUTE_TOOLS = [
                 "profiles": {"type": "array", "items": {"type": "string"}},
                 "interfaces": {"type": "array", "items": {"type": "string"}},
                 "criticalClasses": {"type": "array", "items": {"type": "string"}},
+                "placementRoutingCorridors": {
+                    "type": "array",
+                    "items": {"type": "object"},
+                    "description": "Numeric breakout corridor reservations returned by sync_schematic_to_board as auto_place_routing_corridors. Used to prioritize critical routing and verify corridor congestion risk.",
+                },
                 "powerCurrentA": {"type": "number"},
                 "copperOz": {"type": "number"},
                 "tempRiseC": {"type": "number"},
@@ -1272,6 +1277,11 @@ AUTOROUTE_TOOLS = [
                 "profiles": {"type": "array", "items": {"type": "string"}},
                 "interfaces": {"type": "array", "items": {"type": "string"}},
                 "criticalClasses": {"type": "array", "items": {"type": "string"}},
+                "placementRoutingCorridors": {
+                    "type": "array",
+                    "items": {"type": "object"},
+                    "description": "Numeric breakout corridor reservations returned by sync_schematic_to_board as auto_place_routing_corridors. These become placementRoutingCorridors in the canonical constraints artifact.",
+                },
                 "powerCurrentA": {"type": "number"},
                 "copperOz": {"type": "number"},
                 "tempRiseC": {"type": "number"},
@@ -1918,7 +1928,7 @@ SCHEMATIC_TOOLS = [
     {
         "name": "sync_schematic_to_board",
         "title": "Sync Schematic to PCB (F8)",
-        "description": "Reads net connections from the schematic and assigns them to matching component pads in the PCB board file. Equivalent to KiCAD Pcbnew F8 'Update PCB from Schematic'. On a blank PCB it can auto-place missing footprints from the schematic before assigning nets, so fresh projects do not require a separate manual placement step just to get a routable board.",
+        "description": "Reads net connections from the schematic and assigns them to matching component pads in the PCB board file. Equivalent to KiCAD Pcbnew F8 'Update PCB from Schematic'. On a blank PCB it can auto-place missing footprints from the schematic before assigning nets, returning placement clusters plus numeric routing corridor reservations for high-speed/RF/reference-sensitive breakouts.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1937,7 +1947,7 @@ SCHEMATIC_TOOLS = [
                 "placementStrategy": {
                     "type": "string",
                     "enum": ["routing_aware", "grid"],
-                    "description": "Auto-placement strategy for missing footprints. routing_aware clusters connected parts and pushes connectors toward edges; grid preserves the legacy deterministic grid behavior.",
+                    "description": "Auto-placement strategy for missing footprints. routing_aware clusters connected parts, pushes connectors toward edges, and emits routing corridor reservations; grid preserves the legacy deterministic grid behavior.",
                 },
                 "placementEdgeMarginMm": {
                     "type": "number",

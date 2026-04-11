@@ -1260,7 +1260,7 @@ Note: operates on .kicad_sch files only. To modify a PCB footprint use edit_comp
       placementStrategy: z
         .enum(["routing_aware", "grid"])
         .optional()
-        .describe("Auto-placement strategy for missing footprints. routing_aware clusters connected parts and keeps connectors near edges; grid preserves the legacy deterministic grid behavior."),
+        .describe("Auto-placement strategy for missing footprints. routing_aware clusters connected parts, keeps connectors near edges, and emits routing corridor reservations; grid preserves the legacy deterministic grid behavior."),
       placementEdgeMarginMm: z
         .number()
         .optional()

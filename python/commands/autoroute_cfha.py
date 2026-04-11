@@ -99,6 +99,7 @@ PROFILE_DEFAULTS: Dict[str, Dict[str, Any]] = {
         "hs_diff_skew_mm": 0.25,
         "hs_diff_uncoupled_mm": 3.0,
         "hs_via_limit": 2,
+        "hs_transition_cell_via_limit": 8,
         "rf_via_limit": 1,
         "crosstalk_guard_mm": 0.5,
         "analog_guard_mm": 1.0,
@@ -111,6 +112,7 @@ PROFILE_DEFAULTS: Dict[str, Dict[str, Any]] = {
         "hs_diff_skew_mm": 0.2,
         "hs_diff_uncoupled_mm": 2.0,
         "hs_via_limit": 2,
+        "hs_transition_cell_via_limit": 8,
         "rf_via_limit": 1,
         "crosstalk_guard_mm": 0.4,
         "analog_guard_mm": 0.8,
@@ -123,6 +125,7 @@ PROFILE_DEFAULTS: Dict[str, Dict[str, Any]] = {
         "hs_diff_skew_mm": 0.15,
         "hs_diff_uncoupled_mm": 1.5,
         "hs_via_limit": 2,
+        "hs_transition_cell_via_limit": 8,
         "rf_via_limit": 1,
         "crosstalk_guard_mm": 0.35,
         "analog_guard_mm": 0.6,
@@ -135,6 +138,7 @@ PROFILE_DEFAULTS: Dict[str, Dict[str, Any]] = {
         "hs_diff_skew_mm": 0.15,
         "hs_diff_uncoupled_mm": 1.0,
         "hs_via_limit": 1,
+        "hs_transition_cell_via_limit": 4,
         "rf_via_limit": 1,
         "crosstalk_guard_mm": 0.5,
         "analog_guard_mm": 1.0,
@@ -147,6 +151,7 @@ PROFILE_DEFAULTS: Dict[str, Dict[str, Any]] = {
         "hs_diff_skew_mm": 0.25,
         "hs_diff_uncoupled_mm": 3.0,
         "hs_via_limit": 2,
+        "hs_transition_cell_via_limit": 8,
         "rf_via_limit": 1,
         "crosstalk_guard_mm": 0.5,
         "analog_guard_mm": 1.0,
@@ -159,6 +164,7 @@ PROFILE_DEFAULTS: Dict[str, Dict[str, Any]] = {
         "hs_diff_skew_mm": 0.12,
         "hs_diff_uncoupled_mm": 1.0,
         "hs_via_limit": 2,
+        "hs_transition_cell_via_limit": 8,
         "rf_via_limit": 1,
         "crosstalk_guard_mm": 0.25,
         "analog_guard_mm": 0.5,
@@ -395,8 +401,8 @@ def compute_weighted_qor_score(
     weighted geometric mean.  The individual sub-scores are returned so
     the caller can see which dimension is worst.
 
-    Weight keys: length, vias, skew, uncoupled, returnPathRisk, completion,
-                 drcErrors.
+    Weight keys: length, vias, skew, uncoupled, returnPathRisk,
+                 placementCorridorRisk, completion, drcErrors.
 
     Reference: Inspired by He (2024) Eq 3.1 composite reward and
     FreeRouting's internal score (wirelength + gamma_g * N_via).
@@ -409,6 +415,7 @@ def compute_weighted_qor_score(
         "skew": 5.0,
         "uncoupled": 5.0,
         "returnPathRisk": 8.0,
+        "placementCorridorRisk": 4.0,
     }
     w.update(weights or {})
 
@@ -453,8 +460,11 @@ def compute_weighted_qor_score(
     sub["uncoupled"] = max(0.0, 1.0 - max(0.0, uncoupled_ratio - 1.0))
 
     # Return path risk: binary per-flag (1.0 if no flags)
-    risk_count = len(flags.get("returnPathRisk", []))
+    risk_count = len(flags.get("returnPathRisk", [])) + len(flags.get("transitionCellRisk", []))
     sub["returnPathRisk"] = 1.0 / (1.0 + risk_count)
+
+    corridor_risk_count = len(flags.get("placementCorridorRisk", []))
+    sub["placementCorridorRisk"] = 1.0 / (1.0 + corridor_risk_count)
 
     # Weighted geometric mean (avoids one bad metric drowning everything)
     total_weight = sum(w.get(k, 0) for k in sub)
@@ -2818,6 +2828,101 @@ class AutorouteCFHACommands:
             "inferredMatchedLengthGroups": auto_groups,
         }
 
+    def _normalize_placement_routing_corridors(
+        self,
+        params: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        raw_corridors: Any = (
+            params.get("placementRoutingCorridors")
+            or params.get("placementCorridors")
+            or params.get("routingCorridors")
+        )
+        if raw_corridors is None:
+            for key in ("autoPlaceResult", "syncResult", "syncSchematicResult"):
+                candidate = params.get(key)
+                if not isinstance(candidate, dict):
+                    continue
+                raw_corridors = (
+                    candidate.get("routingCorridors")
+                    or candidate.get("auto_place_routing_corridors")
+                    or candidate.get("placementRoutingCorridors")
+                )
+                if raw_corridors is not None:
+                    break
+        if not isinstance(raw_corridors, list):
+            return []
+
+        normalized: List[Dict[str, Any]] = []
+        seen_ids: set[str] = set()
+        for index, item in enumerate(raw_corridors):
+            if not isinstance(item, dict):
+                continue
+            anchor = str(item.get("anchor") or "").strip()
+            members = [
+                str(value).strip()
+                for value in (item.get("members") or [])
+                if str(value).strip()
+            ]
+            if anchor and anchor not in members:
+                members.insert(0, anchor)
+            if not anchor and members:
+                anchor = members[0]
+            if not anchor:
+                continue
+
+            corridor_id = str(item.get("id") or f"routing_corridor_{anchor}_{index + 1}")
+            corridor_id = re.sub(r"[^A-Za-z0-9_.:-]+", "_", corridor_id).strip("_")
+            if not corridor_id:
+                corridor_id = f"routing_corridor_{index + 1}"
+            if corridor_id in seen_ids:
+                corridor_id = f"{corridor_id}_{index + 1}"
+            seen_ids.add(corridor_id)
+
+            edge = str(item.get("edge") or "center").lower()
+            if edge not in {"left", "right", "top", "bottom", "center"}:
+                edge = "center"
+            try:
+                priority = max(0.0, float(item.get("priority", 0.0)))
+            except (TypeError, ValueError):
+                priority = 0.0
+            try:
+                budget = float(item.get("congestionBudgetMm", 0.0))
+            except (TypeError, ValueError):
+                budget = 0.0
+
+            normalized_item = {
+                "id": corridor_id,
+                "anchor": anchor,
+                "members": list(dict.fromkeys(members)),
+                "edge": edge,
+                "direction": item.get("direction"),
+                "signalProfile": item.get("signalProfile", "generic"),
+                "referenceProfile": item.get("referenceProfile", "generic"),
+                "referenceDomain": item.get("referenceDomain", "generic"),
+                "referenceDomainClass": item.get("referenceDomainClass", "generic"),
+                "priority": round(priority, 4),
+                "congestionBudgetMm": round(max(0.0, budget), 4),
+                "rules": list(item.get("rules") or []),
+            }
+            if isinstance(item.get("rect"), dict):
+                normalized_item["rect"] = item["rect"]
+            if isinstance(item.get("centerline"), list):
+                normalized_item["centerline"] = item["centerline"]
+            if item.get("widthMm") is not None:
+                normalized_item["widthMm"] = item.get("widthMm")
+            if item.get("depthMm") is not None:
+                normalized_item["depthMm"] = item.get("depthMm")
+            normalized.append(normalized_item)
+
+        normalized.sort(
+            key=lambda item: (
+                -float(item.get("priority", 0.0)),
+                str(item.get("anchor", "")),
+                str(item.get("id", "")),
+            )
+        )
+        return normalized
+
     def generate_routing_constraints(self, params: Dict[str, Any]) -> Dict[str, Any]:
         intents_result = params.get("intentResult")
         if not intents_result:
@@ -2839,6 +2944,7 @@ class AutorouteCFHACommands:
             inventory=inventory,
             analysis_summary=analysis_summary,
         )
+        placement_routing_corridors = self._normalize_placement_routing_corridors(params)
         seed = int(params.get("seed", 42))
         if "excludeFromFreeRouting" in params and params.get("excludeFromFreeRouting") is not None:
             exclude_candidates = params.get("excludeFromFreeRouting") or []
@@ -3160,6 +3266,7 @@ class AutorouteCFHACommands:
                 },
             },
             "referencePlanning": reference_planning,
+            "placementRoutingCorridors": placement_routing_corridors,
             "matchedLengthGroups": matched_groups,
             "compiledRules": compiled_rules,
             "excludeFromFreeRouting": exclude_from_freerouting,
@@ -3173,16 +3280,20 @@ class AutorouteCFHACommands:
                     "escape_complexity",
                     "breakout_pressure",
                     "reference_alignment",
+                    "placement_corridor_priority",
                     "local_congestion",
                 ],
                 "placementCoupling": {
                     "expectEdgeConnectors": True,
                     "expectLocalDecoupling": True,
                     "reserveConnectorBreakouts": True,
+                    "routingCorridorReservationCount": len(placement_routing_corridors),
+                    "hasRoutingCorridorReservations": bool(placement_routing_corridors),
                     "preferReferenceContinuity": True,
                     "avoidSplitReferenceLayers": bool(reference_planning.get("splitRiskLayers")),
                     "preferredReferenceLayer": reference_planning.get("preferredZoneLayer"),
                     "preferredSignalLayer": reference_planning.get("preferredSignalLayer"),
+                    "hsTransitionCellViaLimit": merged_defaults.get("hs_transition_cell_via_limit"),
                 },
                 "compiledRuleFamilies": [rule["name"] for rule in compiled_rules],
             },
@@ -3194,6 +3305,7 @@ class AutorouteCFHACommands:
                     "skew": 5.0,
                     "uncoupled": 5.0,
                     "returnPathRisk": 8.0,
+                    "placementCorridorRisk": 4.0,
                 },
             ),
         }
@@ -3461,6 +3573,7 @@ class AutorouteCFHACommands:
         default_layer: Optional[str],
         forced_layer: Optional[str],
         footprints: Optional[Dict[str, Any]] = None,
+        placement_corridor: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         if forced_layer:
             return {
@@ -3499,6 +3612,23 @@ class AutorouteCFHACommands:
         continuity_score = float(reference_planning.get("referenceContinuityScore") or 0.0)
         edge_pressure_by_layer = dict(board_summary.get("edgePressureByLayer", {}) or {})
         track_pressure_by_layer = dict(board_summary.get("trackPressureByLayer", {}) or {})
+        corridor = placement_corridor if isinstance(placement_corridor, dict) else {}
+        corridor_edge = str(corridor.get("edge") or "")
+        if corridor_edge in {"left", "right"}:
+            corridor_bucket = corridor_edge
+        elif corridor_edge in {"top", "bottom", "center"}:
+            corridor_bucket = "center"
+        else:
+            corridor_bucket = ""
+        try:
+            corridor_budget = float(corridor.get("congestionBudgetMm", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            corridor_budget = 0.0
+        try:
+            corridor_priority = float(corridor.get("priority", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            corridor_priority = 0.0
+        corridor_priority = min(150.0, max(0.0, corridor_priority))
         footprints = footprints or {}
         endpoint_layers: Dict[str, int] = {}
         endpoint_layers_per_pad: List[str] = []
@@ -3544,6 +3674,34 @@ class AutorouteCFHACommands:
                     candidate.get("edgePressure", total_pressure),
                 ) or total_pressure
             )
+            corridor_pressure: Optional[float] = None
+            corridor_pressure_penalty = 0.0
+            corridor_policy: Optional[str] = None
+            if corridor_bucket:
+                corridor_pressure = float(
+                    layer_edge_profile.get(
+                        corridor_bucket,
+                        candidate.get("edgePressure", total_pressure),
+                    ) or total_pressure
+                )
+                over_budget_mm = (
+                    max(0.0, corridor_pressure - corridor_budget)
+                    if corridor_budget > 0.0
+                    else 0.0
+                )
+                over_budget_ratio = (
+                    over_budget_mm / max(corridor_budget, 1.0)
+                    if corridor_budget > 0.0
+                    else 0.0
+                )
+                corridor_pressure_penalty = (
+                    corridor_pressure * (1.0 + corridor_priority / 100.0)
+                    + over_budget_ratio * 25.0
+                )
+                if corridor_budget > 0.0:
+                    corridor_policy = "over_budget" if over_budget_mm > 0.0 else "within_budget"
+                else:
+                    corridor_policy = "unbudgeted"
             if bucket == preferred_edge:
                 weighted_pressure = bucket_pressure * (1.0 + continuity_score)
             elif bucket == "center":
@@ -3554,6 +3712,8 @@ class AutorouteCFHACommands:
             via_transition_penalty = 0.0
             estimated_via_count_total = 0
             estimated_via_count_per_net = 0.0
+            estimated_stitch_via_count_total = 0
+            estimated_transition_cell_via_count_total = 0
             transition_required = False
             if endpoint_layers_per_pad:
                 estimated_via_count_total = sum(
@@ -3572,6 +3732,17 @@ class AutorouteCFHACommands:
                     via_transition_penalty = mismatch_refs * 12.0
                 else:
                     via_transition_penalty = mismatch_refs * 6.0
+                if (
+                    intent_name == "HS_DIFF"
+                    and str(intent.get("diff_partner") or "")
+                    and reference_planning.get("groundNet")
+                    and mismatch_refs > 0
+                ):
+                    estimated_stitch_via_count_total = mismatch_refs * 2
+                    via_transition_penalty += estimated_stitch_via_count_total * 2.0
+            estimated_transition_cell_via_count_total = (
+                estimated_via_count_total + estimated_stitch_via_count_total
+            )
 
             ranked_candidates.append(
                 {
@@ -3584,7 +3755,23 @@ class AutorouteCFHACommands:
                     "viaTransitionPenalty": round(via_transition_penalty, 4),
                     "estimatedViaCountTotal": int(estimated_via_count_total),
                     "estimatedViaCountPerNet": round(estimated_via_count_per_net, 4),
+                    "estimatedStitchViaCountTotal": int(estimated_stitch_via_count_total),
+                    "estimatedTransitionCellViaCountTotal": int(estimated_transition_cell_via_count_total),
                     "transitionRequired": bool(transition_required),
+                    "placementCorridorId": corridor.get("id"),
+                    "placementCorridorEdge": corridor_edge or None,
+                    "placementCorridorPressure": (
+                        round(corridor_pressure, 4)
+                        if corridor_pressure is not None
+                        else None
+                    ),
+                    "placementCorridorBudget": (
+                        round(corridor_budget, 4)
+                        if corridor_budget > 0.0
+                        else None
+                    ),
+                    "placementCorridorPenalty": round(corridor_pressure_penalty, 4),
+                    "placementCorridorPolicy": corridor_policy,
                     "totalPressure": round(total_pressure, 4),
                     "candidateRank": index,
                 }
@@ -3605,6 +3792,7 @@ class AutorouteCFHACommands:
                 1 if item["splitRisk"] else 0,
                 int(item["adjacencyRank"]),
                 float(item["viaTransitionPenalty"]),
+                float(item.get("placementCorridorPenalty") or 0.0),
                 float(item["weightedPressure"]),
                 float(item["totalPressure"]),
                 int(item["candidateRank"]),
@@ -3618,6 +3806,9 @@ class AutorouteCFHACommands:
             "bucket": bucket,
             "centroidXmm": side_info.get("centroidXmm"),
             "candidates": ranked_candidates,
+            "placementCorridorPressureMm": best.get("placementCorridorPressure"),
+            "placementCorridorBudgetMm": best.get("placementCorridorBudget"),
+            "placementCorridorPolicy": best.get("placementCorridorPolicy"),
         }
 
     def _select_locked_diff_pair_route_layer(
@@ -3633,6 +3824,8 @@ class AutorouteCFHACommands:
         forced_layer: Optional[str],
         footprints: Optional[Dict[str, Any]] = None,
         via_limit: Optional[int] = None,
+        transition_cell_via_limit: Optional[int] = None,
+        placement_corridor: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         partner_name = str(intent.get("diff_partner") or "")
         merged_pads = list(inventory.get(intent["net_name"], {}).get("pads", []) or [])
@@ -3652,6 +3845,7 @@ class AutorouteCFHACommands:
             default_layer=default_layer,
             forced_layer=forced_layer,
             footprints=footprints,
+            placement_corridor=placement_corridor,
         )
         candidates = list(decision.get("candidates") or [])
         transition_policy = "unknown_endpoint_layers"
@@ -3669,19 +3863,40 @@ class AutorouteCFHACommands:
                 budget_safe_candidates = [
                     candidate
                     for candidate in candidates
-                    if via_limit is None
-                    or float(candidate.get("estimatedViaCountPerNet", 0.0)) <= float(via_limit)
+                    if (
+                        via_limit is None
+                        or float(candidate.get("estimatedViaCountPerNet", 0.0)) <= float(via_limit)
+                    )
+                    and (
+                        transition_cell_via_limit is None
+                        or float(candidate.get("estimatedTransitionCellViaCountTotal", 0.0))
+                        <= float(transition_cell_via_limit)
+                    )
                 ]
                 selected = budget_safe_candidates[0] if budget_safe_candidates else candidates[0]
                 decision["layer"] = selected["layer"]
                 estimated_per_net = float(selected.get("estimatedViaCountPerNet", 0.0))
+                estimated_cell_total = float(selected.get("estimatedTransitionCellViaCountTotal", 0.0))
                 if via_limit is not None and estimated_per_net > float(via_limit):
                     transition_policy = "transitions_over_budget"
+                elif (
+                    transition_cell_via_limit is not None
+                    and estimated_cell_total > float(transition_cell_via_limit)
+                ):
+                    transition_policy = "transition_cell_over_budget"
                 else:
                     transition_policy = "paired_transitions_required"
             decision["viaBudget"] = via_limit
+            decision["transitionCellViaBudget"] = transition_cell_via_limit
             decision["estimatedViaCountTotal"] = int(selected.get("estimatedViaCountTotal", 0))
             decision["estimatedViaCountPerNet"] = round(float(selected.get("estimatedViaCountPerNet", 0.0)), 4)
+            decision["estimatedStitchViaCountTotal"] = int(selected.get("estimatedStitchViaCountTotal", 0))
+            decision["estimatedTransitionCellViaCountTotal"] = int(
+                selected.get("estimatedTransitionCellViaCountTotal", 0)
+            )
+            decision["placementCorridorPressureMm"] = selected.get("placementCorridorPressure")
+            decision["placementCorridorBudgetMm"] = selected.get("placementCorridorBudget")
+            decision["placementCorridorPolicy"] = selected.get("placementCorridorPolicy")
             decision["transitionPolicy"] = transition_policy
         if decision.get("source") == "per_net_reference":
             decision["source"] = "diff_pair_locked"
@@ -4024,6 +4239,79 @@ class AutorouteCFHACommands:
         critical_classes = set(constraints["criticalClasses"])
         reference_planning = constraints.get("referencePlanning", {})
         board_summary = dict(constraints.get("boardSummary", {}) or {})
+        placement_corridors = list(constraints.get("placementRoutingCorridors") or [])
+        corridors_by_ref: Dict[str, List[Dict[str, Any]]] = {}
+        for corridor in placement_corridors:
+            if not isinstance(corridor, dict):
+                continue
+            refs = list(corridor.get("members") or [])
+            anchor = corridor.get("anchor")
+            if anchor:
+                refs.append(anchor)
+            for ref in dict.fromkeys(str(value) for value in refs if str(value)):
+                corridors_by_ref.setdefault(ref, []).append(corridor)
+        for ref, corridors in corridors_by_ref.items():
+            corridors.sort(
+                key=lambda item: (
+                    -float(item.get("priority", 0.0) or 0.0),
+                    str(item.get("id", "")),
+                )
+            )
+
+        def _placement_corridor_for_intent(
+            intent: Dict[str, Any],
+            net_info: Dict[str, Any],
+        ) -> Optional[Dict[str, Any]]:
+            refs = list(intent.get("component_refs") or [])
+            refs.extend(net_info.get("pad_refs") or [])
+            refs.extend(pad.get("ref") for pad in net_info.get("pads", []) if pad.get("ref"))
+            candidates: List[Dict[str, Any]] = []
+            for ref in dict.fromkeys(str(value) for value in refs if str(value)):
+                candidates.extend(corridors_by_ref.get(ref, []))
+            if not candidates:
+                return None
+            return max(
+                candidates,
+                key=lambda item: (
+                    float(item.get("priority", 0.0) or 0.0),
+                    str(item.get("id", "")),
+                ),
+            )
+
+        def _placement_corridor_pressure(
+            corridor: Optional[Dict[str, Any]],
+            layer: Optional[str],
+        ) -> Optional[float]:
+            if not corridor or not layer:
+                return None
+            edge = str(corridor.get("edge") or "center")
+            bucket = edge if edge in {"left", "right"} else "center"
+            layer_pressure = (
+                board_summary.get("edgePressureByLayer", {}).get(layer, {})
+                if isinstance(board_summary.get("edgePressureByLayer"), dict)
+                else {}
+            )
+            try:
+                return round(float(layer_pressure.get(bucket, 0.0)), 4)
+            except (TypeError, ValueError):
+                return None
+
+        def _placement_corridor_fields(intent: Dict[str, Any]) -> Dict[str, Any]:
+            if not intent.get("_placement_corridor_id"):
+                return {}
+            return {
+                "placementCorridorId": intent.get("_placement_corridor_id"),
+                "placementCorridorAnchor": intent.get("_placement_corridor_anchor"),
+                "placementCorridorEdge": intent.get("_placement_corridor_edge"),
+                "placementCorridorPriority": intent.get("_placement_corridor_priority"),
+                "placementCorridorCongestionBudgetMm": intent.get(
+                    "_placement_corridor_congestion_budget_mm"
+                ),
+                "placementCorridorEdgePressureMm": intent.get(
+                    "_placement_corridor_edge_pressure_mm"
+                ),
+                "placementCorridorPolicy": intent.get("_placement_corridor_policy"),
+            }
         forced_layer = params.get("criticalLayer")
         critical_layer = (
             forced_layer
@@ -4052,6 +4340,7 @@ class AutorouteCFHACommands:
         for intent in critical_intents:
             net_info = inventory.get(intent["net_name"], {})
             pads = net_info.get("pads", [])
+            placement_corridor = _placement_corridor_for_intent(intent, net_info)
             intent["_congestion"] = self._estimate_net_congestion(pads, board)
             intent["_escape_complexity"] = self._estimate_escape_complexity(
                 intent["net_name"], pads, footprints
@@ -4067,6 +4356,7 @@ class AutorouteCFHACommands:
                 pair_key = tuple(sorted((intent["net_name"], intent["diff_partner"])))
                 layer_decision = pair_layer_decisions.get(pair_key, {})
                 if not layer_decision:
+                    transition_cell_limit_raw = constraints.get("defaults", {}).get("hs_transition_cell_via_limit")
                     layer_decision = self._select_locked_diff_pair_route_layer(
                         intent=intent,
                         partner_intent=critical_intents_by_name.get(str(intent["diff_partner"] or "")),
@@ -4078,6 +4368,12 @@ class AutorouteCFHACommands:
                         forced_layer=forced_layer,
                         footprints=footprints,
                         via_limit=int(constraints.get("defaults", {}).get("hs_via_limit", 2)),
+                        transition_cell_via_limit=(
+                            int(transition_cell_limit_raw)
+                            if transition_cell_limit_raw is not None
+                            else None
+                        ),
+                        placement_corridor=placement_corridor,
                     )
                     pair_layer_decisions[pair_key] = layer_decision
             else:
@@ -4090,6 +4386,7 @@ class AutorouteCFHACommands:
                     default_layer=critical_layer,
                     forced_layer=forced_layer,
                     footprints=footprints,
+                    placement_corridor=placement_corridor,
                 )
             intent["_route_layer"] = layer_decision.get("layer") or critical_layer
             intent["_route_layer_source"] = layer_decision.get("source", "referencePlanning")
@@ -4097,8 +4394,36 @@ class AutorouteCFHACommands:
             intent["_route_layer_centroid_x_mm"] = layer_decision.get("centroidXmm")
             intent["_estimated_via_count_total"] = layer_decision.get("estimatedViaCountTotal")
             intent["_estimated_via_count_per_net"] = layer_decision.get("estimatedViaCountPerNet")
+            intent["_estimated_stitch_via_count_total"] = layer_decision.get("estimatedStitchViaCountTotal")
+            intent["_estimated_transition_cell_via_count_total"] = layer_decision.get(
+                "estimatedTransitionCellViaCountTotal"
+            )
             intent["_transition_policy"] = layer_decision.get("transitionPolicy")
             intent["_via_budget"] = layer_decision.get("viaBudget")
+            intent["_transition_cell_via_budget"] = layer_decision.get("transitionCellViaBudget")
+            if placement_corridor:
+                intent["_placement_corridor_id"] = placement_corridor.get("id")
+                intent["_placement_corridor_anchor"] = placement_corridor.get("anchor")
+                intent["_placement_corridor_edge"] = placement_corridor.get("edge")
+                intent["_placement_corridor_priority"] = float(
+                    placement_corridor.get("priority", 0.0) or 0.0
+                )
+                intent["_placement_corridor_congestion_budget_mm"] = layer_decision.get(
+                    "placementCorridorBudgetMm",
+                    placement_corridor.get("congestionBudgetMm"),
+                )
+                intent["_placement_corridor_edge_pressure_mm"] = layer_decision.get(
+                    "placementCorridorPressureMm"
+                )
+                if intent["_placement_corridor_edge_pressure_mm"] is None:
+                    intent["_placement_corridor_edge_pressure_mm"] = _placement_corridor_pressure(
+                        placement_corridor,
+                        intent.get("_route_layer"),
+                    )
+                intent["_placement_corridor_policy"] = layer_decision.get("placementCorridorPolicy")
+            else:
+                intent["_placement_corridor_priority"] = 0.0
+                intent["_placement_corridor_policy"] = None
 
         critical_intents.sort(
             key=lambda item: (
@@ -4106,6 +4431,7 @@ class AutorouteCFHACommands:
                 -item.get("_escape_complexity", 0),
                 -item.get("_breakout_pressure", 0),
                 -item.get("_reference_alignment", 0),
+                -item.get("_placement_corridor_priority", 0),
                 -item.get("_congestion", 0),
                 item["net_name"],
             )
@@ -4117,11 +4443,20 @@ class AutorouteCFHACommands:
                 "escapeComplexity": round(float(intent.get("_escape_complexity", 0.0)), 4),
                 "breakoutPressure": round(float(intent.get("_breakout_pressure", 0.0)), 4),
                 "referenceAlignment": round(float(intent.get("_reference_alignment", 0.0)), 4),
+                "placementCorridorPriority": round(
+                    float(intent.get("_placement_corridor_priority", 0.0)), 4
+                ),
+                **_placement_corridor_fields(intent),
                 "localCongestion": round(float(intent.get("_congestion", 0.0)), 4),
                 "selectedLayer": intent.get("_route_layer"),
                 "selectedLayerSource": intent.get("_route_layer_source"),
                 "selectedLayerBucket": intent.get("_route_layer_bucket"),
                 "estimatedViaCountPerNet": intent.get("_estimated_via_count_per_net"),
+                "estimatedStitchViaCountTotal": intent.get("_estimated_stitch_via_count_total"),
+                "estimatedTransitionCellViaCountTotal": intent.get(
+                    "_estimated_transition_cell_via_count_total"
+                ),
+                "transitionCellViaBudget": intent.get("_transition_cell_via_budget"),
                 "transitionPolicy": intent.get("_transition_policy"),
             }
             for intent in critical_intents
@@ -4184,9 +4519,15 @@ class AutorouteCFHACommands:
                         "widthMm": width_mm,
                         "layer": route_layer,
                         "layerSource": intent.get("_route_layer_source"),
+                        **_placement_corridor_fields(intent),
                         "backend": "diff_pair",
                         "pairWith": intent["diff_partner"],
                         "estimatedViaCountPerNet": intent.get("_estimated_via_count_per_net"),
+                        "estimatedStitchViaCountTotal": intent.get("_estimated_stitch_via_count_total"),
+                        "estimatedTransitionCellViaCountTotal": intent.get(
+                            "_estimated_transition_cell_via_count_total"
+                        ),
+                        "transitionCellViaBudget": intent.get("_transition_cell_via_budget"),
                         "transitionPolicy": intent.get("_transition_policy"),
                     })
                     routed.append({
@@ -4195,9 +4536,15 @@ class AutorouteCFHACommands:
                         "widthMm": width_mm,
                         "layer": route_layer,
                         "layerSource": intent.get("_route_layer_source"),
+                        **_placement_corridor_fields(intent),
                         "backend": "diff_pair",
                         "pairWith": intent["net_name"],
                         "estimatedViaCountPerNet": intent.get("_estimated_via_count_per_net"),
+                        "estimatedStitchViaCountTotal": intent.get("_estimated_stitch_via_count_total"),
+                        "estimatedTransitionCellViaCountTotal": intent.get(
+                            "_estimated_transition_cell_via_count_total"
+                        ),
+                        "transitionCellViaBudget": intent.get("_transition_cell_via_budget"),
                         "transitionPolicy": intent.get("_transition_policy"),
                     })
                     continue
@@ -4217,6 +4564,7 @@ class AutorouteCFHACommands:
                         "widthMm": width_mm,
                         "layer": route_layer,
                         "layerSource": intent.get("_route_layer_source"),
+                        **_placement_corridor_fields(intent),
                         "backend": result.get("backend", "mst"),
                         "multiPin": True,
                         "edgesRouted": result.get("edgesRouted", 0),
@@ -4280,6 +4628,7 @@ class AutorouteCFHACommands:
                     "widthMm": width_mm,
                     "layer": route_layer,
                     "layerSource": intent.get("_route_layer_source"),
+                    **_placement_corridor_fields(intent),
                     "backend": "ipc" if same_layer_ipc else "swig",
                 })
             else:
@@ -4330,9 +4679,15 @@ class AutorouteCFHACommands:
                             "widthMm": width_mm,
                             "layer": route_layer,
                             "layerSource": intent.get("_route_layer_source"),
+                            **_placement_corridor_fields(intent),
                             "backend": "diff_pair",
                             "pairWith": intent["diff_partner"],
                             "estimatedViaCountPerNet": intent.get("_estimated_via_count_per_net"),
+                            "estimatedStitchViaCountTotal": intent.get("_estimated_stitch_via_count_total"),
+                            "estimatedTransitionCellViaCountTotal": intent.get(
+                                "_estimated_transition_cell_via_count_total"
+                            ),
+                            "transitionCellViaBudget": intent.get("_transition_cell_via_budget"),
                             "transitionPolicy": intent.get("_transition_policy"),
                             "reroutePass": pass_num + 1,
                         })
@@ -4342,9 +4697,15 @@ class AutorouteCFHACommands:
                             "widthMm": width_mm,
                             "layer": route_layer,
                             "layerSource": intent.get("_route_layer_source"),
+                            **_placement_corridor_fields(intent),
                             "backend": "diff_pair",
                             "pairWith": intent["net_name"],
                             "estimatedViaCountPerNet": intent.get("_estimated_via_count_per_net"),
+                            "estimatedStitchViaCountTotal": intent.get("_estimated_stitch_via_count_total"),
+                            "estimatedTransitionCellViaCountTotal": intent.get(
+                                "_estimated_transition_cell_via_count_total"
+                            ),
+                            "transitionCellViaBudget": intent.get("_transition_cell_via_budget"),
                             "transitionPolicy": intent.get("_transition_policy"),
                             "reroutePass": pass_num + 1,
                         })
@@ -4376,6 +4737,7 @@ class AutorouteCFHACommands:
                         "widthMm": width_mm,
                         "layer": route_layer,
                         "layerSource": intent.get("_route_layer_source"),
+                        **_placement_corridor_fields(intent),
                         "reroutePass": pass_num + 1,
                     })
                 else:
@@ -4676,6 +5038,8 @@ class AutorouteCFHACommands:
         via_count = 0
         power_misuse_flags: List[Dict[str, Any]] = []
         return_path_risk_flags: List[Dict[str, Any]] = []
+        transition_cell_risk_flags: List[Dict[str, Any]] = []
+        placement_corridor_risk_flags: List[Dict[str, Any]] = []
         copper_layers = self._board_layers(board)
         prefer_power_zones = len(copper_layers) >= 4
 
@@ -4716,6 +5080,72 @@ class AutorouteCFHACommands:
 
         constraints_result = params.get("constraintsResult", {})
         constraints_data = constraints_result.get("constraints", {})
+        route_critical_result = params.get("routeCriticalResult") or params.get("criticalRouteResult") or {}
+        seen_transition_cell_keys: set[Tuple[str, str]] = set()
+        for collection_name in ("ordering", "routed", "rerouted"):
+            for item in route_critical_result.get(collection_name, []) or []:
+                net_name = str(item.get("net") or "")
+                pair_name = str(item.get("pairWith") or net_name)
+                if not net_name:
+                    continue
+                key = tuple(sorted((net_name, pair_name)))
+                if key in seen_transition_cell_keys:
+                    continue
+                budget = item.get("transitionCellViaBudget")
+                estimated = item.get("estimatedTransitionCellViaCountTotal")
+                policy = str(item.get("transitionPolicy") or "")
+                try:
+                    budget_value = float(budget) if budget is not None else None
+                    estimated_value = float(estimated) if estimated is not None else 0.0
+                except (TypeError, ValueError):
+                    budget_value = None
+                    estimated_value = 0.0
+                over_budget = bool(budget_value is not None and estimated_value > budget_value)
+                policy_over_budget = policy in {"transition_cell_over_budget", "transitions_over_budget"}
+                if not over_budget and not policy_over_budget:
+                    continue
+                seen_transition_cell_keys.add(key)
+                transition_cell_risk_flags.append(
+                    {
+                        "net": net_name,
+                        "pairWith": pair_name if pair_name != net_name else None,
+                        "reason": policy or "transition_cell_via_budget_exceeded",
+                        "estimatedTransitionCellViaCountTotal": int(estimated_value),
+                        "transitionCellViaBudget": int(budget_value) if budget_value is not None else None,
+                        "estimatedStitchViaCountTotal": item.get("estimatedStitchViaCountTotal"),
+                        "source": collection_name,
+                    }
+                )
+        seen_corridor_risk_keys: set[Tuple[str, str]] = set()
+        for collection_name in ("ordering", "routed", "rerouted"):
+            for item in route_critical_result.get(collection_name, []) or []:
+                corridor_id = str(item.get("placementCorridorId") or "")
+                net_name = str(item.get("net") or "")
+                if not corridor_id or not net_name:
+                    continue
+                try:
+                    pressure_value = float(item.get("placementCorridorEdgePressureMm", 0.0) or 0.0)
+                    budget_value = float(item.get("placementCorridorCongestionBudgetMm", 0.0) or 0.0)
+                except (TypeError, ValueError):
+                    continue
+                if budget_value <= 0 or pressure_value <= budget_value:
+                    continue
+                key = (corridor_id, net_name)
+                if key in seen_corridor_risk_keys:
+                    continue
+                seen_corridor_risk_keys.add(key)
+                placement_corridor_risk_flags.append(
+                    {
+                        "net": net_name,
+                        "corridorId": corridor_id,
+                        "anchor": item.get("placementCorridorAnchor"),
+                        "edge": item.get("placementCorridorEdge"),
+                        "reason": "placement_corridor_congestion_budget_exceeded",
+                        "edgePressureMm": round(pressure_value, 4),
+                        "congestionBudgetMm": round(budget_value, 4),
+                        "source": collection_name,
+                    }
+                )
         matched_groups = list(
             constraints_data.get("matchedLengthGroups")
             or params.get("matchedLengthGroups")
@@ -4801,11 +5231,32 @@ class AutorouteCFHACommands:
             "maxMatchedGroupSkewRatio": round(max(matched_group_skew_ratios, default=0.0), 4),
             "matchedGroupCount": len(matched_group_skews),
             "maxUncoupledMm": round(max(uncoupled_estimates, default=0.0), 4),
+            "transitionCellRiskCount": len(transition_cell_risk_flags),
+            "placementCorridorRiskCount": len(placement_corridor_risk_flags),
+            "maxTransitionCellViaCountTotal": max(
+                (
+                    int(flag.get("estimatedTransitionCellViaCountTotal") or 0)
+                    for flag in transition_cell_risk_flags
+                ),
+                default=0,
+            ),
+            "maxPlacementCorridorPressureMm": round(
+                max(
+                    (
+                        float(flag.get("edgePressureMm") or 0.0)
+                        for flag in placement_corridor_risk_flags
+                    ),
+                    default=0.0,
+                ),
+                4,
+            ),
         }
         flags = {
             "powerNetMisuse": power_misuse_flags,
             "returnPathRisk": return_path_risk_flags,
             "matchedLengthRisk": matched_length_risk_flags,
+            "transitionCellRisk": transition_cell_risk_flags,
+            "placementCorridorRisk": placement_corridor_risk_flags,
         }
 
         # Compute weighted QoR score (uses qorWeights from constraints)
@@ -5019,7 +5470,12 @@ class AutorouteCFHACommands:
         verify = timed(
             "verify",
             self.verify_routing_qor,
-            {**effective_params, "intentResult": intents, "constraintsResult": constraints},
+            {
+                **effective_params,
+                "intentResult": intents,
+                "constraintsResult": constraints,
+                "routeCriticalResult": critical,
+            },
         )
         if not verify.get("success", False) and verify.get("drc", {}).get("errors", 0) > 0:
             success = False

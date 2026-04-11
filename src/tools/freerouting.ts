@@ -18,6 +18,10 @@ export function registerFreeroutingTools(server: McpServer, callKicadScript: Fun
       .array(z.string())
       .optional()
       .describe("Critical intent classes routed before bulk routing"),
+    placementRoutingCorridors: z
+      .array(z.record(z.any()))
+      .optional()
+      .describe("Numeric breakout corridor reservations returned by sync_schematic_to_board as auto_place_routing_corridors"),
     powerCurrentA: z
       .number()
       .optional()
@@ -81,6 +85,7 @@ export function registerFreeroutingTools(server: McpServer, callKicadScript: Fun
         skew: z.number().optional(),
         uncoupled: z.number().optional(),
         returnPathRisk: z.number().optional(),
+        placementCorridorRisk: z.number().optional(),
       })
       .optional()
       .describe("QoR weighting for reporting and future optimization loops"),
@@ -219,6 +224,10 @@ export function registerFreeroutingTools(server: McpServer, callKicadScript: Fun
       profiles: z.array(z.string()).optional(),
       interfaces: z.array(z.string()).optional(),
       criticalClasses: z.array(z.string()).optional(),
+      placementRoutingCorridors: z
+        .array(z.record(z.any()))
+        .optional()
+        .describe("Numeric breakout corridor reservations returned by sync_schematic_to_board as auto_place_routing_corridors"),
       powerCurrentA: z.number().optional().describe("Optional DC current in amps for IPC-2221 power-width synthesis"),
       copperOz: z.number().optional().describe("Copper weight in oz for IPC-2221 power-width synthesis"),
       tempRiseC: z.number().optional().describe("Allowed temperature rise in Celsius for IPC-2221 power-width synthesis"),

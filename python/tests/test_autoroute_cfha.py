@@ -287,6 +287,7 @@ def test_generate_constraints_adds_rf_rules_and_policy(tmp_path):
         "escape_complexity",
         "breakout_pressure",
         "reference_alignment",
+        "placement_corridor_priority",
         "local_congestion",
     ]
     assert "cfha_rf_clearance" in result["constraints"]["policy"]["compiledRuleFamilies"]
@@ -659,6 +660,71 @@ def test_generate_constraints_prefers_edge_low_pressure_signal_layer_for_referen
     assert planning["preferredSignalLayer"] == "B.Cu"
     assert planning["signalLayerCandidates"][0]["layer"] == "B.Cu"
     assert planning["signalLayerCandidates"][0]["weightedEdgePressure"] < planning["signalLayerCandidates"][1]["weightedEdgePressure"]
+
+
+def test_generate_constraints_carries_placement_routing_corridors(tmp_path):
+    commands = AutorouteCFHACommands()
+    result = commands.generate_routing_constraints(
+        {
+            "placementRoutingCorridors": [
+                {
+                    "id": "usb-left-corridor",
+                    "anchor": "J1",
+                    "members": ["J1", "U1"],
+                    "edge": "left",
+                    "direction": "east",
+                    "signalProfile": "high_speed",
+                    "referenceProfile": "ground_continuity",
+                    "priority": 112.5,
+                    "congestionBudgetMm": 6.0,
+                    "rect": {"left": 0, "top": 10, "right": 14, "bottom": 20, "unit": "mm"},
+                }
+            ],
+            "intentResult": {
+                "success": True,
+                "boardPath": str(tmp_path / "placement_corridor_demo.kicad_pcb"),
+                "profiles": ["generic_4layer", "high_speed_digital"],
+                "interfaces": ["USB2"],
+                "analysisSummary": {"copperLayers": ["F.Cu", "In1.Cu", "B.Cu"]},
+                "byIntent": {
+                    "HS_SINGLE": ["USB_CLK"],
+                    "GROUND": ["GND"],
+                },
+                "intents": [
+                    {
+                        "net_name": "USB_CLK",
+                        "intent": "HS_SINGLE",
+                        "track_length_mm": 0.0,
+                        "component_refs": ["J1", "U1"],
+                    },
+                    {"net_name": "GND", "intent": "GROUND", "track_length_mm": 0.0},
+                ],
+                "netInventory": {
+                    "USB_CLK": {
+                        "pad_refs": ["J1", "U1"],
+                        "pads": [
+                            {"ref": "J1", "x": 1.0, "y": 4.0},
+                            {"ref": "U1", "x": 12.0, "y": 4.0},
+                        ],
+                        "zones": [],
+                    },
+                    "GND": {
+                        "pad_refs": ["J1", "U1"],
+                        "pads": [{"ref": "J1", "x": 0.0, "y": 1.0}],
+                        "zones": [],
+                    },
+                },
+            },
+        }
+    )
+
+    assert result["success"] is True
+    corridors = result["constraints"]["placementRoutingCorridors"]
+    assert corridors[0]["id"] == "usb-left-corridor"
+    assert corridors[0]["members"] == ["J1", "U1"]
+    assert result["constraints"]["policy"]["placementCoupling"]["hasRoutingCorridorReservations"] is True
+    assert result["constraints"]["policy"]["placementCoupling"]["routingCorridorReservationCount"] == 1
+    assert "placement_corridor_priority" in result["constraints"]["policy"]["criticalOrdering"]
 
 
 def test_generate_constraints_skips_coupled_diff_rules_for_ineligible_endpoint_pitch(tmp_path):
@@ -1176,6 +1242,253 @@ def test_route_critical_nets_prioritizes_reference_alignment_after_breakout(monk
     assert result["ordering"][0]["referenceAlignment"] > result["ordering"][1]["referenceAlignment"]
 
 
+def test_route_critical_nets_prioritizes_placement_corridor_reservations(monkeypatch, tmp_path):
+    def _footprint(ref: str, pad_count: int):
+        footprint = MagicMock()
+        footprint.GetReference.return_value = ref
+        footprint.Pads.return_value = [object()] * pad_count
+        return footprint
+
+    board = MagicMock()
+    board.GetFileName.return_value = str(tmp_path / "placement_corridor_route.kicad_pcb")
+    board.GetFootprints.return_value = [
+        _footprint("J1", 16),
+        _footprint("J2", 16),
+        _footprint("U1", 8),
+        _footprint("U2", 8),
+    ]
+
+    routed_order = []
+    routing_commands = MagicMock()
+
+    def _route(params):
+        routed_order.append(params["net"])
+        return {"success": True}
+
+    routing_commands.route_pad_to_pad.side_effect = _route
+    commands = AutorouteCFHACommands(board=board, routing_commands=routing_commands)
+
+    monkeypatch.setattr(
+        commands,
+        "_ensure_board",
+        lambda params: (board, Path(board.GetFileName()), None),
+    )
+    monkeypatch.setattr(
+        commands,
+        "_collect_inventory",
+        lambda _board: {
+            "FAST_NET": {
+                "pad_refs": ["J1", "U1"],
+                "pads": [
+                    {"ref": "J1", "pad": "1", "x": 1.0, "y": 10.0},
+                    {"ref": "U1", "pad": "1", "x": 12.0, "y": 10.0},
+                ],
+            },
+            "SLOW_NET": {
+                "pad_refs": ["J2", "U2"],
+                "pads": [
+                    {"ref": "J2", "pad": "1", "x": 50.0, "y": 20.0},
+                    {"ref": "U2", "pad": "1", "x": 40.0, "y": 20.0},
+                ],
+            },
+        },
+    )
+    monkeypatch.setattr(commands, "_estimate_net_congestion", lambda pads, _board: 0.0)
+    monkeypatch.setattr(commands, "_estimate_escape_complexity", lambda net, pads, fps: 5.0)
+    monkeypatch.setattr(commands, "_estimate_breakout_pressure", lambda net, pads, board, fps: 2.0)
+    monkeypatch.setattr(
+        commands,
+        "_estimate_reference_alignment_pressure",
+        lambda net, pads, board, planning: 1.0,
+    )
+
+    result = commands.route_critical_nets(
+        {
+            "constraintsResult": {
+                "success": True,
+                "constraints": {
+                    "criticalClasses": ["HS_SINGLE"],
+                    "referencePlanning": {"preferredSignalLayer": "F.Cu"},
+                    "boardSummary": {
+                        "edgePressureByLayer": {
+                            "F.Cu": {"left": 4.5, "right": 0.5, "center": 0.0}
+                        }
+                    },
+                    "placementRoutingCorridors": [
+                        {
+                            "id": "fast-left",
+                            "anchor": "J1",
+                            "members": ["J1", "U1"],
+                            "edge": "left",
+                            "priority": 120.0,
+                            "congestionBudgetMm": 5.0,
+                        }
+                    ],
+                    "defaults": {"power_min_width_mm": 0.8},
+                    "derived": {},
+                    "intents": [
+                        {
+                            "net_name": "SLOW_NET",
+                            "intent": "HS_SINGLE",
+                            "track_length_mm": 0.0,
+                            "priority": 85,
+                            "component_refs": ["J2", "U2"],
+                        },
+                        {
+                            "net_name": "FAST_NET",
+                            "intent": "HS_SINGLE",
+                            "track_length_mm": 0.0,
+                            "priority": 85,
+                            "component_refs": ["J1", "U1"],
+                        },
+                    ],
+                },
+            }
+        }
+    )
+
+    assert result["success"] is True
+    assert routed_order == ["FAST_NET", "SLOW_NET"]
+    assert result["ordering"][0]["placementCorridorId"] == "fast-left"
+    assert result["ordering"][0]["placementCorridorEdgePressureMm"] == 4.5
+    assert result["routed"][0]["placementCorridorCongestionBudgetMm"] == 5.0
+
+
+def test_route_critical_nets_uses_placement_corridor_pressure_for_layer_selection(
+    monkeypatch,
+    tmp_path,
+):
+    class _Footprint:
+        def __init__(self, ref: str, pad_count: int):
+            self._ref = ref
+            self._pads = [object()] * pad_count
+
+        def GetReference(self):
+            return self._ref
+
+        def Pads(self):
+            return self._pads
+
+        def GetLayer(self):
+            raise RuntimeError("footprint layer unavailable in this unit test")
+
+    bbox = MagicMock()
+    bbox.GetLeft.return_value = 0
+    bbox.GetTop.return_value = 0
+    bbox.GetRight.return_value = int(80 * 1_000_000)
+    bbox.GetBottom.return_value = int(40 * 1_000_000)
+
+    board = MagicMock()
+    board.GetFileName.return_value = str(tmp_path / "corridor_layer_selection.kicad_pcb")
+    board.GetBoardEdgesBoundingBox.return_value = bbox
+    board.GetFootprints.return_value = [
+        _Footprint("J1", 16),
+        _Footprint("U1", 8),
+    ]
+
+    routed_layers = {}
+    routing_commands = MagicMock()
+
+    def _route(params):
+        routed_layers[params["net"]] = params["layer"]
+        return {"success": True}
+
+    routing_commands.route_pad_to_pad.side_effect = _route
+    commands = AutorouteCFHACommands(board=board, routing_commands=routing_commands)
+
+    monkeypatch.setattr(
+        commands,
+        "_ensure_board",
+        lambda params: (board, Path(board.GetFileName()), None),
+    )
+    monkeypatch.setattr(
+        commands,
+        "_collect_inventory",
+        lambda _board: {
+            "USB_CLK": {
+                "pad_refs": ["J1", "U1"],
+                "pads": [
+                    {"ref": "J1", "pad": "1", "x": 36.0, "y": 10.0},
+                    {"ref": "U1", "pad": "1", "x": 44.0, "y": 10.0},
+                ],
+            }
+        },
+    )
+    monkeypatch.setattr(commands, "_estimate_net_congestion", lambda pads, _board: 0.0)
+    monkeypatch.setattr(commands, "_estimate_escape_complexity", lambda net, pads, fps: 0.0)
+    monkeypatch.setattr(commands, "_estimate_breakout_pressure", lambda net, pads, board, fps: 0.0)
+    monkeypatch.setattr(
+        commands,
+        "_estimate_reference_alignment_pressure",
+        lambda net, pads, board, planning: 0.0,
+    )
+
+    result = commands.route_critical_nets(
+        {
+            "constraintsResult": {
+                "success": True,
+                "constraints": {
+                    "criticalClasses": ["HS_SINGLE"],
+                    "boardSummary": {
+                        "trackPressureByLayer": {"F.Cu": 6.0, "B.Cu": 16.0},
+                        "edgePressureByLayer": {
+                            "F.Cu": {"left": 18.0, "right": 1.0, "center": 1.0},
+                            "B.Cu": {"left": 2.0, "right": 4.0, "center": 9.0},
+                        },
+                    },
+                    "referencePlanning": {
+                        "preferredSignalLayer": "F.Cu",
+                        "signalLayerCandidates": [
+                            {
+                                "layer": "F.Cu",
+                                "splitRisk": False,
+                                "adjacencyRank": 0,
+                                "totalPressure": 6.0,
+                                "edgePressure": 1.0,
+                            },
+                            {
+                                "layer": "B.Cu",
+                                "splitRisk": False,
+                                "adjacencyRank": 0,
+                                "totalPressure": 16.0,
+                                "edgePressure": 9.0,
+                            },
+                        ],
+                    },
+                    "placementRoutingCorridors": [
+                        {
+                            "id": "usb-left",
+                            "anchor": "J1",
+                            "members": ["J1", "U1"],
+                            "edge": "left",
+                            "priority": 120.0,
+                            "congestionBudgetMm": 6.0,
+                        }
+                    ],
+                    "defaults": {"power_min_width_mm": 0.8},
+                    "derived": {},
+                    "intents": [
+                        {
+                            "net_name": "USB_CLK",
+                            "intent": "HS_SINGLE",
+                            "track_length_mm": 0.0,
+                            "priority": 85,
+                            "component_refs": ["J1", "U1"],
+                        }
+                    ],
+                },
+            }
+        }
+    )
+
+    assert result["success"] is True
+    assert routed_layers["USB_CLK"] == "B.Cu"
+    assert result["ordering"][0]["selectedLayer"] == "B.Cu"
+    assert result["ordering"][0]["placementCorridorId"] == "usb-left"
+    assert result["ordering"][0]["placementCorridorEdgePressureMm"] == 2.0
+    assert result["ordering"][0]["placementCorridorPolicy"] == "within_budget"
+
+
 def test_route_critical_nets_selects_per_net_layer_from_signal_candidates(monkeypatch, tmp_path):
     def _footprint(ref: str, pad_count: int):
         footprint = MagicMock()
@@ -1673,6 +1986,126 @@ def test_route_critical_nets_uses_budget_safe_diff_pair_transitions(monkeypatch,
     assert result["ordering"][0]["selectedLayer"] == "B.Cu"
     assert result["ordering"][0]["transitionPolicy"] == "paired_transitions_required"
     assert result["ordering"][0]["estimatedViaCountPerNet"] == 2.0
+
+
+def test_route_critical_nets_respects_diff_pair_transition_cell_budget(monkeypatch, tmp_path):
+    def _footprint(ref: str, layer_id: int = 0):
+        footprint = MagicMock()
+        footprint.GetReference.return_value = ref
+        footprint.GetLayer.return_value = layer_id
+        return footprint
+
+    bbox = MagicMock()
+    bbox.GetLeft.return_value = 0
+    bbox.GetTop.return_value = 0
+    bbox.GetRight.return_value = int(80 * 1_000_000)
+    bbox.GetBottom.return_value = int(40 * 1_000_000)
+
+    board = MagicMock()
+    board.GetFileName.return_value = str(tmp_path / "diff_pair_transition_cell_budget_demo.kicad_pcb")
+    board.GetBoardEdgesBoundingBox.return_value = bbox
+    board.GetFootprints.return_value = [_footprint("J1", 0), _footprint("U1", 31)]
+    board.GetLayerName.side_effect = lambda layer_id: {0: "F.Cu", 1: "In1.Cu", 31: "B.Cu"}.get(layer_id, "F.Cu")
+
+    commands = AutorouteCFHACommands(board=board, routing_commands=MagicMock())
+    diff_pair_calls = []
+
+    def _route_diff_pair(net_pos, net_neg, *, inventory, constraints, width_mm, layer, board, footprints):
+        diff_pair_calls.append({"netPos": net_pos, "netNeg": net_neg, "layer": layer})
+        return {"success": True}
+
+    inventory = {
+        "USB_D_P": {
+            "pads": [
+                {"ref": "J1", "pad": "1", "x": 2.0, "y": 10.0},
+                {"ref": "U1", "pad": "1", "x": 18.0, "y": 10.0},
+            ]
+        },
+        "USB_D_N": {
+            "pads": [
+                {"ref": "J1", "pad": "2", "x": 2.0, "y": 10.4},
+                {"ref": "U1", "pad": "2", "x": 18.0, "y": 10.4},
+            ]
+        },
+    }
+    monkeypatch.setattr(commands, "_ensure_board", lambda params: (board, Path(board.GetFileName()), None))
+    monkeypatch.setattr(commands, "_collect_inventory", lambda _board: inventory)
+    monkeypatch.setattr(commands, "_estimate_net_congestion", lambda pads, _board: 0.0)
+    monkeypatch.setattr(commands, "_estimate_escape_complexity", lambda net, pads, fps: 0.0)
+    monkeypatch.setattr(commands, "_estimate_breakout_pressure", lambda net, pads, board, fps: 0.0)
+    monkeypatch.setattr(commands, "_estimate_reference_alignment_pressure", lambda net, pads, board, planning: 0.0)
+    monkeypatch.setattr(commands, "_route_diff_pair", _route_diff_pair)
+
+    result = commands.route_critical_nets(
+        {
+            "constraintsResult": {
+                "success": True,
+                "constraints": {
+                    "criticalClasses": ["HS_DIFF"],
+                    "boardSummary": {
+                        "trackPressureByLayer": {"In1.Cu": 1.0, "B.Cu": 8.0},
+                        "edgePressureByLayer": {
+                            "In1.Cu": {"left": 1.0, "right": 1.0, "center": 1.0},
+                            "B.Cu": {"left": 8.0, "right": 8.0, "center": 8.0},
+                        },
+                    },
+                    "referencePlanning": {
+                        "groundNet": "GND",
+                        "preferredSignalLayer": "In1.Cu",
+                        "preferredEntryEdge": "left",
+                        "referenceContinuityScore": 1.0,
+                        "signalLayerCandidates": [
+                            {
+                                "layer": "In1.Cu",
+                                "splitRisk": False,
+                                "adjacencyRank": 0,
+                                "totalPressure": 1.0,
+                            },
+                            {
+                                "layer": "B.Cu",
+                                "splitRisk": False,
+                                "adjacencyRank": 1,
+                                "totalPressure": 8.0,
+                            },
+                        ],
+                    },
+                    "defaults": {
+                        "power_min_width_mm": 0.8,
+                        "hs_via_limit": 2,
+                        "hs_transition_cell_via_limit": 4,
+                    },
+                    "derived": {},
+                    "intents": [
+                        {
+                            "net_name": "USB_D_P",
+                            "intent": "HS_DIFF",
+                            "track_length_mm": 0.0,
+                            "priority": 90,
+                            "diff_partner": "USB_D_N",
+                        },
+                        {
+                            "net_name": "USB_D_N",
+                            "intent": "HS_DIFF",
+                            "track_length_mm": 0.0,
+                            "priority": 90,
+                            "diff_partner": "USB_D_P",
+                        },
+                    ],
+                },
+            }
+        }
+    )
+
+    ordering = result["ordering"][0]
+    assert result["success"] is True
+    assert diff_pair_calls[0]["layer"] == "B.Cu"
+    assert ordering["selectedLayer"] == "B.Cu"
+    assert ordering["estimatedViaCountPerNet"] == 1.0
+    assert ordering["estimatedStitchViaCountTotal"] == 2
+    assert ordering["estimatedTransitionCellViaCountTotal"] == 4
+    assert ordering["transitionCellViaBudget"] == 4
+    assert ordering["transitionPolicy"] == "paired_transitions_required"
+    assert result["routed"][0]["estimatedTransitionCellViaCountTotal"] == 4
 
 
 def test_route_diff_pair_passes_transition_geometry_to_backend():
@@ -2283,6 +2716,157 @@ def test_verify_routing_qor_preserves_explicit_zero_skew(monkeypatch, tmp_path):
     assert result["success"] is True
     assert result["metrics"]["maxMatchedGroupSkewRatio"] == 35.0
     assert result["flags"]["matchedLengthRisk"][0]["maxSkewMm"] == 0.0
+
+
+def test_verify_routing_qor_flags_transition_cell_budget_risk(monkeypatch, tmp_path):
+    board = MagicMock()
+    board.GetFileName.return_value = str(tmp_path / "transition_cell_qor.kicad_pcb")
+    board.GetTracks.return_value = []
+    board.GetFootprints.return_value = []
+    board.Zones.return_value = []
+    board.IsLayerEnabled.return_value = False
+
+    commands = AutorouteCFHACommands(board=board, design_rule_commands=MagicMock())
+    monkeypatch.setattr(
+        commands,
+        "_ensure_board",
+        lambda params: (board, Path(board.GetFileName()), None),
+    )
+    monkeypatch.setattr(commands, "_board_layers", lambda _board: ["F.Cu", "B.Cu", "In1.Cu", "In2.Cu"])
+    monkeypatch.setattr(
+        commands,
+        "_collect_inventory",
+        lambda _board: {
+            "USB_D_P": {"pads": [{}, {}], "track_length_mm": 20.0, "via_count": 2, "zones": []},
+            "USB_D_N": {"pads": [{}, {}], "track_length_mm": 20.1, "via_count": 2, "zones": []},
+        },
+    )
+    monkeypatch.setattr(commands, "_collect_zones", lambda _board: [{"net": "GND"}])
+    monkeypatch.setattr(
+        commands,
+        "extract_routing_intents",
+        lambda params: {
+            "success": True,
+            "intents": [
+                {"net_name": "USB_D_P", "intent": "HS_DIFF", "diff_partner": "USB_D_N"},
+                {"net_name": "USB_D_N", "intent": "HS_DIFF", "diff_partner": "USB_D_P"},
+            ],
+        },
+    )
+    commands.design_rule_commands.run_drc.return_value = {
+        "success": True,
+        "summary": {"by_severity": {"error": 0, "warning": 0}},
+        "violationsFile": str(tmp_path / "violations.json"),
+        "reportPath": str(tmp_path / "transition_cell_qor.drc.rpt"),
+    }
+
+    result = commands.verify_routing_qor(
+        {
+            "constraintsResult": {
+                "constraints": {
+                    "defaults": {"hs_diff_skew_mm": 0.25, "hs_diff_uncoupled_mm": 3.0},
+                    "matchedLengthGroups": [],
+                }
+            },
+            "routeCriticalResult": {
+                "ordering": [
+                    {
+                        "net": "USB_D_P",
+                        "pairWith": "USB_D_N",
+                        "transitionPolicy": "transition_cell_over_budget",
+                        "estimatedTransitionCellViaCountTotal": 8,
+                        "transitionCellViaBudget": 4,
+                        "estimatedStitchViaCountTotal": 4,
+                    },
+                    {
+                        "net": "USB_D_N",
+                        "pairWith": "USB_D_P",
+                        "transitionPolicy": "transition_cell_over_budget",
+                        "estimatedTransitionCellViaCountTotal": 8,
+                        "transitionCellViaBudget": 4,
+                        "estimatedStitchViaCountTotal": 4,
+                    },
+                ]
+            },
+        }
+    )
+
+    assert result["success"] is True
+    assert result["metrics"]["transitionCellRiskCount"] == 1
+    assert result["metrics"]["maxTransitionCellViaCountTotal"] == 8
+    assert result["flags"]["transitionCellRisk"][0]["net"] == "USB_D_P"
+    assert result["flags"]["transitionCellRisk"][0]["pairWith"] == "USB_D_N"
+    assert result["qorDetail"]["subScores"]["returnPathRisk"] == 0.5
+
+
+def test_verify_routing_qor_flags_placement_corridor_congestion_risk(monkeypatch, tmp_path):
+    board = MagicMock()
+    board.GetFileName.return_value = str(tmp_path / "placement_corridor_qor.kicad_pcb")
+    board.GetTracks.return_value = []
+    board.GetFootprints.return_value = []
+    board.Zones.return_value = [{"net": "GND"}]
+    board.IsLayerEnabled.return_value = False
+
+    commands = AutorouteCFHACommands(board=board, design_rule_commands=MagicMock())
+    monkeypatch.setattr(
+        commands,
+        "_ensure_board",
+        lambda params: (board, Path(board.GetFileName()), None),
+    )
+    monkeypatch.setattr(commands, "_board_layers", lambda _board: ["F.Cu", "B.Cu"])
+    monkeypatch.setattr(
+        commands,
+        "_collect_inventory",
+        lambda _board: {
+            "USB_CLK": {"pads": [{}, {}], "track_length_mm": 12.0, "via_count": 0, "zones": []},
+        },
+    )
+    monkeypatch.setattr(commands, "_collect_zones", lambda _board: [{"net": "GND"}])
+    monkeypatch.setattr(
+        commands,
+        "extract_routing_intents",
+        lambda params: {
+            "success": True,
+            "intents": [
+                {"net_name": "USB_CLK", "intent": "HS_SINGLE"},
+            ],
+        },
+    )
+    commands.design_rule_commands.run_drc.return_value = {
+        "success": True,
+        "summary": {"by_severity": {"error": 0, "warning": 0}},
+        "violationsFile": str(tmp_path / "violations.json"),
+        "reportPath": str(tmp_path / "placement_corridor_qor.drc.rpt"),
+    }
+
+    result = commands.verify_routing_qor(
+        {
+            "constraintsResult": {
+                "constraints": {
+                    "defaults": {"hs_diff_skew_mm": 0.25, "hs_diff_uncoupled_mm": 3.0},
+                    "matchedLengthGroups": [],
+                }
+            },
+            "routeCriticalResult": {
+                "ordering": [
+                    {
+                        "net": "USB_CLK",
+                        "placementCorridorId": "usb-left",
+                        "placementCorridorAnchor": "J1",
+                        "placementCorridorEdge": "left",
+                        "placementCorridorEdgePressureMm": 9.0,
+                        "placementCorridorCongestionBudgetMm": 6.0,
+                    }
+                ]
+            },
+        }
+    )
+
+    assert result["success"] is True
+    assert result["metrics"]["placementCorridorRiskCount"] == 1
+    assert result["metrics"]["maxPlacementCorridorPressureMm"] == 9.0
+    assert result["flags"]["placementCorridorRisk"][0]["corridorId"] == "usb-left"
+    assert result["qorDetail"]["subScores"]["placementCorridorRisk"] == 0.5
 
 
 def test_autoroute_cfha_analysis_only_skips_mutating_stages(tmp_path):

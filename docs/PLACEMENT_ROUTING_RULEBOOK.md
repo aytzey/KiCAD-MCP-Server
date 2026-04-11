@@ -160,11 +160,40 @@ This document captures the deterministic engineering rules now used by the KiCAD
    - Reference stitching is fail-soft: blocked or failed stitch vias are reported in transition telemetry, but they do not invalidate the already-safe synchronized signal transition.
    - The diff-pair report now separates signal `viaCount` from `stitchViaCount` and exposes `returnPathStitching`, making via budgets and return-path quality auditable independently.
 
+24. Budget the whole diff-pair transition cell, not just signal vias.
+   - The layer selector now estimates `estimatedStitchViaCountTotal` and `estimatedTransitionCellViaCountTotal` for each candidate signal layer when a reference net is available.
+   - `hs_via_limit` still governs signal via count per net, while `hs_transition_cell_via_limit` governs the total transition cell cost: signal vias plus return-path stitch vias.
+   - If a lower-pressure layer would require an oversized transition cell, the locked diff-pair selector can choose a slightly busier but budget-safe layer and report `transitionCellViaBudget` in ordering/routed telemetry.
+   - This keeps placement/routing automation honest about the copper and via-array cost of a high-speed layer change instead of treating stitching vias as free afterthoughts.
+
+25. Verify transition-cell budget risk after routing.
+   - `verify_routing_qor` now consumes `routeCriticalResult` telemetry and flags `transitionCellRisk` when a routed or selected diff-pair transition cell exceeds its budget.
+   - Duplicate positive/negative entries are collapsed to one pair-level risk so the QoR report describes the physical issue instead of double-counting both nets.
+   - Transition-cell risk contributes to the return-path QoR sub-score because oversized via/stitch clusters are a signal-integrity risk even when basic DRC reports zero errors.
+   - The full `autoroute_cfha` pipeline now passes the critical routing stage into verification, closing the loop from placement/reference planning to routing to final quality scoring.
+
+26. Turn placement breakout intent into routable corridor reservations.
+   - `sync_schematic_to_board` now emits `auto_place_routing_corridors` for high-speed/RF/reference-sensitive connector clusters instead of only tagging clusters with `reserve_breakout_corridor`.
+   - Each corridor carries an anchor, member refs, edge, direction, rectangular reservation, priority, and `congestionBudgetMm`, giving downstream tools a measurable placement-to-routing contract.
+   - `generate_routing_constraints` normalizes those corridors into `placementRoutingCorridors`, and `route_critical_nets` routes matching nets earlier through `placement_corridor_priority`.
+   - `verify_routing_qor` flags `placementCorridorRisk` when critical routing telemetry shows the selected corridor edge pressure exceeds the reserved corridor budget.
+
+27. Feed placement corridor pressure into layer assignment.
+   - A reserved breakout corridor must influence which copper layer a critical net uses, not just the order in which that net is attempted.
+   - `_select_critical_route_layer` now scores each candidate layer against the corridor edge bucket and `congestionBudgetMm`, then reports `placementCorridorPolicy` and selected-layer corridor pressure in ordering/routed telemetry.
+   - The layer selector still prioritizes split-risk, reference adjacency, and transition-cell budgets before corridor pressure, so corridor avoidance cannot silently violate stronger signal-integrity constraints.
+   - This follows routability-driven placement/global-routing practice: placement-derived congestion estimates should feed layer selection before detailed routing commits copper.
+
 ## Research Mapping
 
 - Placement and routing should be coupled through routability and congestion, not optimized independently.
   - Ruoyu Cheng and Junchi Yan, "On Joint Learning for Solving Placement and Routing in Chip Design", arXiv:2111.00234
   - Junchi Yan et al., "Towards Machine Learning for Placement and Routing in Chip Design: a Methodological Overview", arXiv:2202.13564
+  - Yifan Chen et al., "RUPlace: Optimizing Routability via Unified Placement and Routing Formulation", DOI: 10.1109/DAC63849.2025.11132838
+  - Seong-I Lei and Wai-Kei Mak, "Simultaneous Constrained Pin Assignment and Escape Routing for FPGA-PCB Codesign", DOI: 10.1109/FPL.2011.86
+  - Yeun Tsun Wong et al., "Placement for Routability", DOI: 10.1201/9781003067030-4
+  - Ruicheng Pan, Ruibin Zhou, and Anton Ivanov, "Routability-driven Global Routing with 3D Congestion Estimation Using a Customized Neural Network", DOI: 10.1109/ISQED54688.2022.9806228
+  - Xifan Tang et al., "A Survey on Steiner Tree Construction and Global Routing for VLSI Design", DOI: 10.1109/ACCESS.2020.2986138
 
 - Connector breakout pressure and congestion should influence routing order.
   - Classic congestion-driven ordering and negotiated-congestion ideas remain useful for deterministic routers.
@@ -182,6 +211,10 @@ This document captures the deterministic engineering rules now used by the KiCAD
   - Yan Deng et al., "S Parameters Optimization of High-Speed Differential Vias Model on A Multilayer PCB", DOI: 10.1109/ICEPT56209.2022.9873518
   - Meng Lee Chew et al., "PCB Channel Optimization Techniques for High-Speed Differential Interconnects", DOI: 10.23919/ICEP55381.2022.9795393
   - Zhitong Li et al., "Undesired-resonance Analysis and Modeling of Differential Signals Due to Narrow Ground Lines Without Stitching Vias", DOI: 10.1109/EMCSIPI50001.2023.10241719
+  - Mosin Mandal et al., "Analysis of High Speed Differential Pair Routing through Dense Via Arrays", DOI: 10.1109/EMCSI.2018.8495184
+  - Ze Yang et al., "Simultaneous Escape Routing Algorithm for Large-Scale Pin Arrays", DOI: 10.1109/ISEDA62518.2024.10617655
+  - Katharina Scharff et al., "Physical scaling effects of differential crosstalk in via arrays up to frequencies of 100 GHz", DOI: 10.1109/SAPIW.2018.8401672
+  - Leilei Jin et al., "A Crosstalk-Aware Timing Prediction Method in Routing", arXiv:2403.04145
 
 - Open, modular EDA flows work best when analysis, rule generation, placement, routing, and verification stay separate but composable.
   - Tutu Ajayi et al., "Toward an Open-Source Digital Flow", DOI: 10.1145/3316781.3326334
@@ -202,6 +235,7 @@ The placement response now exposes:
 
 - `auto_place_strategy`
 - `auto_place_clusters`
+- `auto_place_routing_corridors`
 - `auto_place_rules`
 
 The routing constraint artifact now exposes:
@@ -209,6 +243,7 @@ The routing constraint artifact now exposes:
 - `compiledRules`
 - `policy`
 - `referencePlanning`
+- `placementRoutingCorridors`
 - `matchedLengthGroups`
 
 The post-route tuner now exposes:

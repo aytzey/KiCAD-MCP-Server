@@ -80,6 +80,7 @@ def test_auto_place_missing_footprints_uses_deterministic_grid_and_skips_missing
     assert result["placed"][0]["footprint"] == "Capacitor_SMD:C_0603_1608Metric"
     assert result["strategy"] == "grid"
     assert result["rules"][0]["name"] == "deterministic_grid"
+    assert result["routingCorridors"] == []
     assert result["skipped"] == [
         {"reference": "U1", "reason": "missing Footprint property in schematic"}
     ]
@@ -175,8 +176,18 @@ def test_build_auto_place_plan_routing_aware_clusters_components_by_connectivity
         cluster["anchor"] == "J1"
         and cluster["signalProfile"] == "high_speed"
         and "connectors_on_edge" in cluster["rulesApplied"]
+        and "emit_routing_corridor_reservation" in cluster["rulesApplied"]
         for cluster in plan["clusters"]
     )
+    corridor = next(item for item in plan["routingCorridors"] if item["anchor"] == "J1")
+    assert corridor["edge"] == "left"
+    assert corridor["direction"] == "east"
+    assert corridor["priority"] > 90.0
+    assert corridor["rect"]["right"] > corridor["rect"]["left"]
+    assert corridor["congestionBudgetMm"] > 0.0
+    j1_cluster = next(cluster for cluster in plan["clusters"] if cluster["anchor"] == "J1")
+    assert j1_cluster["routingCorridorId"] == corridor["id"]
+    assert any(rule["name"] == "routing_corridor_reservations" for rule in plan["rules"])
 
 
 def test_build_auto_place_plan_profiles_connectors_to_top_bottom_and_sides():
