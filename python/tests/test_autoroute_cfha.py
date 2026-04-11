@@ -1710,7 +1710,10 @@ def test_route_diff_pair_passes_transition_geometry_to_backend():
         "USB_D_P",
         "USB_D_N",
         inventory=inventory,
-        constraints={"defaults": {"hs_diff_gap_mm": {"opt": 0.15}, "hs_diff_skew_mm": 0.25}},
+        constraints={
+            "defaults": {"hs_diff_gap_mm": {"opt": 0.15}, "hs_diff_skew_mm": 0.25},
+            "referencePlanning": {"groundNet": "AGND"},
+        },
         width_mm=0.25,
         layer="B.Cu",
         board=board,
@@ -1725,6 +1728,8 @@ def test_route_diff_pair_passes_transition_geometry_to_backend():
     assert payload["startRef"] == "J1"
     assert payload["endRef"] == "U1"
     assert payload["allowLayerTransitions"] is True
+    assert payload["referenceNet"] == "AGND"
+    assert payload["addReturnPathStitching"] is True
     assert payload["startPosPos"]["x"] == 2.0
     assert payload["startPosNeg"]["y"] == 10.4
     assert payload["endPosPos"]["x"] == 18.0

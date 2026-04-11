@@ -114,3 +114,97 @@ def test_route_differential_pair_adds_synchronized_transitions(monkeypatch):
     assert {segment["net"] for segment in main_segments} == {"USB_D_P", "USB_D_N"}
     board.SetModified.assert_called_once()
     board.BuildConnectivity.assert_called()
+
+
+def test_route_differential_pair_adds_return_path_stitching_vias(monkeypatch):
+    nets_map = MagicMock()
+    nets_map.has_key.side_effect = lambda name: name in {"USB_D_P", "USB_D_N", "GND"}
+    nets_map.__getitem__.side_effect = lambda name: {
+        "USB_D_P": object(),
+        "USB_D_N": object(),
+        "GND": object(),
+    }[name]
+
+    board = MagicMock()
+    board.GetLayerID.side_effect = lambda layer: {"F.Cu": 0, "B.Cu": 31}.get(layer, -1)
+    board.GetNetInfo.return_value.NetsByName.return_value = nets_map
+    board.SetModified = MagicMock()
+    board.BuildConnectivity = MagicMock()
+
+    commands = RoutingCommands(board=board)
+    monkeypatch.setattr(commands, "_get_track_width_mm", lambda width: 0.25)
+    monkeypatch.setattr(
+        commands,
+        "_get_point",
+        lambda point_spec: type(
+            "Point",
+            (),
+            {
+                "x": int(float(point_spec["x"]) * 1_000_000),
+                "y": int(float(point_spec["y"]) * 1_000_000),
+            },
+        )(),
+    )
+    monkeypatch.setattr(
+        commands,
+        "_plan_trace_points",
+        lambda start, end, layer, width_mm, **kwargs: [start, end],
+    )
+    monkeypatch.setattr(
+        commands,
+        "_select_paired_via_positions",
+        lambda **kwargs: {
+            "center": (4.0, 10.2) if kwargs["anchor_mid"][0] < 10.0 else (16.0, 10.2),
+            "posVia": (4.0, 10.0) if kwargs["anchor_mid"][0] < 10.0 else (16.0, 10.0),
+            "negVia": (4.0, 10.4) if kwargs["anchor_mid"][0] < 10.0 else (16.0, 10.4),
+            "referenceVias": (
+                [(4.0, 9.35), (4.0, 11.05)]
+                if kwargs["anchor_mid"][0] < 10.0
+                else [(16.0, 9.35), (16.0, 11.05)]
+            ),
+            "referenceBlockedCount": 0,
+            "blockedCount": 0,
+            "candidates": [],
+        },
+    )
+
+    add_via_calls = []
+    monkeypatch.setattr(commands, "route_trace", lambda params: {"success": True})
+    monkeypatch.setattr(
+        commands,
+        "add_via",
+        lambda params: add_via_calls.append(params) or {"success": True},
+    )
+    monkeypatch.setattr(commands, "_add_track_segment", lambda *args, **kwargs: MagicMock())
+
+    result = commands.route_differential_pair(
+        {
+            "startPos": {"x": 2.0, "y": 10.2, "unit": "mm"},
+            "endPos": {"x": 18.0, "y": 10.2, "unit": "mm"},
+            "startPosPos": {"x": 2.0, "y": 10.0, "unit": "mm"},
+            "startPosNeg": {"x": 2.0, "y": 10.4, "unit": "mm"},
+            "endPosPos": {"x": 18.0, "y": 10.0, "unit": "mm"},
+            "endPosNeg": {"x": 18.0, "y": 10.4, "unit": "mm"},
+            "netPos": "USB_D_P",
+            "netNeg": "USB_D_N",
+            "layer": "B.Cu",
+            "startLayer": "F.Cu",
+            "endLayer": "F.Cu",
+            "width": 0.25,
+            "gap": 0.4,
+            "referenceNet": "GND",
+        }
+    )
+
+    diff_pair = result["diffPair"]
+    ground_vias = [call for call in add_via_calls if call["net"] == "GND"]
+    assert result["success"] is True
+    assert diff_pair["viaCount"] == 4
+    assert diff_pair["stitchViaCount"] == 4
+    assert diff_pair["returnPathStitching"] is True
+    assert diff_pair["referenceNet"] == "GND"
+    assert diff_pair["startTransition"]["stitchViaCount"] == 2
+    assert diff_pair["endTransition"]["stitchViaCount"] == 2
+    assert len(add_via_calls) == 8
+    assert len(ground_vias) == 4
+    assert all(call["from_layer"] == "F.Cu" and call["to_layer"] == "B.Cu" for call in ground_vias)

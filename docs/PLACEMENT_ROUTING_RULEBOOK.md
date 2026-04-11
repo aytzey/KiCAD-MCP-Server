@@ -154,6 +154,12 @@ This document captures the deterministic engineering rules now used by the KiCAD
    - The transition is still deterministic: paired via sites are chosen from a bounded candidate set scored by obstacle hits and total Manhattan detour, and the final report exposes `startTransition`, `endTransition`, and total pair `viaCount`.
    - This keeps the layer planner and the physical router aligned: a pair layer is only considered practically useful when the backend can now instantiate the synchronized transitions it implies.
 
+23. Stitch return paths around diff-pair layer transitions.
+   - `referencePlanning.groundNet` now flows into `route_differential_pair` as `referenceNet`, so local `AGND`, `GND`, or other selected reference domains are preserved through the physical transition.
+   - Each successful paired signal transition can add flanking reference vias outside the P/N pair, producing a deterministic GSSG-like layer-change cell instead of isolated signal vias.
+   - Reference stitching is fail-soft: blocked or failed stitch vias are reported in transition telemetry, but they do not invalidate the already-safe synchronized signal transition.
+   - The diff-pair report now separates signal `viaCount` from `stitchViaCount` and exposes `returnPathStitching`, making via budgets and return-path quality auditable independently.
+
 ## Research Mapping
 
 - Placement and routing should be coupled through routability and congestion, not optimized independently.
@@ -171,6 +177,11 @@ This document captures the deterministic engineering rules now used by the KiCAD
 
 - Rule synthesis should come from measurable signal-integrity constraints, not fixed folklore alone.
   - Alexandre Plot, Benoit Goral, Philippe Besnier, "Machine Learning Techniques for Defining Routing Rules for PCB Design", DOI: 10.1109/SPI57109.2023.10145545
+
+- Differential-pair layer transitions need nearby reference stitching to control return-path discontinuity and via resonance.
+  - Yan Deng et al., "S Parameters Optimization of High-Speed Differential Vias Model on A Multilayer PCB", DOI: 10.1109/ICEPT56209.2022.9873518
+  - Meng Lee Chew et al., "PCB Channel Optimization Techniques for High-Speed Differential Interconnects", DOI: 10.23919/ICEP55381.2022.9795393
+  - Zhitong Li et al., "Undesired-resonance Analysis and Modeling of Differential Signals Due to Narrow Ground Lines Without Stitching Vias", DOI: 10.1109/EMCSIPI50001.2023.10241719
 
 - Open, modular EDA flows work best when analysis, rule generation, placement, routing, and verification stay separate but composable.
   - Tutu Ajayi et al., "Toward an Open-Source Digital Flow", DOI: 10.1145/3316781.3326334

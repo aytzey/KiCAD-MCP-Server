@@ -371,8 +371,23 @@ class RoutingCommands:
             unique_centers.append(center)
 
         ranked: List[Dict[str, Any]] = []
+        stitch_offset = max(gap * 1.35, width_mm * 5.0, keepout_margin * 2.5, 0.75)
         for center in unique_centers:
             pos_via, neg_via = self._offset_pair_about_center(center, guide_point, gap)
+            reference_candidates = [
+                (
+                    round(center[0] + px * stitch_offset, 6),
+                    round(center[1] + py * stitch_offset, 6),
+                ),
+                (
+                    round(center[0] - px * stitch_offset, 6),
+                    round(center[1] - py * stitch_offset, 6),
+                ),
+            ]
+            reference_vias = [
+                point for point in reference_candidates
+                if not self._point_hits_obstacle(point, obstacles)
+            ]
             blocked_count = int(self._point_hits_obstacle(pos_via, obstacles)) + int(
                 self._point_hits_obstacle(neg_via, obstacles)
             )
@@ -387,17 +402,21 @@ class RoutingCommands:
                     "center": center,
                     "posVia": pos_via,
                     "negVia": neg_via,
+                    "referenceVias": reference_vias,
+                    "referenceBlockedCount": len(reference_candidates) - len(reference_vias),
                     "blockedCount": blocked_count,
                     "wirelengthScore": round(wirelength, 4),
                 }
             )
 
-        ranked.sort(key=lambda item: (item["blockedCount"], item["wirelengthScore"]))
+        ranked.sort(key=lambda item: (item["blockedCount"], item["referenceBlockedCount"], item["wirelengthScore"]))
         selected = ranked[0]
         return {
             "center": selected["center"],
             "posVia": selected["posVia"],
             "negVia": selected["negVia"],
+            "referenceVias": selected["referenceVias"],
+            "referenceBlockedCount": selected["referenceBlockedCount"],
             "blockedCount": selected["blockedCount"],
             "candidates": ranked,
         }
@@ -1915,6 +1934,13 @@ class RoutingCommands:
             gap = params.get("gap")
             max_skew_mm = float(params.get("maxSkewMm", 0.25))
             allow_layer_transitions = bool(params.get("allowLayerTransitions", True))
+            reference_net = params.get("referenceNet")
+            add_return_path_stitching_param = params.get("addReturnPathStitching")
+            add_return_path_stitching = (
+                bool(reference_net)
+                if add_return_path_stitching_param is None
+                else bool(add_return_path_stitching_param)
+            )
 
             if not start_pos or not end_pos or not net_pos or not net_neg:
                 return {
@@ -1941,6 +1967,7 @@ class RoutingCommands:
                     "message": "Nets not found",
                     "errorDetails": "One or both differential pair nets do not exist",
                 }
+            reference_net_available = bool(reference_net and nets_map.has_key(reference_net))
 
             start_point = self._get_point(start_pos)
             end_point = self._get_point(end_pos)
@@ -1963,6 +1990,7 @@ class RoutingCommands:
             route_end_pos_mm = _point_spec_to_mm(end_pos_pos)
             route_end_neg_mm = _point_spec_to_mm(end_pos_neg)
             transition_via_count = 0
+            transition_stitch_via_count = 0
             start_transition: Optional[Dict[str, Any]] = None
             end_transition: Optional[Dict[str, Any]] = None
 
@@ -1983,6 +2011,7 @@ class RoutingCommands:
                         "pos": pos_point,
                         "neg": neg_point,
                         "viaCount": 0,
+                        "stitchViaCount": 0,
                         "name": transition_name,
                     }
                 if not allow_layer_transitions:
@@ -2063,6 +2092,36 @@ class RoutingCommands:
                             "negVia": neg_via_result,
                         },
                     }
+                stitch_vias: List[Dict[str, Any]] = []
+                stitch_failures: List[Dict[str, Any]] = []
+                stitch_skipped_reason: Optional[str] = None
+                if add_return_path_stitching and reference_net:
+                    if not reference_net_available:
+                        stitch_skipped_reason = "reference_net_not_found"
+                    else:
+                        for stitch_point in via_plan.get("referenceVias", []):
+                            stitch_params = {
+                                "position": {
+                                    "x": stitch_point[0],
+                                    "y": stitch_point[1],
+                                    "unit": "mm",
+                                },
+                                "net": reference_net,
+                                "from_layer": from_layer_name,
+                                "to_layer": to_layer_name,
+                            }
+                            stitch_result = self.add_via(stitch_params)
+                            stitch_record = {
+                                "position": stitch_params["position"],
+                                "net": reference_net,
+                                "fromLayer": from_layer_name,
+                                "toLayer": to_layer_name,
+                            }
+                            if stitch_result.get("success"):
+                                stitch_vias.append(stitch_record)
+                            else:
+                                stitch_record["errorDetails"] = stitch_result
+                                stitch_failures.append(stitch_record)
                 return {
                     "success": True,
                     "name": transition_name,
@@ -2072,6 +2131,12 @@ class RoutingCommands:
                     "pos": pos_via,
                     "neg": neg_via,
                     "viaCount": 2,
+                    "referenceNet": reference_net,
+                    "stitchViaCount": len(stitch_vias),
+                    "stitchVias": stitch_vias,
+                    "stitchFailures": stitch_failures,
+                    "stitchSkippedReason": stitch_skipped_reason,
+                    "referenceBlockedCandidates": via_plan.get("referenceBlockedCount", 0),
                     "blockedCandidates": via_plan["blockedCount"],
                 }
 
@@ -2097,6 +2162,7 @@ class RoutingCommands:
                 route_start_pos_mm = start_transition["pos"]
                 route_start_neg_mm = start_transition["neg"]
                 transition_via_count += int(start_transition.get("viaCount", 0))
+                transition_stitch_via_count += int(start_transition.get("stitchViaCount", 0))
 
             if end_layer != layer:
                 if route_end_pos_mm is None or route_end_neg_mm is None:
@@ -2120,6 +2186,7 @@ class RoutingCommands:
                 route_end_pos_mm = end_transition["pos"]
                 route_end_neg_mm = end_transition["neg"]
                 transition_via_count += int(end_transition.get("viaCount", 0))
+                transition_stitch_via_count += int(end_transition.get("stitchViaCount", 0))
 
             route_start_mid_mm = (
                 self._pair_midpoint(route_start_pos_mm, route_start_neg_mm)
@@ -2250,6 +2317,10 @@ class RoutingCommands:
                     "segments": len(pos_tracks),
                     "obstacleAware": True,
                     "viaCount": transition_via_count,
+                    "stitchViaCount": transition_stitch_via_count,
+                    "returnPathStitching": transition_stitch_via_count > 0,
+                    "returnPathStitchingRequested": bool(add_return_path_stitching and reference_net),
+                    "referenceNet": reference_net,
                     "pairedTransitions": transition_via_count > 0,
                     "startTransition": start_transition,
                     "endTransition": end_transition,

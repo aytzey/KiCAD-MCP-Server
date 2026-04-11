@@ -3952,6 +3952,7 @@ class AutorouteCFHACommands:
             "unit": "mm",
         }
         max_skew_mm = float(constraints.get("defaults", {}).get("hs_diff_skew_mm", 0.25))
+        reference_net = constraints.get("referencePlanning", {}).get("groundNet")
         return self.routing_commands.route_differential_pair(
             {
                 "startPos": start_mid,
@@ -3987,6 +3988,8 @@ class AutorouteCFHACommands:
                 "gap": target_center_spacing,
                 "maxSkewMm": max_skew_mm,
                 "allowLayerTransitions": True,
+                "referenceNet": reference_net,
+                "addReturnPathStitching": bool(reference_net),
             }
         )
 
