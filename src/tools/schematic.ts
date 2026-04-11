@@ -717,6 +717,114 @@ Note: operates on .kicad_sch files only. To modify a PCB footprint use edit_comp
     },
   );
 
+  // Readability-only visual polish pass
+  server.tool(
+    "polish_schematic_readability",
+    "Apply a non-electrical schematic readability polish pass: shrink internal/debug local net labels, make junction dots visible, and optionally add block-frame rectangles/titles. This does not move symbols or rewire nets.",
+    {
+      schematicPath: z.string().describe("Path to the .kicad_sch file"),
+      hideInternalLabels: z
+        .boolean()
+        .optional()
+        .describe("Shrink internal/debug local net labels so the schematic reads through wires (default: true)"),
+      internalLabelNames: z
+        .array(z.string())
+        .optional()
+        .describe("Explicit local label names to shrink. If omitted, labels with internal-looking names such as STAGE1_OUT, U1A_FB, TONE_RC are selected heuristically."),
+      keepLabelNames: z
+        .array(z.string())
+        .optional()
+        .describe("Labels that must remain readable, e.g. VREF, GND, +9V. Defaults include common power/reference rails."),
+      internalLabelFontSize: z
+        .number()
+        .optional()
+        .describe("Font size in mm for hidden internal labels (default: 0.2)"),
+      visibleLabelFontSize: z
+        .number()
+        .optional()
+        .describe("Optional font size in mm to apply to non-hidden local labels"),
+      junctionDiameter: z
+        .number()
+        .optional()
+        .describe("Visible junction dot diameter in mm; set to 0 to hide junction dots (default: 1.27)"),
+      blockFrames: z
+        .array(
+          z.object({
+            title: z.string().optional().describe("Optional block title text"),
+            x1: z.number().describe("Frame left x in mm"),
+            y1: z.number().describe("Frame top y in mm"),
+            x2: z.number().describe("Frame right x in mm"),
+            y2: z.number().describe("Frame bottom y in mm"),
+            titleX: z.number().optional().describe("Title x in mm (default: x1 + 4)"),
+            titleY: z.number().optional().describe("Title y in mm (default: y1 + 5)"),
+            titleSize: z.number().optional().describe("Title font size in mm (default: 2.2)"),
+            strokeWidth: z.number().optional().describe("Frame line width in mm (default: 0.15)"),
+          }),
+        )
+        .optional()
+        .describe("Optional block frames to add around functional schematic regions"),
+      createBackup: z
+        .boolean()
+        .optional()
+        .describe("Create a .bak backup before modifying the schematic (default: false)"),
+      backupSuffix: z
+        .string()
+        .optional()
+        .describe("Backup suffix when createBackup=true (default: .bak_pre_polish)"),
+    },
+    async (args: {
+      schematicPath: string;
+      hideInternalLabels?: boolean;
+      internalLabelNames?: string[];
+      keepLabelNames?: string[];
+      internalLabelFontSize?: number;
+      visibleLabelFontSize?: number;
+      junctionDiameter?: number;
+      blockFrames?: Array<{
+        title?: string;
+        x1: number;
+        y1: number;
+        x2: number;
+        y2: number;
+        titleX?: number;
+        titleY?: number;
+        titleSize?: number;
+        strokeWidth?: number;
+      }>;
+      createBackup?: boolean;
+      backupSuffix?: string;
+    }) => {
+      const result = await callKicadScript("polish_schematic_readability", args);
+      if (result.success) {
+        const labels = result.hiddenLabels?.length
+          ? `\nHidden labels: ${result.hiddenLabels.join(", ")}`
+          : "";
+        return {
+          content: [
+            {
+              type: "text",
+              text:
+                `${result.message || "Polished schematic readability."}\n` +
+                `Junctions updated: ${result.junctionsUpdated ?? 0}\n` +
+                `Frames added: ${result.framesAdded ?? 0}` +
+                labels +
+                (result.backup ? `\nBackup: ${result.backup}` : ""),
+            },
+          ],
+        };
+      }
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Failed to polish schematic: ${result.message || "Unknown error"}`,
+          },
+        ],
+        isError: true,
+      };
+    },
+  );
+
   // Move a placed symbol, dragging connected wires
   server.tool(
     "move_schematic_component",
@@ -1198,6 +1306,86 @@ Note: operates on .kicad_sch files only. To modify a PCB footprint use edit_comp
       const result = await callKicadScript("sync_schematic_to_board", args);
       return {
         content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+      };
+    },
+  );
+
+  // Validate schematic/PCB equivalence after sync
+  server.tool(
+    "validate_schematic_pcb_sync",
+    "Validate that the PCB is a faithful physical view of the schematic: every schematic footprint exists on the PCB, every relevant PCB footprint exists in the schematic, and each PCB pad net matches the schematic netlist. Use after sync_schematic_to_board and after PCB edits.",
+    {
+      schematicPath: z
+        .string()
+        .optional()
+        .describe("Absolute path to the .kicad_sch schematic file. If omitted, inferred from boardPath."),
+      boardPath: z
+        .string()
+        .optional()
+        .describe("Absolute path to the .kicad_pcb board file. If omitted, uses the currently loaded board."),
+      ignoreMechanicalFootprints: z
+        .boolean()
+        .optional()
+        .describe("Ignore mechanical-only footprints such as MH1/FID1 that are intentionally PCB-only (default: true)."),
+      ignoreReferences: z
+        .array(z.string())
+        .optional()
+        .describe("Specific PCB references to ignore during comparison, e.g. ['MH1', 'FID1']."),
+      ignoreReferencePrefixes: z
+        .array(z.string())
+        .optional()
+        .describe("PCB reference prefixes to ignore during comparison, e.g. ['MH', 'FID']."),
+      compareFootprints: z
+        .boolean()
+        .optional()
+        .describe("Also compare the footprint ID assigned in the schematic with the PCB footprint ID (default: true)."),
+    },
+    async (args: {
+      schematicPath?: string;
+      boardPath?: string;
+      ignoreMechanicalFootprints?: boolean;
+      ignoreReferences?: string[];
+      ignoreReferencePrefixes?: string[];
+      compareFootprints?: boolean;
+    }) => {
+      const result = await callKicadScript("validate_schematic_pcb_sync", args);
+      if (result.success) {
+        const summary = result.summary || {};
+        const lines = [
+          result.inSync
+            ? "Schematic and PCB are in sync."
+            : "Schematic and PCB are NOT in sync.",
+          `Schematic footprints: ${summary.schematicFootprints ?? 0}`,
+          `Board footprints: ${summary.boardFootprints ?? 0}`,
+          `Missing footprints: ${summary.missingFootprints ?? 0}`,
+          `Extra footprints: ${summary.extraFootprints ?? 0}`,
+          `Footprint mismatches: ${summary.footprintMismatches ?? 0}`,
+          `Missing pads: ${summary.missingPads ?? 0}`,
+          `Pad/net mismatches: ${summary.padNetMismatches ?? 0}`,
+          `Extra assigned pads: ${summary.extraAssignedPads ?? 0}`,
+        ];
+        const details: Array<[string, any]> = [
+          ["Missing footprints", result.missingFootprints],
+          ["Extra footprints", result.extraFootprints],
+          ["Footprint mismatches", result.footprintMismatches],
+          ["Missing pads", result.missingPads],
+          ["Pad/net mismatches", result.padNetMismatches],
+          ["Extra assigned pads", result.extraAssignedPads],
+        ];
+        details.forEach(([title, items]) => {
+          if (Array.isArray(items) && items.length) {
+            lines.push(`\n${title}:`);
+            items.slice(0, 20).forEach((item: any) => {
+              lines.push(`  ${typeof item === "string" ? item : JSON.stringify(item)}`);
+            });
+            if (items.length > 20) lines.push(`  ... and ${items.length - 20} more`);
+          }
+        });
+        return { content: [{ type: "text", text: lines.join("\n") }] };
+      }
+      return {
+        content: [{ type: "text", text: `Failed: ${result.message || "Unknown error"}` }],
+        isError: true,
       };
     },
   );

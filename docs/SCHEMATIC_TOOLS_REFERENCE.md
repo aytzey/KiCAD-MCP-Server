@@ -3,7 +3,7 @@
 Added in: v2.1.0, expanded in v2.2.0-v2.2.3
 Contributors: @Mehanik (PRs #60, #66), @Kletternaut (PR #57)
 
-This document provides a complete reference for the 27 schematic tools in the KiCAD MCP Server. These tools enable a complete schematic design workflow, from creating projects and adding components to wiring, validation, and synchronization with PCB boards. The dynamic symbol loading feature provides access to approximately 10,000 standard KiCad symbols.
+This document provides a complete reference for the schematic tools in the KiCAD MCP Server. These tools enable a complete schematic design workflow, from creating projects and adding components to wiring, validation, and synchronization with PCB boards. The dynamic symbol loading feature provides access to approximately 10,000 standard KiCad symbols.
 
 ## Component Operations (8 tools)
 
@@ -219,6 +219,22 @@ List all net labels, global labels, and power flags in the schematic.
 | ------------- | ------ | -------- | --------------------------- |
 | schematicPath | string | Yes      | Path to the .kicad_sch file |
 
+### polish_schematic_readability
+
+Apply a readability-only visual polish pass to a schematic without moving symbols or changing nets.
+
+| Parameter             | Type    | Required | Description                                                                   |
+| --------------------- | ------- | -------- | ----------------------------------------------------------------------------- |
+| schematicPath         | string  | Yes      | Path to the .kicad_sch file                                                   |
+| hideInternalLabels    | boolean | No       | Shrink internal/debug local labels so the schematic reads through wires        |
+| internalLabelNames    | array   | No       | Explicit local label names to shrink; otherwise internal-looking names are used |
+| keepLabelNames        | array   | No       | Labels that must stay readable, such as VREF, GND, +9V                        |
+| internalLabelFontSize | number  | No       | Font size for hidden internal labels, default 0.2 mm                           |
+| junctionDiameter      | number  | No       | Junction dot diameter, default 1.27 mm                                         |
+| blockFrames           | array   | No       | Optional frame rectangles/titles around functional schematic blocks             |
+
+**Usage Notes:** This is intended as a final schematic presentation pass. It preserves electrical topology, but improves readability by reducing technical net-label clutter, making real junctions visible, and adding optional block boundaries.
+
 ## Schematic Creation and Export (5 tools)
 
 ### create_schematic
@@ -302,6 +318,21 @@ Import the schematic netlist into the PCB board — equivalent to pressing F8 in
 | placementColumns          | number | No       | Column count used by the deterministic grid fallback.                                           |
 
 **Usage Notes:** This is the F8 equivalent. It synchronizes the schematic design to the PCB, creating footprints on the board and assigning nets. On blank boards, the default `routing_aware` strategy uses connectivity to keep tightly related parts near each other, biases analog connectors upward, biases power/switching connectors downward, preserves easier breakout/routing channels for high-speed clusters, and performs a final local net-separation legalization pass so analog/RF clusters are not left too close to noisy power-switching regions. The response now also includes `auto_place_clusters` and `auto_place_rules`, so agents can inspect which placement rules were applied before routing. Ground-coupled high-speed or RF connectors now receive a `referenceProfile`-aware edge policy as well: they are prioritized for the quietest side-edge slots near the board midline and get slightly deeper inward breakout corridors so a cleaner future return-path region is left behind them. That edge policy is now also `referenceDomain`-aware: quiet domains such as `AGND` and chassis-earth are favored for the central side corridor, while `PGND`-coupled connectors are pushed toward more peripheral side-edge slots to reduce downstream split-plane and switching-noise risk. If the board already contains ground-domain zones, the placer also becomes zone-aware: it will prefer the left or right edge that actually has the strongest matching reference-plane continuity for that domain, and the returned cluster metadata will expose the chosen edge preference and zone bias. Use `placementStrategy: "grid"` when you need the previous simple deterministic staging layout. After routing, pair this with `post_tune_routes` so the MCP can first attempt explicit matched-length bus compensation, then synthesize a deterministic ground reference zone when a ground net exists but no plane is present, and finally heal residual ground/power disconnects before final DRC. For full `autoroute_cfha` runs, the constraint artifact now also emits `referencePlanning`, and the orchestrator consumes that plan in a new `preRouteReference` stage before critical routing so the preferred signal layer and any missing ground reference zone are established early instead of being deferred entirely to post-tune. That reference plan is now local-domain-aware: if a high-speed interface is tied more strongly to `AGND` than `GND`, the MCP will prefer `AGND` for plane synthesis and will not let an unrelated `GND` zone suppress creation of the local analog reference. The same plan now also carries `preferredEntryEdge`, `entryEdgeBias`, `referenceContinuityScore`, and `topologyCueSource`, and its `signalLayerCandidates` now expose estimated transition load as well as pressure. Combined with `trackPressureByLayer` and `edgePressureByLayer` from the board analysis, the MCP can prefer the signal layer whose breakout corridor is cleaner on the selected reference side instead of blindly defaulting to `F.Cu`. That decision is no longer just global planning metadata: `route_critical_nets` now applies a per-net layer override for high-speed and RF nets, locks each `HS_DIFF` pair onto one shared layer, records `estimatedViaCountPerNet` and `transitionPolicy` in the routing telemetry, and when the chosen layer is budget-safe it now passes full endpoint geometry into the backend so synchronized paired start/end vias can actually be synthesized instead of being treated as a planner-only fiction. DDR-style buses can still be inferred automatically from interface-aware net stems such as `DQ` and `ADDR`; override that behavior with `inferMatchedLengthGroups`, `autoMatchedLengthMaxSkewMm`, the min/max auto-group size knobs, and the `autoCreateReferenceZones` / `referenceZone*` controls when needed.
+
+### validate_schematic_pcb_sync
+
+Validate that the PCB is a faithful physical view of the schematic.
+
+| Parameter                  | Type    | Required | Description                                                        |
+| -------------------------- | ------- | -------- | ------------------------------------------------------------------ |
+| schematicPath              | string  | No       | Absolute path to the .kicad_sch file; inferred from board if omitted |
+| boardPath                  | string  | No       | Absolute path to the .kicad_pcb file; current board if omitted      |
+| ignoreMechanicalFootprints | boolean | No       | Ignore PCB-only mechanical items such as mounting holes and fiducials |
+| ignoreReferences           | array   | No       | Specific PCB references to ignore during comparison                 |
+| ignoreReferencePrefixes    | array   | No       | PCB reference prefixes to ignore during comparison                  |
+| compareFootprints          | boolean | No       | Compare schematic footprint IDs against PCB footprint IDs           |
+
+**Usage Notes:** This is the post-F8 guardrail. Run it after `sync_schematic_to_board` and after any PCB edits. It reports missing/extra footprints, footprint ID mismatches, missing pads, pad/net mismatches, and extra assigned pads.
 
 ## Example Workflows
 

@@ -103,9 +103,11 @@ export const toolCategories: ToolCategory[] = [
       "list_schematic_nets",
       "list_schematic_wires",
       "list_schematic_labels",
+      "polish_schematic_readability",
       "get_wire_connections",
       "generate_netlist",
       "sync_schematic_to_board",
+      "validate_schematic_pcb_sync",
       "get_schematic_view",
       "export_schematic_svg",
       "export_schematic_pdf",
@@ -176,6 +178,7 @@ export const directToolNames = [
 
   // Schematic <-> PCB sync (F8 equivalent)
   "sync_schematic_to_board",
+  "validate_schematic_pcb_sync",
 
   // UI management
   "check_kicad_ui",

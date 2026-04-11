@@ -1357,6 +1357,35 @@ class SchematicHandlers:
             logger.error(traceback.format_exc())
             return {"success": False, "message": str(e)}
 
+    def polish_schematic_readability(self, params):
+        """Apply a non-electrical readability polish pass to a schematic."""
+        logger.info("Polishing schematic readability")
+        try:
+            from commands.schematic_polish import polish_schematic_readability
+
+            schematic_path = params.get("schematicPath") or params.get("schematic_path")
+            if not schematic_path:
+                return {"success": False, "message": "schematicPath is required"}
+
+            return polish_schematic_readability(
+                schematic_path,
+                hide_internal_labels=params.get("hideInternalLabels", True),
+                internal_label_names=params.get("internalLabelNames"),
+                keep_label_names=params.get("keepLabelNames"),
+                internal_label_font_size=params.get("internalLabelFontSize", 0.2),
+                visible_label_font_size=params.get("visibleLabelFontSize"),
+                junction_diameter=params.get("junctionDiameter", 1.27),
+                block_frames=params.get("blockFrames"),
+                create_backup=params.get("createBackup", False),
+                backup_suffix=params.get("backupSuffix", ".bak_pre_polish"),
+            )
+        except Exception as e:
+            logger.error(f"Error polishing schematic readability: {e}")
+            import traceback
+
+            logger.error(traceback.format_exc())
+            return {"success": False, "message": str(e)}
+
     def list_schematic_libraries(self, params):
         """List available symbol libraries"""
         logger.info("Listing schematic libraries")

@@ -238,6 +238,7 @@ Access project state without executing tools:
 - `kicad://project/current/design-rules` - Current DRC settings
 - `kicad://project/current/drc-report` - Design rule violations
 - `kicad://board/preview.png` - Board visualization (PNG)
+- `kicad://workflow/circuit-design-excellence` - Research-backed agent workflow for verified circuit design
 
 ### Protocol Compliance
 
@@ -759,6 +760,7 @@ Show me the current component list.
 What are the current design rules?
 Display the board preview.
 List all electrical nets.
+Load the circuit design excellence workflow before designing this board.
 ```
 
 ### JLCPCB Component Selection

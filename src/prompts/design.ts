@@ -8,6 +8,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { logger } from "../logger.js";
+import { CIRCUIT_DESIGN_EXCELLENCE_WORKFLOW } from "../workflows/circuit-design-excellence.js";
 
 /**
  * Register design prompts with the MCP server
@@ -335,6 +336,56 @@ When optimizing a PCB design, consider these key areas based on the stated goals
    - Connector and interface optimization
 
 Based on the provided information and optimization goals, suggest specific, actionable improvements to the PCB design. Prioritize your recommendations based on their potential impact and implementation feasibility.`,
+          },
+        },
+      ],
+    }),
+  );
+
+  // ------------------------------------------------------
+  // Circuit Design Excellence Workflow Prompt
+  // ------------------------------------------------------
+  server.prompt(
+    "circuit_design_excellence_workflow",
+    {
+      design_goal: z
+        .string()
+        .describe(
+          "The circuit/PCB the user wants, including target behavior and success criteria",
+        ),
+      constraints: z
+        .string()
+        .optional()
+        .describe(
+          "Board size, layer count, assembly style, supplier/library constraints, package constraints, cost, enclosure, and manufacturing limits",
+        ),
+      verification_level: z
+        .string()
+        .optional()
+        .describe(
+          "Expected rigor level, for example concept, prototype, fabrication-ready, or production-review",
+        ),
+    },
+    () => ({
+      messages: [
+        {
+          role: "user",
+          content: {
+            type: "text",
+            text: `${CIRCUIT_DESIGN_EXCELLENCE_WORKFLOW}
+
+Apply this workflow to the following design request.
+
+Design goal:
+{{design_goal}}
+
+Constraints:
+{{constraints}}
+
+Verification level:
+{{verification_level}}
+
+Before using KiCad tools, produce a compact execution plan with the required quality gates. During execution, prefer tool-verified facts over assumptions and stop on any ERC, DRC, or schematic/PCB sync failure.`,
           },
         },
       ],

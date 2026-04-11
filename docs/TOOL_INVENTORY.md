@@ -168,6 +168,7 @@ _Source: `src/tools/schematic.ts`_
 | `list_schematic_nets`   | List all nets in schematic    | Routed (schematic) |
 | `list_schematic_wires`  | List all wires in schematic   | Routed (schematic) |
 | `list_schematic_labels` | List all net labels           | Routed (schematic) |
+| `polish_schematic_readability` | Hide internal label clutter, show junction dots, add optional block frames | Routed (schematic) |
 
 ### Schematic Creation and Export
 
@@ -185,6 +186,7 @@ _Source: `src/tools/schematic.ts`_
 | `run_erc`                 | Run electrical rule check                             | Additional         |
 | `generate_netlist`        | Generate netlist from schematic                       | Routed (schematic) |
 | `sync_schematic_to_board` | Sync schematic components/nets to PCB (F8 equivalent) | Direct             |
+| `validate_schematic_pcb_sync` | Validate PCB footprints/pad nets match schematic exactly | Direct         |
 
 ---
 

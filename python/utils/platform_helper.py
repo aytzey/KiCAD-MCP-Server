@@ -19,6 +19,46 @@ class PlatformHelper:
     """Platform detection and path resolution utilities"""
 
     @staticmethod
+    def get_kicad_appdirs() -> List[Path]:
+        """
+        Get potential KiCad AppImage AppDir locations on Linux.
+
+        Returns:
+            List of candidate AppDir paths in priority order
+        """
+        appdirs: List[Path] = []
+        seen = set()
+
+        env_candidates = [
+            os.environ.get("KICAD_APPDIR"),
+            os.environ.get("APPDIR"),
+            os.environ.get("SHARUN_DIR"),
+        ]
+
+        for candidate in env_candidates:
+            if not candidate:
+                continue
+            path = Path(candidate).expanduser()
+            if path.exists() and path not in seen:
+                appdirs.append(path)
+                seen.add(path)
+
+        if PlatformHelper.is_linux():
+            search_roots = [
+                Path.home() / ".local" / "opt",
+                Path("/opt"),
+            ]
+            for root in search_roots:
+                if not root.exists():
+                    continue
+                for appdir in sorted(root.glob("kicad-*/AppDir")):
+                    if appdir.exists() and appdir not in seen:
+                        appdirs.append(appdir)
+                        seen.add(appdir)
+
+        return appdirs
+
+    @staticmethod
     def is_windows() -> bool:
         """Check if running on Windows"""
         return platform.system() == "Windows"
@@ -66,12 +106,24 @@ class PlatformHelper:
 
         elif PlatformHelper.is_linux():
             # Linux: Check common installation paths
-            candidates = [
+            candidates = []
+
+            for appdir in PlatformHelper.get_kicad_appdirs():
+                candidates.extend(
+                    [
+                        *sorted(appdir.glob("shared/lib/python*/dist-packages")),
+                        *sorted(appdir.glob("lib/python*/dist-packages")),
+                    ]
+                )
+
+            candidates.extend(
+                [
                 Path("/usr/lib/kicad/lib/python3/dist-packages"),
                 Path("/usr/share/kicad/scripting/plugins"),
                 Path("/usr/local/lib/kicad/lib/python3/dist-packages"),
                 Path.home() / ".local/lib/kicad/lib/python3/dist-packages",
-            ]
+                ]
+            )
 
             # Also check based on Python version
             py_version = f"{sys.version_info.major}.{sys.version_info.minor}"
@@ -93,7 +145,14 @@ class PlatformHelper:
                 ]
             )
 
-            paths = [p for p in candidates if p.exists()]
+            deduped_candidates = []
+            seen = set()
+            for candidate in candidates:
+                if candidate.exists() and candidate not in seen:
+                    deduped_candidates.append(candidate)
+                    seen.add(candidate)
+
+            paths = deduped_candidates
 
         elif PlatformHelper.is_macos():
             # macOS: Check multiple KiCAD application bundle locations

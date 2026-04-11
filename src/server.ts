@@ -6,7 +6,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import express from "express";
 import { spawn, exec, execSync, ChildProcess } from "child_process";
-import { existsSync } from "fs";
+import { existsSync, readdirSync } from "fs";
 import { join, dirname } from "path";
 import { logger } from "./logger.js";
 
@@ -33,12 +33,70 @@ import { registerProjectResources } from "./resources/project.js";
 import { registerBoardResources } from "./resources/board.js";
 import { registerComponentResources } from "./resources/component.js";
 import { registerLibraryResources } from "./resources/library.js";
+import { registerWorkflowResources } from "./resources/workflow.js";
 
 // Import prompt registration functions
 import { registerComponentPrompts } from "./prompts/component.js";
 import { registerRoutingPrompts } from "./prompts/routing.js";
 import { registerDesignPrompts } from "./prompts/design.js";
 import { registerFootprintPrompts } from "./prompts/footprint.js";
+
+/**
+ * Detect a KiCad AppImage AppDir on Linux.
+ */
+function findKicadAppImageDir(): string | undefined {
+  if (process.platform !== "linux") {
+    return undefined;
+  }
+
+  const envCandidates = [process.env.KICAD_APPDIR, process.env.APPDIR, process.env.SHARUN_DIR]
+    .filter(Boolean)
+    .map((value) => value!.trim())
+    .filter((value) => value.length > 0);
+
+  for (const candidate of envCandidates) {
+    if (existsSync(join(candidate, "AppRun"))) {
+      return candidate;
+    }
+  }
+
+  const searchRoots = [process.env.HOME ? join(process.env.HOME, ".local", "opt") : undefined, "/opt"]
+    .filter(Boolean)
+    .map((value) => value!);
+
+  for (const root of searchRoots) {
+    if (!existsSync(root)) {
+      continue;
+    }
+
+    for (const entry of readdirSync(root, { withFileTypes: true })) {
+      if (!entry.isDirectory() || !entry.name.startsWith("kicad-")) {
+        continue;
+      }
+
+      const appDir = join(root, entry.name, "AppDir");
+      if (existsSync(join(appDir, "AppRun"))) {
+        return appDir;
+      }
+    }
+  }
+
+  return undefined;
+}
+
+/**
+ * Resolve the repo-local launcher that runs KiCad AppImage's Python with MCP deps.
+ */
+function findKicadAppImagePythonLauncher(scriptPath: string): string | undefined {
+  const appDir = findKicadAppImageDir();
+  if (!appDir) {
+    return undefined;
+  }
+
+  const projectRoot = dirname(dirname(scriptPath));
+  const launcher = join(projectRoot, "scripts", "kicad-appimage-python");
+  return existsSync(launcher) ? launcher : undefined;
+}
 
 /**
  * Find the Python executable to use
@@ -52,6 +110,20 @@ function findPythonExecutable(scriptPath: string): string {
   // Get the project root (parent of the python/ directory)
   const projectRoot = dirname(dirname(scriptPath));
 
+  // Allow override via KICAD_PYTHON environment variable (any platform)
+  if (process.env.KICAD_PYTHON) {
+    logger.info(`Using KICAD_PYTHON environment variable: ${process.env.KICAD_PYTHON}`);
+    return process.env.KICAD_PYTHON;
+  }
+
+  if (isLinux) {
+    const appImageLauncher = findKicadAppImagePythonLauncher(scriptPath);
+    if (appImageLauncher) {
+      logger.info(`Using KiCad AppImage Python launcher: ${appImageLauncher}`);
+      return appImageLauncher;
+    }
+  }
+
   // Check for virtual environment
   const venvPaths = [
     join(projectRoot, "venv", isWindows ? "Scripts" : "bin", isWindows ? "python.exe" : "python"),
@@ -63,12 +135,6 @@ function findPythonExecutable(scriptPath: string): string {
       logger.info(`Found virtual environment Python at: ${venvPath}`);
       return venvPath;
     }
-  }
-
-  // Allow override via KICAD_PYTHON environment variable (any platform)
-  if (process.env.KICAD_PYTHON) {
-    logger.info(`Using KICAD_PYTHON environment variable: ${process.env.KICAD_PYTHON}`);
-    return process.env.KICAD_PYTHON;
   }
 
   // Platform-specific KiCAD bundled Python detection
@@ -174,6 +240,17 @@ function defaultPythonPath(): string | undefined {
 
 function buildPythonEnv(): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...process.env };
+  const appDir = findKicadAppImageDir();
+
+  if (appDir) {
+    env.KICAD_APPDIR = appDir;
+    delete env.PYTHONPATH;
+    delete env.PYTHONHOME;
+    delete env.LD_LIBRARY_PATH;
+    delete env.LD_PRELOAD;
+    return env;
+  }
+
   const fallbackPythonPath = defaultPythonPath();
   if (fallbackPythonPath && !env.PYTHONPATH) {
     env.PYTHONPATH = fallbackPythonPath;
@@ -265,6 +342,7 @@ export class KiCADMcpServer {
     registerBoardResources(this.server, this.callKicadScript.bind(this));
     registerComponentResources(this.server, this.callKicadScript.bind(this));
     registerLibraryResources(this.server, this.callKicadScript.bind(this));
+    registerWorkflowResources(this.server);
 
     // Register all prompts
     registerComponentPrompts(this.server);
@@ -544,6 +622,7 @@ export class KiCADMcpServer {
         "export_pdf",
         "export_3d",
         "sync_schematic_to_board",
+        "validate_schematic_pcb_sync",
       ];
       if (longRunningCommands.includes(command)) {
         commandTimeout = 600000; // 10 minutes for long operations

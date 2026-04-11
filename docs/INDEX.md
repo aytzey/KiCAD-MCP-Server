@@ -14,6 +14,7 @@ KiCAD MCP Server -- AI-assisted PCB design via Model Context Protocol
 | [Client Configuration](CLIENT_CONFIGURATION.md) | MCP client setup (Claude Desktop, Cline, Claude Code)          |
 | [Platform Guide](PLATFORM_GUIDE.md)             | Linux vs Windows vs macOS differences                          |
 | [PCB Design Workflow](PCB_DESIGN_WORKFLOW.md)   | End-to-end design guide from project creation to manufacturing |
+| [Circuit Design Excellence Workflow](CIRCUIT_DESIGN_EXCELLENCE_WORKFLOW.md) | Research-backed rulebook for Claude/Codex circuit design agents |
 
 ---
 
@@ -49,6 +50,7 @@ KiCAD MCP Server -- AI-assisted PCB design via Model Context Protocol
 | [Realtime Workflow](REALTIME_WORKFLOW.md)     | Working with IPC backend for live updates |
 | [Visual Feedback](VISUAL_FEEDBACK.md)         | UI visual feedback guide                  |
 | [UI Auto Launch](UI_AUTO_LAUNCH.md)           | Automatic KiCAD UI launch feature         |
+| [Circuit Design Excellence Workflow](CIRCUIT_DESIGN_EXCELLENCE_WORKFLOW.md) | Prompt/resource workflow for fabrication-quality designs |
 | [Router Guide](mcp-router-guide.md)           | Tool router pattern usage                 |
 | [Router Architecture](ROUTER_ARCHITECTURE.md) | Router pattern design                     |
 | [Router Quick Start](ROUTER_QUICK_START.md)   | Quick start for the router pattern        |

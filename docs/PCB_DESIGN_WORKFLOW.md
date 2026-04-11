@@ -14,6 +14,8 @@ Project Setup -> Schematic Design -> PCB Layout -> Verification -> Manufacturing
 
 Each stage maps to specific MCP tools. You can ask your AI assistant to perform any of these steps using natural language.
 
+For fabrication-quality work, start from the `circuit_design_excellence_workflow` prompt or load the `kicad://workflow/circuit-design-excellence` resource. That workflow makes the agent treat the schematic as the source of truth, requires component sourcing and calculations before schematic capture, and requires ERC, schematic/PCB sync validation, DRC, and BOM/export gates before calling a design complete.
+
 ---
 
 ## Stage 1: Project Setup
@@ -106,6 +108,8 @@ Sync the schematic to the board.
 ```
 
 **Tool:** `sync_schematic_to_board` -- imports all component footprints and net assignments from the schematic into the PCB (equivalent to pressing F8 in KiCAD)
+
+**Guardrail:** Run `validate_schematic_pcb_sync` after every sync and after any footprint/net-affecting PCB edit. The PCB must be treated as the physical view of the schematic, not as an independent design database.
 
 ### Place Components
 

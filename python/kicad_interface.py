@@ -14,6 +14,7 @@ import os
 import re
 import sys
 import traceback
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from resources.resource_definitions import RESOURCE_DEFINITIONS, handle_resource_read
@@ -425,12 +426,14 @@ class KiCADInterface:
             "run_erc": self.schematic_handlers.run_erc,
             "generate_netlist": self.schematic_handlers.generate_netlist,
             "sync_schematic_to_board": self._handle_sync_schematic_to_board,
+            "validate_schematic_pcb_sync": self._handle_validate_schematic_pcb_sync,
             "list_schematic_libraries": self.schematic_handlers.list_schematic_libraries,
             "get_schematic_view": self.schematic_handlers.get_schematic_view,
             "list_schematic_components": self.schematic_handlers.list_schematic_components,
             "list_schematic_nets": self.schematic_handlers.list_schematic_nets,
             "list_schematic_wires": self.schematic_handlers.list_schematic_wires,
             "list_schematic_labels": self.schematic_handlers.list_schematic_labels,
+            "polish_schematic_readability": self.schematic_handlers.polish_schematic_readability,
             "move_schematic_component": self.schematic_handlers.move_schematic_component,
             "rotate_schematic_component": self.schematic_handlers.rotate_schematic_component,
             "annotate_schematic": self.schematic_handlers.annotate_schematic,
@@ -2541,6 +2544,308 @@ class KiCADInterface:
 
         except Exception as e:
             logger.error(f"Error in sync_schematic_to_board: {e}")
+            import traceback
+
+            logger.error(traceback.format_exc())
+            return {"success": False, "message": str(e)}
+
+    def _canonical_net_name(self, net_name: str) -> str:
+        """Normalize root-sheet KiCad net names for schematic-vs-PCB comparisons."""
+        name = (net_name or "").strip()
+        if name.startswith("/") and name.count("/") == 1:
+            return name[1:]
+        return name
+
+    def _symbol_value(self, form: list, key: str, default: str = "") -> str:
+        import sexpdata
+
+        for item in form[1:]:
+            if (
+                isinstance(item, list)
+                and item
+                and isinstance(item[0], sexpdata.Symbol)
+                and item[0].value() == key
+            ):
+                return str(item[1]) if len(item) > 1 else default
+        return default
+
+    def _parse_kicad_cli_netlist(self, netlist_path: Path) -> Dict[str, Any]:
+        """Parse kicad-cli S-expression netlist into components and pad-net maps."""
+        import sexpdata
+
+        data = sexpdata.loads(netlist_path.read_text(encoding="utf-8"))
+        components: Dict[str, Dict[str, str]] = {}
+        pad_net_map: Dict[Tuple[str, str], str] = {}
+
+        for section in data:
+            if (
+                not isinstance(section, list)
+                or not section
+                or not isinstance(section[0], sexpdata.Symbol)
+            ):
+                continue
+
+            if section[0].value() == "components":
+                for comp in section[1:]:
+                    if (
+                        not isinstance(comp, list)
+                        or not comp
+                        or not isinstance(comp[0], sexpdata.Symbol)
+                        or comp[0].value() != "comp"
+                    ):
+                        continue
+                    ref = self._symbol_value(comp, "ref")
+                    if not ref:
+                        continue
+                    components[ref] = {
+                        "value": self._symbol_value(comp, "value"),
+                        "footprint": self._symbol_value(comp, "footprint"),
+                    }
+
+            elif section[0].value() == "nets":
+                for net in section[1:]:
+                    if (
+                        not isinstance(net, list)
+                        or not net
+                        or not isinstance(net[0], sexpdata.Symbol)
+                        or net[0].value() != "net"
+                    ):
+                        continue
+                    net_name = self._canonical_net_name(self._symbol_value(net, "name"))
+                    for node in net[1:]:
+                        if (
+                            not isinstance(node, list)
+                            or not node
+                            or not isinstance(node[0], sexpdata.Symbol)
+                            or node[0].value() != "node"
+                        ):
+                            continue
+                        ref = self._symbol_value(node, "ref")
+                        pin = self._symbol_value(node, "pin")
+                        if ref and pin:
+                            pad_net_map[(ref, str(pin))] = net_name
+
+        return {"components": components, "pad_net_map": pad_net_map}
+
+    def _is_ignored_board_footprint(
+        self,
+        footprint,
+        ignore_refs: Set[str],
+        ignore_prefixes: Tuple[str, ...],
+        ignore_mechanical: bool,
+    ) -> bool:
+        ref = footprint.GetReference()
+        if ref in ignore_refs or any(ref.startswith(prefix) for prefix in ignore_prefixes):
+            return True
+
+        if not ignore_mechanical:
+            return False
+
+        if re.match(r"^(MH|H|FID)\d*$", ref, re.IGNORECASE):
+            return True
+
+        pads = list(footprint.Pads())
+        if pads and all(not str(pad.GetNumber()) and not pad.GetNetname() for pad in pads):
+            return True
+
+        return False
+
+    def _handle_validate_schematic_pcb_sync(self, params):
+        """Validate that the PCB footprints and pad nets match the schematic netlist."""
+        logger.info("Validating schematic/PCB sync")
+        try:
+            import subprocess
+            import tempfile
+            from pathlib import Path
+
+            schematic_path = params.get("schematicPath")
+            board_path = params.get("boardPath")
+
+            if not board_path:
+                if self.board:
+                    board_path = self.board.GetFileName()
+                else:
+                    return {
+                        "success": False,
+                        "message": "No board loaded. Provide boardPath or open a project first.",
+                    }
+
+            board_file = Path(board_path)
+            if not board_file.exists():
+                return {"success": False, "message": f"Board not found: {board_file}"}
+
+            if not schematic_path:
+                candidate = board_file.with_suffix(".kicad_sch")
+                schematic_path = str(candidate) if candidate.exists() else None
+
+            if not schematic_path or not Path(schematic_path).exists():
+                return {
+                    "success": False,
+                    "message": f"Schematic not found. Provide schematicPath. Tried: {schematic_path}",
+                }
+
+            kicad_cli = self.design_rule_commands._find_kicad_cli()
+            if not kicad_cli:
+                return {"success": False, "message": "kicad-cli not found in PATH"}
+
+            with tempfile.NamedTemporaryFile(suffix=".net", delete=False) as tmp:
+                netlist_path = Path(tmp.name)
+
+            result = subprocess.run(
+                [
+                    kicad_cli,
+                    "sch",
+                    "export",
+                    "netlist",
+                    str(schematic_path),
+                    "-o",
+                    str(netlist_path),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            if result.returncode != 0:
+                return {
+                    "success": False,
+                    "message": f"kicad-cli netlist export failed: {result.stderr}",
+                }
+
+            parsed = self._parse_kicad_cli_netlist(netlist_path)
+            try:
+                netlist_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+            schematic_components = {
+                ref: info
+                for ref, info in parsed["components"].items()
+                if ref
+                and not ref.startswith("#")
+                and not ref.startswith("_TEMPLATE")
+                and info.get("footprint")
+            }
+            schematic_pad_nets = {
+                (ref, pin): net
+                for (ref, pin), net in parsed["pad_net_map"].items()
+                if ref in schematic_components
+            }
+
+            board = pcbnew.LoadBoard(str(board_file))
+            ignore_refs = set(params.get("ignoreReferences", []))
+            ignore_prefixes = tuple(params.get("ignoreReferencePrefixes", []))
+            ignore_mechanical = params.get("ignoreMechanicalFootprints", True)
+            compare_footprints = params.get("compareFootprints", True)
+
+            board_footprints = {}
+            for footprint in board.GetFootprints():
+                if self._is_ignored_board_footprint(
+                    footprint, ignore_refs, ignore_prefixes, ignore_mechanical
+                ):
+                    continue
+                ref = footprint.GetReference()
+                board_footprints[ref] = footprint
+
+            schematic_refs = set(schematic_components)
+            board_refs = set(board_footprints)
+            missing_footprints = sorted(schematic_refs - board_refs, key=self._reference_sort_key)
+            extra_footprints = sorted(board_refs - schematic_refs, key=self._reference_sort_key)
+
+            footprint_mismatches = []
+            if compare_footprints:
+                for ref in sorted(schematic_refs & board_refs, key=self._reference_sort_key):
+                    schematic_fp = schematic_components[ref].get("footprint", "")
+                    fp_id = board_footprints[ref].GetFPID()
+                    board_fp = f"{fp_id.GetLibNickname()}:{fp_id.GetLibItemName()}"
+                    if schematic_fp != board_fp:
+                        footprint_mismatches.append(
+                            {
+                                "reference": ref,
+                                "schematicFootprint": schematic_fp,
+                                "boardFootprint": board_fp,
+                            }
+                        )
+
+            board_pad_nets = {}
+            missing_pads = []
+            for ref, footprint in board_footprints.items():
+                for pad in footprint.Pads():
+                    pin = str(pad.GetNumber())
+                    if not pin:
+                        continue
+                    board_pad_nets[(ref, pin)] = self._canonical_net_name(pad.GetNetname())
+
+            pad_net_mismatches = []
+            for key, schematic_net in sorted(
+                schematic_pad_nets.items(),
+                key=lambda item: (self._reference_sort_key(item[0][0]), item[0][1]),
+            ):
+                ref, pin = key
+                if ref not in board_footprints:
+                    continue
+                if key not in board_pad_nets:
+                    missing_pads.append({"reference": ref, "pin": pin, "schematicNet": schematic_net})
+                    continue
+                board_net = board_pad_nets[key]
+                if board_net != schematic_net:
+                    pad_net_mismatches.append(
+                        {
+                            "reference": ref,
+                            "pin": pin,
+                            "schematicNet": schematic_net,
+                            "boardNet": board_net,
+                        }
+                    )
+
+            extra_assigned_pads = []
+            for (ref, pin), board_net in sorted(
+                board_pad_nets.items(), key=lambda item: (self._reference_sort_key(item[0][0]), item[0][1])
+            ):
+                if ref in schematic_refs and (ref, pin) not in schematic_pad_nets and board_net:
+                    extra_assigned_pads.append(
+                        {"reference": ref, "pin": pin, "boardNet": board_net}
+                    )
+
+            issue_count = (
+                len(missing_footprints)
+                + len(extra_footprints)
+                + len(footprint_mismatches)
+                + len(missing_pads)
+                + len(pad_net_mismatches)
+                + len(extra_assigned_pads)
+            )
+
+            return {
+                "success": True,
+                "inSync": issue_count == 0,
+                "message": (
+                    "Schematic and PCB are in sync."
+                    if issue_count == 0
+                    else f"Schematic/PCB sync check found {issue_count} issue(s)."
+                ),
+                "summary": {
+                    "schematicFootprints": len(schematic_refs),
+                    "boardFootprints": len(board_refs),
+                    "schematicPadNets": len(schematic_pad_nets),
+                    "boardPadNets": len(board_pad_nets),
+                    "missingFootprints": len(missing_footprints),
+                    "extraFootprints": len(extra_footprints),
+                    "footprintMismatches": len(footprint_mismatches),
+                    "missingPads": len(missing_pads),
+                    "padNetMismatches": len(pad_net_mismatches),
+                    "extraAssignedPads": len(extra_assigned_pads),
+                },
+                "missingFootprints": missing_footprints,
+                "extraFootprints": extra_footprints,
+                "footprintMismatches": footprint_mismatches,
+                "missingPads": missing_pads,
+                "padNetMismatches": pad_net_mismatches,
+                "extraAssignedPads": extra_assigned_pads,
+                "ignoredMechanicalFootprints": ignore_mechanical,
+            }
+
+        except Exception as e:
+            logger.error(f"Error validating schematic/PCB sync: {e}")
             import traceback
 
             logger.error(traceback.format_exc())

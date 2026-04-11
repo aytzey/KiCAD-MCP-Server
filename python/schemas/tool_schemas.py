@@ -1972,6 +1972,42 @@ SCHEMATIC_TOOLS = [
         },
     },
     {
+        "name": "validate_schematic_pcb_sync",
+        "title": "Validate Schematic/PCB Sync",
+        "description": "Checks that the PCB is a faithful physical view of the schematic: schematic footprints exist on the PCB, relevant PCB footprints exist in the schematic, and each PCB pad net matches the schematic netlist.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "schematicPath": {
+                    "type": "string",
+                    "description": "Path to .kicad_sch file. If omitted, auto-detected from boardPath.",
+                },
+                "boardPath": {
+                    "type": "string",
+                    "description": "Path to .kicad_pcb file. If omitted, uses currently loaded board.",
+                },
+                "ignoreMechanicalFootprints": {
+                    "type": "boolean",
+                    "description": "Ignore mechanical-only PCB footprints such as mounting holes and fiducials (default: true).",
+                },
+                "ignoreReferences": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Specific PCB references to ignore during comparison.",
+                },
+                "ignoreReferencePrefixes": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "PCB reference prefixes to ignore during comparison.",
+                },
+                "compareFootprints": {
+                    "type": "boolean",
+                    "description": "Also compare schematic footprint IDs against PCB footprint IDs (default: true).",
+                },
+            },
+        },
+    },
+    {
         "name": "generate_netlist",
         "title": "Generate Netlist",
         "description": "Generates a netlist from the schematic showing all components and their net connections.",

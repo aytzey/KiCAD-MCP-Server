@@ -165,6 +165,22 @@ class TestDetectPlatform:
 class TestKiCADPathDetection:
     """Tests that require KiCAD to be installed"""
 
+    def test_linux_appimage_python_path_is_prioritized(self, monkeypatch, tmp_path):
+        """KiCad AppImage path should come before system paths on Linux."""
+        appdir = tmp_path / "AppDir"
+        dist_packages = appdir / "shared" / "lib" / "python3.11" / "dist-packages"
+        dist_packages.mkdir(parents=True)
+
+        monkeypatch.setenv("KICAD_APPDIR", str(appdir))
+        monkeypatch.setattr(PlatformHelper, "is_linux", staticmethod(lambda: True))
+        monkeypatch.setattr(PlatformHelper, "is_windows", staticmethod(lambda: False))
+        monkeypatch.setattr(PlatformHelper, "is_macos", staticmethod(lambda: False))
+
+        paths = PlatformHelper.get_kicad_python_paths()
+
+        assert paths
+        assert paths[0] == dist_packages
+
     def test_kicad_python_paths_exist(self):
         """Test that at least one KiCAD Python path exists (if KiCAD is installed)"""
         paths = PlatformHelper.get_kicad_python_paths()
