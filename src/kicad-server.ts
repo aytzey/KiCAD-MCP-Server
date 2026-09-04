@@ -1,9 +1,9 @@
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { spawn, ChildProcess } from "child_process";
 import { existsSync } from "fs";
+import { fileURLToPath } from "url";
 import path from "path";
 
 // Import all tool definitions for reference
@@ -24,8 +24,9 @@ class KiCADServer {
 
   constructor() {
     // Set absolute path to the Python KiCAD interface script
-    // Using a hardcoded path to avoid cwd() issues when running from Cline
-    this.kicadScriptPath = "c:/repo/KiCAD-MCP/python/kicad_interface.py";
+    this.kicadScriptPath =
+      process.env.KICAD_SCRIPT_PATH ||
+      path.join(path.dirname(fileURLToPath(import.meta.url)), "../python/kicad_interface.py");
 
     // Check if script exists
     if (!existsSync(this.kicadScriptPath)) {
@@ -36,7 +37,7 @@ class KiCADServer {
     this.server = new Server(
       {
         name: "kicad-mcp-server",
-        version: "1.0.0",
+        version: "2.4.0",
       },
       {
         capabilities: {
@@ -306,14 +307,13 @@ class KiCADServer {
 
       // Start the Python process for KiCAD scripting
       console.error(`Starting Python process with script: ${this.kicadScriptPath}`);
-      const pythonExe = "C:\\Program Files\\KiCad\\9.0\\bin\\python.exe";
+      const pythonExe = process.env.KICAD_PYTHON || "python3";
 
       console.error(`Using Python executable: ${pythonExe}`);
       this.pythonProcess = spawn(pythonExe, [this.kicadScriptPath], {
         stdio: ["pipe", "pipe", "pipe"],
         env: {
           ...process.env,
-          PYTHONPATH: "C:/Program Files/KiCad/9.0/lib/python3/dist-packages",
         },
       });
 
@@ -436,6 +436,7 @@ class KiCADServer {
             }
 
             // Resolve with the expected MCP tool response format
+            clearTimeout(timeout);
             if (result.success) {
               resolve({
                 content: [
@@ -456,7 +457,7 @@ class KiCADServer {
                 isError: true,
               });
             }
-          } catch (e) {
+          } catch {
             // Not a complete JSON yet, keep collecting data
           }
         });

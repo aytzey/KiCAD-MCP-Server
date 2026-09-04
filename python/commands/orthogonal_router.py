@@ -29,6 +29,7 @@ Point = Tuple[float, float]
 Rect = Tuple[float, float, float, float]
 
 _EPSILON = 1e-6
+_MAX_GRID_POINTS = 10_000
 
 
 def normalize_rect(rect: Rect) -> Rect:
@@ -203,7 +204,9 @@ def compress_path(points: Iterable[Point], eps: float = _EPSILON) -> List[Point]
             prev_point = compressed[-1]
             point = result[i]
             next_point = result[i + 1]
-            if segment_direction(prev_point, point, eps) == segment_direction(point, next_point, eps):
+            if segment_direction(prev_point, point, eps) == segment_direction(
+                point, next_point, eps
+            ):
                 changed = True
                 continue
             compressed.append(point)
@@ -301,6 +304,59 @@ def _build_hanan_grid(
     return xs_sorted, ys_sorted
 
 
+def _sample_axis(values: Sequence[float], required: Iterable[float], limit: int) -> List[float]:
+    """Deterministically sample one grid axis while retaining terminal lines."""
+    required_values = sorted(set(round(value, 6) for value in required))
+    if len(values) <= limit:
+        return list(values)
+    if len(required_values) > limit:
+        return required_values[:limit]
+
+    required_set = set(required_values)
+    candidates = [value for value in values if value not in required_set]
+    slots = limit - len(required_values)
+    if slots <= 0 or not candidates:
+        return required_values
+    if slots == 1:
+        selected = [candidates[len(candidates) // 2]]
+    else:
+        selected = [
+            candidates[round(index * (len(candidates) - 1) / (slots - 1))] for index in range(slots)
+        ]
+    return sorted(set([*required_values, *selected]))
+
+
+def _coarsen_hanan_grid(
+    xs: Sequence[float],
+    ys: Sequence[float],
+    start: Point,
+    end: Point,
+    max_points: int = _MAX_GRID_POINTS,
+) -> Tuple[List[float], List[float]]:
+    """Bound a dense Cartesian Hanan grid without dropping its terminals."""
+    if len(xs) * len(ys) <= max_points:
+        return list(xs), list(ys)
+
+    x_required = {start[0], end[0]}
+    y_required = {start[1], end[1]}
+    ratio = len(xs) / max(len(ys), 1)
+    x_limit = min(len(xs), max(len(x_required), int(math.sqrt(max_points * ratio))))
+    y_limit = min(len(ys), max(len(y_required), max_points // max(x_limit, 1)))
+
+    while x_limit * y_limit > max_points:
+        if x_limit > len(x_required) and x_limit >= y_limit:
+            x_limit -= 1
+        elif y_limit > len(y_required):
+            y_limit -= 1
+        else:
+            break
+
+    return (
+        _sample_axis(xs, x_required, x_limit),
+        _sample_axis(ys, y_required, y_limit),
+    )
+
+
 def estimate_congestion(
     point: Point,
     existing_tracks: Optional[Sequence[Tuple[Point, Point]]] = None,
@@ -390,20 +446,24 @@ def plan_orthogonal_path(
     )
 
     # Cap grid size to avoid combinatorial explosion on dense boards
-    _MAX_GRID_POINTS = 10_000
     if len(xs_list) * len(ys_list) > _MAX_GRID_POINTS:
         # Fall back to raw Hanan grid without midpoints
         xs_list, ys_list = _build_hanan_grid(
-            [start, end], rects,
-            extra_xs=extra_xs, extra_ys=extra_ys,
+            [start, end],
+            rects,
+            extra_xs=extra_xs,
+            extra_ys=extra_ys,
             midpoint_density=0,
         )
+    if len(xs_list) * len(ys_list) > _MAX_GRID_POINTS:
+        xs_list, ys_list = _coarsen_hanan_grid(xs_list, ys_list, start, end)
 
     valid_nodes = {
         (x, y)
         for x in xs_list
         for y in ys_list
-        if (x, y) in (start, end) or not any(point_in_rect((x, y), rect, strict=True) for rect in rects)
+        if (x, y) in (start, end)
+        or not any(point_in_rect((x, y), rect, strict=True) for rect in rects)
     }
 
     adjacency: Dict[Point, List[Point]] = {node: [] for node in valid_nodes}
@@ -429,22 +489,32 @@ def plan_orthogonal_path(
     _pad_pts: List[Point] = []
     if pad_repulsion > 0 and pad_centers:
         _pad_pts = [round_point(p) for p in pad_centers if round_point(p) not in (start, end)]
+    pad_costs: Dict[Point, float] = {}
 
     def _pad_cost(pt: Point) -> float:
         """Pad-away regularisation: λ_g / min_p d(x, p)."""
         if not _pad_pts or pad_repulsion <= 0:
             return 0.0
+        if pt in pad_costs:
+            return pad_costs[pt]
         min_d = min(manhattan_distance(pt, p) for p in _pad_pts)
         if min_d < _EPSILON:
-            return pad_repulsion * 100.0  # very close to pad — heavy penalty
-        return pad_repulsion / min_d
+            cost = pad_repulsion * 100.0
+        else:
+            cost = pad_repulsion / min_d
+        pad_costs[pt] = cost
+        return cost
+
+    congestion_costs: Dict[Point, float] = {}
 
     def _congestion_cost(pt: Point) -> float:
         """Congestion penalty: λ_c · density(cell)."""
         if congestion_weight <= 0 or not existing_tracks:
             return 0.0
-        density = estimate_congestion(pt, existing_tracks, congestion_cell_size)
-        return congestion_weight * density
+        if pt not in congestion_costs:
+            density = estimate_congestion(pt, existing_tracks, congestion_cell_size)
+            congestion_costs[pt] = congestion_weight * density
+        return congestion_costs[pt]
 
     # A* with directional state for accurate bend accounting
     queue: List[Tuple[float, float, Point, Optional[str]]] = [
@@ -519,7 +589,9 @@ def plan_steiner_tree(
         return None
     if len(terminals) == 2:
         path = plan_orthogonal_path(
-            terminals[0], terminals[1], obstacles,
+            terminals[0],
+            terminals[1],
+            obstacles,
             bend_penalty=bend_penalty,
             pad_repulsion=pad_repulsion,
             pad_centers=pad_centers,
@@ -565,7 +637,9 @@ def plan_steiner_tree(
 
     for u, v in mst_edges:
         path = plan_orthogonal_path(
-            terms[u], terms[v], obstacle_list,
+            terms[u],
+            terms[v],
+            obstacle_list,
             bend_penalty=bend_penalty,
             pad_repulsion=pad_repulsion,
             pad_centers=pad_centers,

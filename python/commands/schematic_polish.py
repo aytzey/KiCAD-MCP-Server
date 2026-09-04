@@ -15,7 +15,6 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Set
 import sexpdata
 from sexpdata import Symbol
 
-
 DEFAULT_KEEP_LABELS: Set[str] = {
     "+3V3",
     "+5V",

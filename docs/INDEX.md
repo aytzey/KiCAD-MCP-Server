@@ -2,19 +2,19 @@
 
 KiCAD MCP Server -- AI-assisted PCB design via Model Context Protocol
 
-**Version:** 2.2.3 | **Tools:** 122 | **Last Updated:** 2026-03-21
+**Version:** 2.7.0 | **Tools:** 182 | **Last Updated:** 2026-09-04
 
 ---
 
 ## Getting Started
 
-| Document                                        | Description                                                    |
-| ----------------------------------------------- | -------------------------------------------------------------- |
-| [README](../README.md)                          | Project overview, installation, configuration, quick start     |
-| [Client Configuration](CLIENT_CONFIGURATION.md) | MCP client setup (Claude Desktop, Cline, Claude Code)          |
-| [Platform Guide](PLATFORM_GUIDE.md)             | Linux vs Windows vs macOS differences                          |
-| [PCB Design Workflow](PCB_DESIGN_WORKFLOW.md)   | End-to-end design guide from project creation to manufacturing |
-| [Circuit Design Excellence Workflow](CIRCUIT_DESIGN_EXCELLENCE_WORKFLOW.md) | Research-backed rulebook for Claude/Codex circuit design agents |
+| Document                                                        | Description                                                           |
+| --------------------------------------------------------------- | --------------------------------------------------------------------- |
+| [README](../README.md)                                          | Project overview, installation, configuration, quick start            |
+| [Client Configuration](CLIENT_CONFIGURATION.md)                 | MCP client setup (Claude Desktop, Cline, Claude Code)                 |
+| [Platform Guide](PLATFORM_GUIDE.md)                             | Linux vs Windows vs macOS differences                                 |
+| [PCB Design Workflow](PCB_DESIGN_WORKFLOW.md)                   | End-to-end design guide from project creation to manufacturing        |
+| [Production-Ready Two-Layer PCB](MANUFACTURING_READY_2LAYER.md) | Placement, routing, readiness gates, and fabrication package workflow |
 
 ---
 
@@ -22,7 +22,7 @@ KiCAD MCP Server -- AI-assisted PCB design via Model Context Protocol
 
 | Document                                                                | Description                                                 |
 | ----------------------------------------------------------------------- | ----------------------------------------------------------- |
-| [Tool Inventory](TOOL_INVENTORY.md)                                     | Complete list of all 122 tools with access types            |
+| [Tool Inventory](TOOL_INVENTORY.md)                                     | Tool catalog, registry totals, and access types             |
 | [Schematic Tools Reference](SCHEMATIC_TOOLS_REFERENCE.md)               | 27 schematic tools -- components, wiring, analysis, export  |
 | [Routing Tools Reference](ROUTING_TOOLS_REFERENCE.md)                   | 13 routing tools -- traces, vias, differential pairs, zones |
 | [Footprint and Symbol Creator Guide](FOOTPRINT_SYMBOL_CREATOR_GUIDE.md) | 8 tools for creating custom footprints and symbols          |
@@ -45,15 +45,15 @@ KiCAD MCP Server -- AI-assisted PCB design via Model Context Protocol
 
 ## Workflows
 
-| Document                                      | Description                               |
-| --------------------------------------------- | ----------------------------------------- |
-| [Realtime Workflow](REALTIME_WORKFLOW.md)     | Working with IPC backend for live updates |
-| [Visual Feedback](VISUAL_FEEDBACK.md)         | UI visual feedback guide                  |
-| [UI Auto Launch](UI_AUTO_LAUNCH.md)           | Automatic KiCAD UI launch feature         |
-| [Circuit Design Excellence Workflow](CIRCUIT_DESIGN_EXCELLENCE_WORKFLOW.md) | Prompt/resource workflow for fabrication-quality designs |
-| [Router Guide](mcp-router-guide.md)           | Tool router pattern usage                 |
-| [Router Architecture](ROUTER_ARCHITECTURE.md) | Router pattern design                     |
-| [Router Quick Start](ROUTER_QUICK_START.md)   | Quick start for the router pattern        |
+| Document                                      | Description                                                                                 |
+| --------------------------------------------- | ------------------------------------------------------------------------------------------- |
+| [Realtime Workflow](REALTIME_WORKFLOW.md)     | Working with IPC backend for live updates                                                   |
+| [Headless Authoring](HEADLESS_AUTHORING.md)   | Driving the server without the KiCad GUI: build recipe, ERC triage, verification discipline |
+| [Visual Feedback](VISUAL_FEEDBACK.md)         | UI visual feedback guide                                                                    |
+| [UI Auto Launch](UI_AUTO_LAUNCH.md)           | Automatic KiCAD UI launch feature                                                           |
+| [Router Guide](mcp-router-guide.md)           | Tool router pattern usage                                                                   |
+| [Router Architecture](ROUTER_ARCHITECTURE.md) | Router pattern design                                                                       |
+| [Router Quick Start](ROUTER_QUICK_START.md)   | Quick start for the router pattern                                                          |
 
 ---
 

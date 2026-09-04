@@ -7,6 +7,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { logger } from "../logger.js";
+import { formatKicadResult } from "./tool-response.js";
 
 // Command function type for KiCAD script calls
 type CommandFunction = (command: string, params: Record<string, unknown>) => Promise<any>;
@@ -25,6 +26,7 @@ export function registerDesignRuleTools(server: McpServer, callKicadScript: Comm
   // ------------------------------------------------------
   server.tool(
     "set_design_rules",
+    "Configure PCB design rules: clearance, track width, via dimensions and courtyard requirements.",
     {
       clearance: z.number().optional().describe("Minimum clearance between copper items (mm)"),
       trackWidth: z.number().optional().describe("Default track width (mm)"),
@@ -51,39 +53,31 @@ export function registerDesignRuleTools(server: McpServer, callKicadScript: Comm
       logger.debug("Setting design rules");
       const result = await callKicadScript("set_design_rules", params);
 
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(result),
-          },
-        ],
-      };
+      return formatKicadResult(result);
     },
   );
 
   // ------------------------------------------------------
   // Get Design Rules Tool
   // ------------------------------------------------------
-  server.tool("get_design_rules", {}, async () => {
-    logger.debug("Getting design rules");
-    const result = await callKicadScript("get_design_rules", {});
+  server.tool(
+    "get_design_rules",
+    "Return the current PCB design rules (clearance, track width, via sizes, courtyard settings).",
+    {},
+    async () => {
+      logger.debug("Getting design rules");
+      const result = await callKicadScript("get_design_rules", {});
 
-    return {
-      content: [
-        {
-          type: "text",
-          text: JSON.stringify(result),
-        },
-      ],
-    };
-  });
+      return formatKicadResult(result);
+    },
+  );
 
   // ------------------------------------------------------
   // Run DRC Tool
   // ------------------------------------------------------
   server.tool(
     "run_drc",
+    "Run the KiCAD Design Rule Check (DRC) on the current PCB and return violations. Optionally save the report to a file.",
     {
       reportPath: z.string().optional().describe("Optional path to save the DRC report"),
     },
@@ -91,77 +85,7 @@ export function registerDesignRuleTools(server: McpServer, callKicadScript: Comm
       logger.debug("Running DRC check");
       const result = await callKicadScript("run_drc", { reportPath });
 
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(result),
-          },
-        ],
-      };
-    },
-  );
-
-  // ------------------------------------------------------
-  // Add Net Class Tool
-  // ------------------------------------------------------
-  server.tool(
-    "add_net_class",
-    {
-      name: z.string().describe("Name of the net class"),
-      description: z.string().optional().describe("Optional description of the net class"),
-      clearance: z.number().describe("Clearance for this net class (mm)"),
-      trackWidth: z.number().describe("Track width for this net class (mm)"),
-      viaDiameter: z.number().describe("Via diameter for this net class (mm)"),
-      viaDrill: z.number().describe("Via drill size for this net class (mm)"),
-      uvia_diameter: z.number().optional().describe("Micro via diameter for this net class (mm)"),
-      uvia_drill: z.number().optional().describe("Micro via drill size for this net class (mm)"),
-      diff_pair_width: z
-        .number()
-        .optional()
-        .describe("Differential pair width for this net class (mm)"),
-      diff_pair_gap: z
-        .number()
-        .optional()
-        .describe("Differential pair gap for this net class (mm)"),
-      nets: z.array(z.string()).optional().describe("Array of net names to assign to this class"),
-    },
-    async ({
-      name,
-      description,
-      clearance,
-      trackWidth,
-      viaDiameter,
-      viaDrill,
-      uvia_diameter,
-      uvia_drill,
-      diff_pair_width,
-      diff_pair_gap,
-      nets,
-    }) => {
-      logger.debug(`Adding net class: ${name}`);
-      const result = await callKicadScript("add_net_class", {
-        name,
-        description,
-        clearance,
-        trackWidth,
-        viaDiameter,
-        viaDrill,
-        uvia_diameter,
-        uvia_drill,
-        diff_pair_width,
-        diff_pair_gap,
-        nets,
-      });
-
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(result),
-          },
-        ],
-      };
+      return formatKicadResult(result);
     },
   );
 
@@ -170,6 +94,7 @@ export function registerDesignRuleTools(server: McpServer, callKicadScript: Comm
   // ------------------------------------------------------
   server.tool(
     "assign_net_to_class",
+    "Assign a net to an existing net class to apply its specific design rules.",
     {
       net: z.string().describe("Name of the net"),
       netClass: z.string().describe("Name of the net class"),
@@ -181,14 +106,7 @@ export function registerDesignRuleTools(server: McpServer, callKicadScript: Comm
         netClass,
       });
 
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(result),
-          },
-        ],
-      };
+      return formatKicadResult(result);
     },
   );
 
@@ -197,6 +115,7 @@ export function registerDesignRuleTools(server: McpServer, callKicadScript: Comm
   // ------------------------------------------------------
   server.tool(
     "set_layer_constraints",
+    "Set per-layer design rule constraints (minimum track width, clearance and via dimensions).",
     {
       layer: z.string().describe("Layer name (e.g., 'F.Cu')"),
       minTrackWidth: z.number().optional().describe("Minimum track width for this layer (mm)"),
@@ -214,14 +133,7 @@ export function registerDesignRuleTools(server: McpServer, callKicadScript: Comm
         minViaDrill,
       });
 
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(result),
-          },
-        ],
-      };
+      return formatKicadResult(result);
     },
   );
 
@@ -230,6 +142,7 @@ export function registerDesignRuleTools(server: McpServer, callKicadScript: Comm
   // ------------------------------------------------------
   server.tool(
     "check_clearance",
+    "Check the actual clearance between two PCB items (track, via, pad, zone or component) and report whether it meets the design rules.",
     {
       item1: z
         .object({
@@ -242,7 +155,7 @@ export function registerDesignRuleTools(server: McpServer, callKicadScript: Comm
             .object({
               x: z.number().optional(),
               y: z.number().optional(),
-              unit: z.enum(["mm", "inch"]).optional(),
+              unit: z.enum(["mm", "mil", "inch"]).optional(),
             })
             .optional()
             .describe("Position to check (if ID not provided)"),
@@ -259,7 +172,7 @@ export function registerDesignRuleTools(server: McpServer, callKicadScript: Comm
             .object({
               x: z.number().optional(),
               y: z.number().optional(),
-              unit: z.enum(["mm", "inch"]).optional(),
+              unit: z.enum(["mm", "mil", "inch"]).optional(),
             })
             .optional()
             .describe("Position to check (if ID not provided)"),
@@ -273,14 +186,7 @@ export function registerDesignRuleTools(server: McpServer, callKicadScript: Comm
         item2,
       });
 
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(result),
-          },
-        ],
-      };
+      return formatKicadResult(result);
     },
   );
 
@@ -289,6 +195,7 @@ export function registerDesignRuleTools(server: McpServer, callKicadScript: Comm
   // ------------------------------------------------------
   server.tool(
     "get_drc_violations",
+    "Return the list of current DRC violations on the PCB, optionally filtered by severity (error, warning).",
     {
       severity: z
         .enum(["error", "warning", "all"])
@@ -299,14 +206,7 @@ export function registerDesignRuleTools(server: McpServer, callKicadScript: Comm
       logger.debug("Getting DRC violations");
       const result = await callKicadScript("get_drc_violations", { severity });
 
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(result),
-          },
-        ],
-      };
+      return formatKicadResult(result);
     },
   );
 

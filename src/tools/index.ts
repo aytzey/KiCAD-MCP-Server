@@ -17,3 +17,7 @@ export { registerDatasheetTools } from "./datasheet.js";
 export { registerFootprintTools } from "./footprint.js";
 export { registerSymbolCreatorTools } from "./symbol-creator.js";
 export { registerFreeroutingTools } from "./freerouting.js";
+export { registerCFHATools, routingOrchestrationArgs } from "./cfha.js";
+export { registerManufacturingTools } from "./manufacturing.js";
+export { registerPartsRegistryTools } from "./parts-registry.js";
+export { registerValidationTools } from "./validation.js";

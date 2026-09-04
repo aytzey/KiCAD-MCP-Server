@@ -7,12 +7,15 @@ and checking connectivity in KiCad schematic files.
 
 import logging
 import math
+from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import sexpdata
 from commands.pin_locator import PinLocator
+from commands.wire_connectivity import _parse_virtual_connections, _to_iu
 from sexpdata import Symbol
+from skip import Schematic
 
 logger = logging.getLogger("kicad_interface")
 
@@ -308,31 +311,6 @@ def _line_segment_intersects_aabb(
     return True
 
 
-def _point_on_segment(
-    point: Tuple[float, float],
-    start: Tuple[float, float],
-    end: Tuple[float, float],
-    tolerance: float = 0.05,
-) -> bool:
-    """Return True when *point* lies on or very near the segment start→end."""
-    px, py = point
-    x1, y1 = start
-    x2, y2 = end
-    dx = x2 - x1
-    dy = y2 - y1
-    seg_len_sq = dx * dx + dy * dy
-    if seg_len_sq < 1e-12:
-        return math.hypot(px - x1, py - y1) <= tolerance
-
-    t = ((px - x1) * dx + (py - y1) * dy) / seg_len_sq
-    if t < 0.0 or t > 1.0:
-        return False
-
-    proj_x = x1 + t * dx
-    proj_y = y1 + t * dy
-    return math.hypot(px - proj_x, py - proj_y) <= tolerance
-
-
 def _point_in_rect(
     px: float,
     py: float,
@@ -370,8 +348,25 @@ def _transform_local_point(
     mirror_x: bool,
     mirror_y: bool,
 ) -> Tuple[float, float]:
-    """Transform a library-local symbol point into schematic coordinates."""
-    return PinLocator.transform_local_point(lx, ly, sym_x, sym_y, rotation, mirror_x, mirror_y)
+    """
+    Transform a point from local symbol coordinates to absolute schematic
+    coordinates using KiCad's transform order:
+    negate-y (lib y-up → schematic y-down) → mirror → rotate → translate.
+    """
+    # Library symbols use y-up; schematic uses y-down
+    ly = -ly
+
+    # Apply mirroring in local coords
+    if mirror_x:
+        ly = -ly
+    if mirror_y:
+        lx = -lx
+
+    # Apply rotation
+    if rotation != 0:
+        lx, ly = PinLocator.rotate_point(lx, ly, rotation)
+
+    return (sym_x + lx, sym_y + ly)
 
 
 def _compute_symbol_bbox_direct(
@@ -721,78 +716,6 @@ def get_elements_in_region(
 
 
 # ---------------------------------------------------------------------------
-# Tool 5: find_unconnected_pins
-# ---------------------------------------------------------------------------
-
-
-def find_unconnected_pins(schematic_path: Path) -> Dict[str, Any]:
-    """
-    Find symbol pins that are not touched by any wire or label.
-
-    This is intentionally conservative and is used as a fallback ERC signal on
-    KiCad installations whose CLI lacks `sch erc`.
-    """
-    schematic_path = Path(schematic_path)
-    sexp_data = _load_sexp(schematic_path)
-    symbols = _parse_symbols(sexp_data)
-    wires = _parse_wires(sexp_data)
-    labels = _parse_labels(sexp_data)
-    lib_defs = _extract_lib_symbols(sexp_data)
-    pin_tolerance = 0.05
-
-    unconnected: List[Dict[str, Any]] = []
-
-    for sym in symbols:
-        ref = sym["reference"]
-        if not ref or sym["is_power"] or ref.startswith("_TEMPLATE"):
-            continue
-
-        lib_data = lib_defs.get(sym["lib_id"], {})
-        pin_defs = lib_data.get("pins", {})
-        if not pin_defs:
-            continue
-
-        pin_positions = _compute_pin_positions_direct(sym, pin_defs)
-        for pin_num, pin_xy in pin_positions.items():
-            is_connected = False
-
-            for wire in wires:
-                if (
-                    _point_on_segment(tuple(pin_xy), wire["start"], wire["end"], tolerance=pin_tolerance)
-                    or math.hypot(pin_xy[0] - wire["start"][0], pin_xy[1] - wire["start"][1]) <= pin_tolerance
-                    or math.hypot(pin_xy[0] - wire["end"][0], pin_xy[1] - wire["end"][1]) <= pin_tolerance
-                ):
-                    is_connected = True
-                    break
-
-            if not is_connected:
-                for label in labels:
-                    if math.hypot(pin_xy[0] - label["x"], pin_xy[1] - label["y"]) <= pin_tolerance:
-                        is_connected = True
-                        break
-
-            if is_connected:
-                continue
-
-            pin_meta = pin_defs.get(pin_num, {})
-            unconnected.append(
-                {
-                    "reference": ref,
-                    "pin": pin_num,
-                    "pinName": pin_meta.get("name", ""),
-                    "position": {
-                        "x": round(pin_xy[0], 4),
-                        "y": round(pin_xy[1], 4),
-                        "unit": "mm",
-                    },
-                    "libId": sym["lib_id"],
-                }
-            )
-
-    return {"count": len(unconnected), "unconnectedPins": unconnected}
-
-
-# ---------------------------------------------------------------------------
 # Tool 5: check_wire_collisions
 # ---------------------------------------------------------------------------
 
@@ -808,7 +731,7 @@ def _compute_pin_positions_direct(
     lookup in the schematic, so it works correctly when multiple symbols share
     the same reference designator (e.g. unannotated "Q?").
 
-    Uses the same transform as PinLocator so analysis matches KiCad ERC.
+    KiCad transform order: mirror (in local coords) → rotate → translate.
     """
     sym_x = sym["x"]
     sym_y = sym["y"]
@@ -820,16 +743,18 @@ def _compute_pin_positions_direct(
     for pin_num, pin_data in pin_defs.items():
         rel_x = float(pin_data["x"])
         rel_y = float(pin_data["y"])
-        world_x, world_y = PinLocator.transform_local_point(
-            rel_x,
-            rel_y,
-            sym_x,
-            sym_y,
-            rotation,
-            mirror_x,
-            mirror_y,
-        )
-        result[pin_num] = [world_x, world_y]
+
+        # Apply mirroring in local symbol coordinates
+        if mirror_x:
+            rel_y = -rel_y
+        if mirror_y:
+            rel_x = -rel_x
+
+        # Apply symbol rotation
+        if rotation != 0:
+            rel_x, rel_y = PinLocator.rotate_point(rel_x, rel_y, rotation)
+
+        result[pin_num] = [sym_x + rel_x, sym_y + rel_y]
     return result
 
 
@@ -860,7 +785,7 @@ def find_wires_crossing_symbols(schematic_path: Path) -> List[Dict[str, Any]]:
     collisions = []
 
     # Pre-compute per-symbol data
-    symbol_data = []
+    symbol_data: List[Dict[str, Any]] = []
     for sym in symbols:
         ref = sym["reference"]
         if sym["is_power"] or ref.startswith("_TEMPLATE") or not ref:
@@ -952,7 +877,106 @@ def find_wires_crossing_symbols(schematic_path: Path) -> List[Dict[str, Any]]:
     return collisions
 
 
-def check_wire_collisions(schematic_path: Path) -> Dict[str, Any]:
-    """Wrapper used by the handler layer."""
-    collisions = find_wires_crossing_symbols(Path(schematic_path))
-    return {"count": len(collisions), "collisions": collisions}
+def find_orphaned_wires(schematic_path: Path) -> Dict[str, Any]:
+    """
+    Find wire segments with at least one dangling endpoint.
+
+    A wire endpoint is dangling when the IU point at that endpoint satisfies
+    all three conditions simultaneously:
+      1. No other wire shares that IU endpoint (would imply a junction / T-join)
+      2. No component pin is at that IU point
+      3. No net label or power symbol pin is at that IU point
+
+    Uses exact KiCad IU matching (10 000 IU/mm) — same strategy as
+    wire_connectivity.py — to avoid floating-point tolerance issues.
+
+    Returns:
+        {
+            "orphaned_wires": [
+                {
+                    "start": {"x": float, "y": float},
+                    "end":   {"x": float, "y": float},
+                    "dangling_ends": [{"x": float, "y": float}, ...]
+                },
+                ...
+            ],
+            "count": int
+        }
+    """
+    sexp_data = _load_sexp(schematic_path)
+
+    # --- wire endpoints in mm and IU ---
+    wires_mm = _parse_wires(sexp_data)
+    wires_iu: List[Tuple[Tuple[int, int], Tuple[int, int]]] = [
+        (_to_iu(*w["start"]), _to_iu(*w["end"])) for w in wires_mm
+    ]
+
+    # Count how many wires touch each IU endpoint
+    iu_to_count: Dict[Tuple[int, int], int] = defaultdict(int)
+    for s_iu, e_iu in wires_iu:
+        iu_to_count[s_iu] += 1
+        iu_to_count[e_iu] += 1
+
+    # --- anchors: component pins ---
+    pin_iu: Set[Tuple[int, int]] = set()
+    try:
+        from commands.schematic import SchematicLoadError, SchematicManager
+
+        locator = PinLocator()
+        sch = SchematicManager.load_schematic(str(schematic_path))
+        for symbol in sch.symbol:
+            try:
+                if not hasattr(symbol, "property") or not hasattr(symbol.property, "Reference"):
+                    continue
+                ref = symbol.property.Reference.value
+                if ref.startswith("_TEMPLATE"):
+                    continue
+                all_pins = locator.get_all_symbol_pins(schematic_path, ref)
+                for coords in all_pins.values():
+                    pin_iu.add(_to_iu(float(coords[0]), float(coords[1])))
+            except Exception as e:
+                logger.warning(f"Error reading pins for symbol: {e}")
+    except SchematicLoadError:
+        # An unparseable schematic must error, not misreport every wire as
+        # orphaned because no pin anchors could be extracted.
+        raise
+    except Exception as e:
+        logger.warning(f"Could not load schematic via skip for pin extraction: {e}")
+        sch = None
+
+    # --- anchors: net labels and global_labels ---
+    labels = _parse_labels(sexp_data)
+    label_iu: Set[Tuple[int, int]] = {_to_iu(lbl["x"], lbl["y"]) for lbl in labels}
+
+    # --- anchors: power symbol pins (VCC, GND …) ---
+    power_iu: Set[Tuple[int, int]] = set()
+    if sch is not None:
+        try:
+            point_to_label, _ = _parse_virtual_connections(sch, schematic_path)
+            power_iu = set(point_to_label.keys())
+        except Exception as e:
+            logger.warning(f"Could not extract power symbol anchors: {e}")
+
+    anchored_iu = pin_iu | label_iu | power_iu
+
+    # --- classify each wire ---
+    orphaned: List[Dict[str, Any]] = []
+    for i, (s_iu, e_iu) in enumerate(wires_iu):
+        w = wires_mm[i]
+        dangling_ends: List[Dict[str, float]] = []
+        for pt_iu, pt_mm in [(s_iu, w["start"]), (e_iu, w["end"])]:
+            if iu_to_count[pt_iu] > 1:
+                continue  # shared with another wire → connected
+            if pt_iu in anchored_iu:
+                continue  # touches a pin or label → connected
+            dangling_ends.append({"x": pt_mm[0], "y": pt_mm[1]})
+        if dangling_ends:
+            orphaned.append(
+                {
+                    "start": {"x": w["start"][0], "y": w["start"][1]},
+                    "end": {"x": w["end"][0], "y": w["end"][1]},
+                    "dangling_ends": dangling_ends,
+                }
+            )
+
+    return {"orphaned_wires": orphaned, "count": len(orphaned)}

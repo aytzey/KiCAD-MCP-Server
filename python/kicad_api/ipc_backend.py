@@ -17,12 +17,23 @@ Key Benefits over SWIG:
 import logging
 import os
 import platform
+import threading
+import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 from kicad_api.base import APINotAvailableError, BoardAPI, ConnectionError, KiCADBackend
+from utils.project_settings_guard import preserve_project_settings
 
 logger = logging.getLogger(__name__)
+
+# Hard wall-clock cap for a single IPC connection attempt. kipy dials with
+# pynng's block_on_dial=True, which has NO timeout (only send/recv are capped),
+# so if KiCad's GUI thread is busy (e.g. reloading a library we just wrote to,
+# or any modal/progress state) and not servicing its socket, a connect can hang
+# until the client's ~240s watchdog fires. Bounding it here turns that into a
+# fast fall-back to the SWIG/file backend instead of an apparent freeze.
+IPC_CONNECT_TIMEOUT_S = float(os.getenv("KICAD_IPC_CONNECT_TIMEOUT", "5"))
 
 # Unit conversion constant: KiCAD IPC uses nanometers internally
 MM_TO_NM = 1_000_000
@@ -40,10 +51,10 @@ class IPCBackend(KiCADBackend):
     without requiring manual reload.
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         self._kicad = None
         self._connected = False
-        self._version = None
+        self._version: Optional[str] = None
         self._on_change_callbacks: List[Callable] = []
 
     def connect(self, socket_path: Optional[str] = None) -> bool:
@@ -85,20 +96,14 @@ class IPCBackend(KiCADBackend):
             last_error = None
             for path in socket_paths_to_try:
                 try:
-                    if path:
-                        logger.debug(f"Trying socket path: {path}")
-                        self._kicad = KiCad(socket_path=path)
-                    else:
-                        logger.debug("Trying auto-detection")
-                        self._kicad = KiCad()
-
-                    # Verify connection with ping (ping returns None on success)
-                    self._kicad.ping()
-                    logger.info(f"Connected via socket: {path or 'auto-detected'}")
+                    logger.debug(f"Trying socket path: {path or 'auto-detect'}")
+                    kicad, elapsed = self._open_with_timeout(KiCad, path, IPC_CONNECT_TIMEOUT_S)
+                    self._kicad = kicad
+                    logger.info(f"Connected via socket: {path or 'auto-detected'} ({elapsed:.2f}s)")
                     break
                 except Exception as e:
                     last_error = e
-                    logger.debug(f"Failed to connect via {path}: {e}")
+                    logger.debug(f"Failed to connect via {path or 'auto-detect'}: {e}")
                     continue
             else:
                 # None of the paths worked
@@ -123,6 +128,43 @@ class IPCBackend(KiCADBackend):
             )
             raise ConnectionError(f"IPC connection failed: {e}") from e
 
+    def _open_with_timeout(self, KiCad: Any, path: Optional[str], timeout_s: float):
+        """Open one kipy connection and ping it, bounded by a wall-clock timeout.
+
+        kipy's dial uses pynng block_on_dial=True (no timeout), so the open+ping
+        can hang if KiCad is busy and not servicing its socket. Run it in a
+        daemon thread and give up after ``timeout_s`` — a stuck thread is
+        orphaned (harmless: daemon, dies with the process) rather than blocking
+        the command loop until the client's ~240s watchdog fires.
+
+        Returns (kicad, elapsed_seconds). Raises TimeoutError on overrun, or the
+        underlying exception if the attempt failed fast.
+        """
+        result: Dict[str, Any] = {}
+        start = time.monotonic()
+
+        def worker() -> None:
+            try:
+                kicad = KiCad(socket_path=path) if path else KiCad()
+                kicad.ping()  # returns None on success, raises on failure
+                result["kicad"] = kicad
+            except Exception as e:  # noqa: BLE001 — surfaced to caller below
+                result["error"] = e
+
+        t = threading.Thread(target=worker, daemon=True)
+        t.start()
+        t.join(timeout_s)
+        elapsed = time.monotonic() - start
+
+        if t.is_alive():
+            raise TimeoutError(
+                f"IPC connect exceeded {timeout_s:.1f}s (KiCad busy or not servicing "
+                f"its socket); falling back to SWIG"
+            )
+        if "error" in result:
+            raise result["error"]
+        return result["kicad"], elapsed
+
     def _get_kicad_version(self) -> str:
         """Get KiCAD version string."""
         try:
@@ -133,8 +175,22 @@ class IPCBackend(KiCADBackend):
             return "unknown"
 
     def disconnect(self) -> None:
-        """Disconnect from KiCAD."""
+        """Disconnect from KiCAD.
+
+        kipy does not expose a public close(), but it holds a persistent pynng
+        socket at ``KiCad._client._conn``. Simply dropping the reference orphans
+        that socket and leaks its OS file descriptors (they are not released
+        promptly by GC), so long-lived sessions that reconnect accumulate fds.
+        Close the underlying socket explicitly, tolerating any internal changes.
+        """
         if self._kicad:
+            try:
+                conn = getattr(getattr(self._kicad, "_client", None), "_conn", None)
+                if conn is not None and hasattr(conn, "close"):
+                    conn.close()
+                    logger.debug("Closed underlying KiCAD IPC socket")
+            except Exception as e:
+                logger.debug(f"Error closing IPC socket during disconnect: {e}")
             self._kicad = None
             self._connected = False
             logger.info("Disconnected from KiCAD IPC")
@@ -154,6 +210,35 @@ class IPCBackend(KiCADBackend):
     def get_version(self) -> str:
         """Get KiCAD version."""
         return self._version or "unknown"
+
+    def get_open_board_path(self) -> Optional[str]:
+        """Path of the .kicad_pcb currently open in the live KiCad GUI, if any.
+
+        Used to decide whether the GUI session and the MCP's loaded board refer
+        to the same file before routing commands over IPC (issue #223).
+        """
+        if not self.is_connected():
+            return None
+        try:
+            # kipy requires an explicit doc_type; a no-arg call raises TypeError.
+            # DocumentSpecifier exposes board_filename + project.path, not .path.
+            from kipy.proto.common.types import DocumentType
+
+            for doc in self._kicad.get_open_documents(DocumentType.DOCTYPE_PCB):
+                name = str(getattr(doc, "board_filename", "") or "")
+                if name.endswith(".kicad_pcb"):
+                    root = str(getattr(getattr(doc, "project", None), "path", "") or "")
+                    if not root:
+                        return name
+                    # The IPC peer can report a POSIX path even when the MCP
+                    # client runs on Windows (remote/WSL KiCad sessions). Do
+                    # not rewrite that peer-native path with local separators.
+                    if root.startswith("/") or ("/" in root and "\\" not in root):
+                        return f"{root.rstrip('/')}/{name.lstrip('/')}"
+                    return os.path.join(root, name)
+        except Exception as e:
+            logger.debug(f"Could not read open documents via IPC: {e}")
+        return None
 
     def register_change_callback(self, callback: Callable) -> None:
         """Register a callback to be called when changes are made."""
@@ -217,7 +302,7 @@ class IPCBackend(KiCADBackend):
             logger.error(f"Failed to check project: {e}")
             return {"success": False, "message": "Failed to check project", "errorDetails": str(e)}
 
-    def save_project(self, path: Optional[Path] = None) -> Dict[str, Any]:
+    def save_project(self, path: Optional[Path] = None, overwrite: bool = False) -> Dict[str, Any]:
         """Save current project via IPC."""
         if not self.is_connected():
             raise ConnectionError("Not connected to KiCAD")
@@ -225,9 +310,16 @@ class IPCBackend(KiCADBackend):
         try:
             board = self._kicad.get_board()
             if path:
-                board.save_as(str(path))
+                saved = board.save_as(str(path), overwrite=overwrite)
             else:
-                board.save()
+                saved = board.save()
+
+            if saved is False:
+                return {
+                    "success": False,
+                    "message": "Failed to save project",
+                    "errorDetails": "KiCad IPC save returned false",
+                }
 
             self._notify_change("save", {"path": str(path) if path else "current"})
 
@@ -257,13 +349,13 @@ class IPCBoardAPI(BoardAPI):
     Uses transactions for proper undo/redo support.
     """
 
-    def __init__(self, kicad_instance, notify_callback: Callable):
+    def __init__(self, kicad_instance: Any, notify_callback: Callable) -> None:
         self._kicad = kicad_instance
         self._board = None
         self._notify = notify_callback
         self._current_commit = None
 
-    def _get_board(self):
+    def _get_board(self) -> Any:
         """Get board instance, connecting if needed."""
         if self._board is None:
             try:
@@ -350,7 +442,7 @@ class IPCBoardAPI(BoardAPI):
             logger.error(f"Failed to set board size: {e}")
             return False
 
-    def get_size(self) -> Dict[str, float]:
+    def get_size(self) -> Dict[str, Any]:
         """Get current board size from bounding box."""
         try:
             board = self._get_board()
@@ -371,10 +463,11 @@ class IPCBoardAPI(BoardAPI):
                 # Check if on Edge.Cuts layer
                 bbox = board.get_item_bounding_box(shape)
                 if bbox:
-                    min_x = min(min_x, bbox.min.x)
-                    min_y = min(min_y, bbox.min.y)
-                    max_x = max(max_x, bbox.max.x)
-                    max_y = max(max_y, bbox.max.y)
+                    left, top, right, bottom = self._get_box2_extents(bbox)
+                    min_x = min(min_x, left)
+                    min_y = min(min_y, top)
+                    max_x = max(max_x, right)
+                    max_y = max(max_y, bottom)
 
             if min_x == float("inf"):
                 return {"width": 0, "height": 0, "unit": "mm"}
@@ -384,6 +477,21 @@ class IPCBoardAPI(BoardAPI):
         except Exception as e:
             logger.error(f"Failed to get board size: {e}")
             return {"width": 0, "height": 0, "unit": "mm", "error": str(e)}
+
+    @staticmethod
+    def _get_box2_extents(bbox: Any) -> tuple[float, float, float, float]:
+        """Return left/top/right/bottom for kipy Box2 wrappers across versions."""
+        if hasattr(bbox, "min") and hasattr(bbox, "max"):
+            return bbox.min.x, bbox.min.y, bbox.max.x, bbox.max.y
+
+        if hasattr(bbox, "pos") and hasattr(bbox, "size"):
+            x1 = bbox.pos.x
+            y1 = bbox.pos.y
+            x2 = x1 + bbox.size.x
+            y2 = y1 + bbox.size.y
+            return min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2)
+
+        raise AttributeError("Unsupported Box2 shape: expected min/max or pos/size")
 
     def add_layer(self, layer_name: str, layer_type: str) -> bool:
         """Add layer to the board (layers are typically predefined in KiCAD)."""
@@ -412,13 +520,79 @@ class IPCBoardAPI(BoardAPI):
             for fp in footprints:
                 try:
                     pos = fp.position
+
+                    # Try to get bounding box
+                    bbox_data = None
+                    try:
+                        bbox = board.get_item_bounding_box(fp)
+                        if bbox:
+                            bbox_data = {
+                                "min_x": to_mm(bbox.min.x),
+                                "min_y": to_mm(bbox.min.y),
+                                "max_x": to_mm(bbox.max.x),
+                                "max_y": to_mm(bbox.max.y),
+                                "width": to_mm(bbox.max.x - bbox.min.x),
+                                "height": to_mm(bbox.max.y - bbox.min.y),
+                                "unit": "mm",
+                            }
+                    except Exception:
+                        pass  # Bounding box may not be available via IPC
+
+                    # Fallback: compute bounding box from pad positions + sizes
+                    if not bbox_data:
+                        try:
+                            pads = fp.pads if hasattr(fp, "pads") else []
+                            pad_list = list(pads)
+                            if pad_list:
+                                min_x = float("inf")
+                                min_y = float("inf")
+                                max_x = float("-inf")
+                                max_y = float("-inf")
+                                for pad in pad_list:
+                                    px = to_mm(pad.position.x) if pad.position else 0
+                                    py = to_mm(pad.position.y) if pad.position else 0
+                                    pw = (
+                                        to_mm(pad.size.x) / 2
+                                        if hasattr(pad, "size") and pad.size
+                                        else 0.5
+                                    )
+                                    ph = (
+                                        to_mm(pad.size.y) / 2
+                                        if hasattr(pad, "size") and pad.size
+                                        else 0.5
+                                    )
+                                    min_x = min(min_x, px - pw)
+                                    min_y = min(min_y, py - ph)
+                                    max_x = max(max_x, px + pw)
+                                    max_y = max(max_y, py + ph)
+                                margin = 0.25  # mm — small margin for component body beyond pads
+                                bbox_data = {
+                                    "min_x": min_x - margin,
+                                    "min_y": min_y - margin,
+                                    "max_x": max_x + margin,
+                                    "max_y": max_y + margin,
+                                    "width": (max_x - min_x) + 2 * margin,
+                                    "height": (max_y - min_y) + 2 * margin,
+                                    "unit": "mm",
+                                }
+                        except Exception as e:
+                            logger.debug(f"Could not compute bbox from pads: {e}")
+
                     components.append(
                         {
                             "reference": (
                                 fp.reference_field.text.value if fp.reference_field else ""
                             ),
                             "value": fp.value_field.text.value if fp.value_field else "",
-                            "footprint": str(fp.definition.library_link) if fp.definition else "",
+                            "footprint": (
+                                str(fp.definition.library_link)
+                                if fp.definition and hasattr(fp.definition, "library_link")
+                                else (
+                                    str(fp.definition.id)
+                                    if fp.definition and hasattr(fp.definition, "id")
+                                    else ""
+                                )
+                            ),
                             "position": {
                                 "x": to_mm(pos.x) if pos else 0,
                                 "y": to_mm(pos.y) if pos else 0,
@@ -427,6 +601,7 @@ class IPCBoardAPI(BoardAPI):
                             "rotation": fp.orientation.degrees if fp.orientation else 0,
                             "layer": str(fp.layer) if hasattr(fp, "layer") else "F.Cu",
                             "id": str(fp.id) if hasattr(fp, "id") else "",
+                            "boundingBox": bbox_data,
                         }
                     )
                 except Exception as e:
@@ -490,7 +665,7 @@ class IPCBoardAPI(BoardAPI):
             logger.error(f"Failed to place component: {e}")
             return False
 
-    def _load_footprint_from_library(self, footprint_path: str):
+    def _load_footprint_from_library(self, footprint_path: str) -> Any:
         """
         Load a footprint from the library using pcbnew SWIG API.
 
@@ -546,7 +721,14 @@ class IPCBoardAPI(BoardAPI):
             return None
 
     def _place_loaded_footprint(
-        self, loaded_fp, reference: str, x: float, y: float, rotation: float, layer: str, value: str
+        self,
+        loaded_fp: Any,
+        reference: str,
+        x: float,
+        y: float,
+        rotation: float,
+        layer: str,
+        value: str,
     ) -> bool:
         """
         Place a loaded pcbnew footprint onto the board.
@@ -608,7 +790,8 @@ class IPCBoardAPI(BoardAPI):
             pcb_board.Add(loaded_fp)
 
             # Save the board so IPC can see the changes
-            pcbnew.SaveBoard(board_path, pcb_board)
+            with preserve_project_settings(board_path):
+                pcbnew.SaveBoard(board_path, pcb_board)
 
             # Refresh IPC view
             try:
@@ -747,6 +930,99 @@ class IPCBoardAPI(BoardAPI):
             logger.error(f"Failed to move component: {e}")
             return False
 
+    def add_3d_model(
+        self,
+        references: Any,
+        model_path: str,
+        offset: Optional[Dict[str, float]] = None,
+        scale: Optional[Dict[str, float]] = None,
+        rotate: Optional[Dict[str, float]] = None,
+        replace: bool = True,
+    ) -> Dict[str, Any]:
+        """Attach a 3D model to one or more placed footprints (live UI update).
+
+        ``references`` may be a single reference ("D1"), a list (["D1","D2"]),
+        or "*"/"all" to apply to every footprint on the board.
+        """
+        try:
+            import kipy.board_types as bt
+
+            board = self._get_board()
+            footprints = board.get_footprints()
+
+            if isinstance(references, str):
+                wanted = [references]
+            else:
+                wanted = list(references or [])
+            apply_all = any(w in ("*", "all") for w in wanted)
+
+            targets = []
+            for fp in footprints:
+                ref = fp.reference_field.text.value if fp.reference_field else ""
+                if apply_all or ref in wanted:
+                    targets.append((ref, fp))
+
+            if not targets:
+                return {"success": False, "error": f"No footprints matched: {references}"}
+
+            off = offset or {}
+            scl = scale or {}
+            rot = rotate or {}
+
+            changed = []
+            details = []
+            for ref, fp in targets:
+                defn = fp.definition
+                already = [m for m in defn.models if m.filename == model_path]
+                if already and not replace:
+                    details.append({"reference": ref, "added": False, "note": "already present"})
+                    continue
+                if already and replace:
+                    keep = [
+                        it
+                        for it in defn.items
+                        if not (isinstance(it, bt.Footprint3DModel) and it.filename == model_path)
+                    ]
+                    defn.items = keep
+
+                from kipy.geometry import Vector3D
+
+                model = bt.Footprint3DModel()
+                model.filename = model_path
+                model.visible = True
+                model.opacity = 1.0
+                # scale defaults to 0 on a fresh proto -> force 1 so the body renders
+                model.scale = Vector3D.from_xyz(
+                    float(scl.get("x", 1.0)), float(scl.get("y", 1.0)), float(scl.get("z", 1.0))
+                )
+                model.offset = Vector3D.from_xyz(
+                    float(off.get("x", 0.0)), float(off.get("y", 0.0)), float(off.get("z", 0.0))
+                )
+                model.rotation = Vector3D.from_xyz(
+                    float(rot.get("x", 0.0)), float(rot.get("y", 0.0)), float(rot.get("z", 0.0))
+                )
+
+                defn.add_item(model)
+                changed.append(fp)
+                details.append({"reference": ref, "added": True, "replaced": len(already)})
+
+            if changed:
+                commit = board.begin_commit()
+                board.update_items(changed)
+                board.push_commit(commit, f"Added 3D model to {len(changed)} footprint(s)")
+                self._notify("model_added", {"count": len(changed), "model": model_path})
+
+            return {
+                "success": True,
+                "model": model_path,
+                "updated": len(changed),
+                "details": details,
+            }
+
+        except Exception as e:
+            logger.error(f"Failed to add 3D model: {e}")
+            return {"success": False, "error": str(e)}
+
     def delete_component(self, reference: str) -> bool:
         """Delete a component from the board."""
         try:
@@ -844,6 +1120,71 @@ class IPCBoardAPI(BoardAPI):
 
         except Exception as e:
             logger.error(f"Failed to add track: {e}")
+            return False
+
+    def add_arc_track(
+        self,
+        start_x: float,
+        start_y: float,
+        mid_x: float,
+        mid_y: float,
+        end_x: float,
+        end_y: float,
+        width: float = 0.25,
+        layer: str = "F.Cu",
+        net_name: Optional[str] = None,
+    ) -> bool:
+        """Add a copper arc track to the board."""
+        try:
+            from kipy.board_types import ArcTrack
+            from kipy.geometry import Vector2
+            from kipy.proto.board.board_types_pb2 import BoardLayer
+            from kipy.util.units import from_mm
+
+            board = self._get_board()
+
+            arc = ArcTrack()
+            arc.start = Vector2.from_xy(from_mm(start_x), from_mm(start_y))
+            arc.mid = Vector2.from_xy(from_mm(mid_x), from_mm(mid_y))
+            arc.end = Vector2.from_xy(from_mm(end_x), from_mm(end_y))
+            arc.width = from_mm(width)
+
+            layer_map = {
+                "F.Cu": BoardLayer.BL_F_Cu,
+                "B.Cu": BoardLayer.BL_B_Cu,
+                "In1.Cu": BoardLayer.BL_In1_Cu,
+                "In2.Cu": BoardLayer.BL_In2_Cu,
+            }
+            arc.layer = layer_map.get(layer, BoardLayer.BL_F_Cu)
+
+            if net_name:
+                nets = board.get_nets()
+                for net in nets:
+                    if net.name == net_name:
+                        arc.net = net
+                        break
+
+            commit = board.begin_commit()
+            board.create_items(arc)
+            board.push_commit(commit, "Added arc track")
+
+            self._notify(
+                "arc_track_added",
+                {
+                    "start": {"x": start_x, "y": start_y},
+                    "mid": {"x": mid_x, "y": mid_y},
+                    "end": {"x": end_x, "y": end_y},
+                    "width": width,
+                    "layer": layer,
+                    "net": net_name,
+                },
+            )
+            logger.info(
+                f"Added arc track start=({start_x}, {start_y}) mid=({mid_x}, {mid_y}) end=({end_x}, {end_y}) mm"
+            )
+            return True
+        except Exception as e:
+            logger.error(f"Failed to add arc track: {e}")
             return False
 
     def add_via(
@@ -1112,11 +1453,13 @@ class IPCBoardAPI(BoardAPI):
             if name:
                 zone.name = name
 
-            # Set fill mode
-            if fill_mode == "hatched":
-                zone.fill_mode = ZoneFillMode.ZFM_HATCHED
-            else:
-                zone.fill_mode = ZoneFillMode.ZFM_SOLID
+            # Set fill mode. kipy's Zone.fill_mode is a read-only property
+            # (its getter reads _proto.copper_settings.fill_mode and there is
+            # no setter), so assigning to it raises AttributeError at runtime.
+            # Write through the proto, the same way the outline is set below.
+            zone._proto.copper_settings.fill_mode = (
+                ZoneFillMode.ZFM_HATCHED if fill_mode == "hatched" else ZoneFillMode.ZFM_SOLID
+            )
 
             # Create outline polyline
             outline = PolyLine()

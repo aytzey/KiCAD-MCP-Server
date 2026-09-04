@@ -12,6 +12,9 @@ Each tool includes:
 
 from typing import Any, Dict
 
+from utils.duplicate_strategies import DEFAULT_DUPLICATE_STRATEGIES, DUPLICATE_STRATEGIES
+from utils.pin_types import PIN_STYLES, PIN_TYPES
+
 # =============================================================================
 # PROJECT TOOLS
 # =============================================================================
@@ -20,18 +23,13 @@ PROJECT_TOOLS = [
     {
         "name": "create_project",
         "title": "Create New KiCAD Project",
-        "description": "Creates a new KiCAD project with PCB board file and optional project configuration. Blank projects default to a 100x100 mm, 2-layer board so routing and placement tools start from a usable canvas immediately.",
+        "description": "Creates a new KiCAD project with PCB board file and optional project configuration. Automatically creates project directory and initializes board with default settings.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "name": {
-                    "type": "string",
-                    "description": "Preferred project name parameter used by the MCP server",
-                    "minLength": 1,
-                },
                 "projectName": {
                     "type": "string",
-                    "description": "Legacy alias for the project name (used for file naming)",
+                    "description": "Name of the project (used for file naming)",
                     "minLength": 1,
                 },
                 "path": {
@@ -42,26 +40,8 @@ PROJECT_TOOLS = [
                     "type": "string",
                     "description": "Optional path to template board file to copy settings from",
                 },
-                "boardWidthMm": {
-                    "type": "number",
-                    "description": "Default board width in millimeters for blank projects (default: 100)",
-                },
-                "boardHeightMm": {
-                    "type": "number",
-                    "description": "Default board height in millimeters for blank projects (default: 100)",
-                },
-                "boardUnit": {
-                    "type": "string",
-                    "enum": ["mm", "inch"],
-                    "description": "Unit used by boardWidthMm/boardHeightMm (default: mm)",
-                },
-                "copperLayers": {
-                    "type": "integer",
-                    "minimum": 2,
-                    "description": "Copper layer count for blank projects. Must be an even number (default: 2)",
-                },
             },
-            "anyOf": [{"required": ["name"]}, {"required": ["projectName"]}],
+            "required": ["projectName"],
         },
     },
     {
@@ -80,18 +60,126 @@ PROJECT_TOOLS = [
         },
     },
     {
+        "name": "close_project",
+        "title": "Close Current Project",
+        "description": "Closes the currently loaded project: optionally saves the board, then drops the in-memory board (SWIG and IPC) and clears all session state. Symmetric counterpart to open_project/create_project. Use this to release the project so the user or agent can edit project files directly without a later MCP save clobbering those changes.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "save": {
+                    "type": "boolean",
+                    "description": "Save the board to disk before closing (default true). If false and there are unsaved changes, the close proceeds but the response warns they were discarded.",
+                },
+                "forceExternalChanges": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Save despite external changes to the loaded SWIG board file",
+                },
+                "force": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Backward-compatible alias for forceExternalChanges",
+                },
+            },
+        },
+    },
+    {
         "name": "save_project",
         "title": "Save Current Project",
-        "description": "Saves the current board to disk. Can optionally save to a new location.",
+        "description": (
+            "Saves the current board to disk. Can optionally save to a new location. "
+            "If the board file's contents changed on disk since it was loaded (an "
+            "external edit), the save is refused to avoid clobbering those changes "
+            "unless force=true is passed."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "filename": {
                     "type": "string",
                     "description": "Optional new path to save the board (if not provided, saves to current location)",
-                }
+                },
+                "path": {
+                    "type": "string",
+                    "description": "Alias for filename",
+                },
+                "force": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": (
+                        "Overwrite the loaded board file even if its on-disk contents "
+                        "changed externally since this session loaded it"
+                    ),
+                },
+                "forceExternalChanges": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Explicit alias for force; takes precedence when both are provided",
+                },
+                "overwrite": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Replace an existing destination when saving to a different path",
+                },
             },
         },
+    },
+    {
+        "name": "open_board",
+        "title": "Open PCB Board",
+        "description": "Opens a specific .kicad_pcb file and refreshes MCP's in-memory board state.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"boardPath": {"type": "string"}},
+            "required": ["boardPath"],
+        },
+    },
+    {
+        "name": "reload_board",
+        "title": "Reload PCB Board",
+        "description": "Reloads the current or specified .kicad_pcb from disk, discarding stale in-memory state.",
+        "inputSchema": {"type": "object", "properties": {"boardPath": {"type": "string"}}},
+    },
+    {
+        "name": "save_board",
+        "title": "Save PCB Board",
+        "description": "Saves the loaded board with the external disk-change guard.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "boardPath": {"type": "string"},
+                "force": {"type": "boolean", "default": False},
+                "forceExternalChanges": {"type": "boolean", "default": False},
+                "overwrite": {"type": "boolean", "default": False},
+            },
+        },
+    },
+    {
+        "name": "save_as",
+        "title": "Save Board As",
+        "description": "Saves the loaded board to a new .kicad_pcb path.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "boardPath": {"type": "string"},
+                "overwrite": {"type": "boolean", "default": False},
+                "force": {"type": "boolean", "default": False},
+                "forceExternalChanges": {"type": "boolean", "default": False},
+            },
+            "required": ["boardPath"],
+        },
+    },
+    {
+        "name": "is_dirty",
+        "title": "Board Dirty State",
+        "description": "Reports whether MCP knows the loaded board has unsaved memory changes or external disk changes.",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "discard_or_reload",
+        "title": "Discard or Reload Board",
+        "description": "Discards the in-memory board and reloads it from disk.",
+        "inputSchema": {"type": "object", "properties": {"boardPath": {"type": "string"}}},
     },
     {
         "name": "snapshot_project",
@@ -150,6 +238,57 @@ BOARD_TOOLS = [
         },
     },
     {
+        "name": "set_board_origin",
+        "title": "Set Board Aux/Grid Origin",
+        "description": (
+            "Set the auxiliary (drill/place) origin and/or grid origin of a "
+            ".kicad_pcb. The aux origin is the datum used by export_drill's "
+            "drillOrigin:'plot' option and by pick-and-place / plot exports "
+            "with useAuxOrigin."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "boardPath": {
+                    "type": "string",
+                    "description": "Path to the .kicad_pcb file",
+                },
+                "type": {
+                    "type": "string",
+                    "enum": ["aux", "grid", "both"],
+                    "description": "Which origin to set (default: aux)",
+                    "default": "aux",
+                },
+                "x": {"type": "number", "description": "Origin X coordinate"},
+                "y": {"type": "number", "description": "Origin Y coordinate"},
+                "unit": {
+                    "type": "string",
+                    "enum": ["mm", "mil", "inch"],
+                    "description": "Coordinate unit (default: mm)",
+                    "default": "mm",
+                },
+            },
+            "required": ["boardPath", "x", "y"],
+        },
+    },
+    {
+        "name": "get_board_origin",
+        "title": "Get Board Aux/Grid Origin",
+        "description": (
+            "Read back the auxiliary (drill/place) origin and grid origin of a " ".kicad_pcb in mm."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "boardPath": {
+                    "type": "string",
+                    "description": "Path to the .kicad_pcb file",
+                },
+            },
+            "required": ["boardPath"],
+        },
+    },
+    {
         "name": "add_board_outline",
         "title": "Add Board Outline",
         "description": "Adds a board outline shape (rectangle, rounded_rectangle, circle, or polygon) on the Edge.Cuts layer. By default the board top-left corner is placed at (0, 0) so all coordinates are positive. Use x/y to set a different top-left corner position.",
@@ -202,23 +341,113 @@ BOARD_TOOLS = [
         },
     },
     {
-        "name": "add_layer",
-        "title": "Add Custom Layer",
-        "description": "Adds a new custom layer to the board stack (e.g., User.1, User.Comments).",
+        "name": "clear_board_outline",
+        "title": "Clear Board Outline",
+        "description": "Deletes all Edge.Cuts graphic items from the current PCB.",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "replace_board_outline",
+        "title": "Replace Board Outline",
+        "description": "Clears existing Edge.Cuts items and adds a new board outline.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "layerName": {
+                "shape": {
                     "type": "string",
-                    "description": "Name of the layer to add",
+                    "enum": ["rectangle", "rounded_rectangle", "circle", "polygon"],
                 },
-                "layerType": {
+                "width": {"type": "number"},
+                "height": {"type": "number"},
+                "x": {"type": "number"},
+                "y": {"type": "number"},
+                "radius": {"type": "number"},
+                "cornerRadius": {"type": "number"},
+                "points": {"type": "array"},
+                "unit": {"type": "string", "enum": ["mm", "mil", "inch"], "default": "mm"},
+            },
+            "required": ["shape"],
+        },
+    },
+    {
+        "name": "list_graphics",
+        "title": "List PCB Graphics",
+        "description": "Lists board drawing items, optionally filtered by layer.",
+        "inputSchema": {"type": "object", "properties": {"layer": {"type": "string"}}},
+    },
+    {
+        "name": "delete_graphic",
+        "title": "Delete PCB Graphic",
+        "description": "Deletes a board drawing item by KiCad UUID.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"uuid": {"type": "string"}},
+            "required": ["uuid"],
+        },
+    },
+    {
+        "name": "update_graphic",
+        "title": "Update PCB Graphic",
+        "description": "Updates common board graphic properties by KiCad UUID.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "uuid": {"type": "string"},
+                "layer": {"type": "string"},
+                "width": {"type": "number"},
+                "start": {"type": "object"},
+                "end": {"type": "object"},
+                "center": {"type": "object"},
+                "position": {"type": "object"},
+                "text": {"type": "string"},
+                "unit": {"type": "string", "enum": ["mm", "mil", "inch"], "default": "mm"},
+            },
+            "required": ["uuid"],
+        },
+    },
+    {
+        "name": "add_layer",
+        "title": "Enable Copper Layer",
+        "description": (
+            "Enables a copper layer in the board stackup and gives it a name. "
+            "Copper layers only — KiCad's technical and user layers (silkscreen, "
+            "mask, courtyard, Dwgs.User, ...) are a fixed set that always exists "
+            "and cannot be added."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {
                     "type": "string",
-                    "enum": ["signal", "power", "mixed", "jumper"],
-                    "description": "Type of layer (for copper layers)",
+                    "description": (
+                        "Name for the layer. Stored alongside KiCad's canonical name "
+                        "(e.g. name 'PWR' on In1.Cu is written as "
+                        '(4 "In1.Cu" signal "PWR")).'
+                    ),
+                },
+                "type": {
+                    "type": "string",
+                    "enum": ["copper", "signal", "power", "mixed", "jumper"],
+                    "description": "Copper layer type",
+                },
+                "position": {
+                    "type": "string",
+                    "enum": ["top", "bottom", "inner"],
+                    "description": "Which copper layer to target",
+                },
+                "number": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 30,
+                    "description": (
+                        "Inner-layer ORDINAL, 1-based: 1 = In1.Cu, 2 = In2.Cu. This is "
+                        "not a KiCad layer ID (In1.Cu's id is 4). Required when "
+                        "position is 'inner'. The response echoes the resolved "
+                        "canonicalName and id."
+                    ),
                 },
             },
-            "required": ["layerName"],
+            "required": ["name", "type", "position"],
         },
     },
     {
@@ -251,21 +480,54 @@ BOARD_TOOLS = [
     {
         "name": "get_board_2d_view",
         "title": "Render Board Preview",
-        "description": "Generates a 2D visual representation of the current board state as a PNG image.",
+        "description": (
+            "Renders a 2D image of the PCB via kicad-cli (no pcbnew/cffi dependency). "
+            "Supports PNG, JPG, and SVG output. "
+            "Use responseMode to control how the image is returned. "
+            'responseMode="inline" (default) returns the image as base64-encoded imageData — '
+            "convenient for small boards but may exceed message-size limits on large designs. "
+            'responseMode="file" writes the image next to the .kicad_pcb file as '
+            "<board>_2d_view.<ext> and returns a filePath; prefer this mode for large boards."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
+                "pcbPath": {
+                    "type": "string",
+                    "description": "Absolute path to the .kicad_pcb file. Falls back to the currently loaded board if omitted.",
+                },
                 "width": {
                     "type": "number",
-                    "description": "Image width in pixels (default: 800)",
+                    "description": "Image width in pixels (default: 1600)",
                     "minimum": 100,
-                    "default": 800,
+                    "default": 1600,
                 },
                 "height": {
                     "type": "number",
-                    "description": "Image height in pixels (default: 600)",
+                    "description": "Image height in pixels (default: 1200)",
                     "minimum": 100,
-                    "default": 600,
+                    "default": 1200,
+                },
+                "format": {
+                    "type": "string",
+                    "enum": ["png", "jpg", "svg"],
+                    "description": "Output image format (default: png)",
+                    "default": "png",
+                },
+                "layers": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": 'Layer names to include, e.g. ["F.Cu","B.Cu","Edge.Cuts"]. Omit for all layers.',
+                },
+                "responseMode": {
+                    "type": "string",
+                    "enum": ["inline", "file"],
+                    "default": "inline",
+                    "description": (
+                        "How to return the image. "
+                        '"inline" (default): base64-encoded bytes in imageData. '
+                        '"file": write to <board>_2d_view.<ext> next to the PCB and return filePath.'
+                    ),
                 },
             },
         },
@@ -279,7 +541,7 @@ BOARD_TOOLS = [
             "properties": {
                 "unit": {
                     "type": "string",
-                    "enum": ["mm", "inch"],
+                    "enum": ["mm", "mil", "inch"],
                     "description": "Unit for returned coordinates (default: mm)",
                     "default": "mm",
                 }
@@ -289,19 +551,46 @@ BOARD_TOOLS = [
     {
         "name": "add_mounting_hole",
         "title": "Add Mounting Hole",
-        "description": "Adds a mounting hole (non-plated through hole) at the specified position with given diameter.",
+        "description": "Adds a mounting hole at the specified position with given diameter. Defaults to non-plated (NPTH) with mask-only pad layers; set plated=true for a PTH with copper pad.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "x": {"type": "number", "description": "X coordinate in millimeters"},
-                "y": {"type": "number", "description": "Y coordinate in millimeters"},
+                "position": {
+                    "type": "object",
+                    "description": "Position of the mounting hole",
+                    "properties": {
+                        "x": {"type": "number", "description": "X coordinate"},
+                        "y": {"type": "number", "description": "Y coordinate"},
+                        "unit": {
+                            "type": "string",
+                            "enum": ["mm", "mil", "inch"],
+                            "default": "mm",
+                            "description": "Unit for x/y (default mm)",
+                        },
+                    },
+                    "required": ["x", "y"],
+                },
                 "diameter": {
                     "type": "number",
-                    "description": "Hole diameter in millimeters",
+                    "description": "Hole (drill) diameter in millimeters",
                     "minimum": 0.1,
                 },
+                "padDiameter": {
+                    "type": "number",
+                    "description": "Pad diameter in millimeters (defaults to diameter + 1mm). For NPTH this only affects the solder-mask opening, not copper.",
+                    "minimum": 0.1,
+                },
+                "plated": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "True for plated through-hole (PTH) with copper pad; false (default) for NPTH (mask only).",
+                },
+                "footprintLibId": {
+                    "type": "string",
+                    "description": "Optional library:name FPID (e.g. 'MountingHole:MountingHole_3.2mm'). Defaults to MountingHole:MountingHole_<diameter>mm. A non-empty FPID is required for the footprint to be selectable in KiCad's GUI Move tool.",
+                },
             },
-            "required": ["x", "y", "diameter"],
+            "required": ["position", "diameter"],
         },
     },
     {
@@ -451,6 +740,20 @@ COMPONENT_TOOLS = [
         },
     },
     {
+        "name": "batch_move_components",
+        "title": "Batch Move Components",
+        "description": "Moves multiple PCB components transactionally and saves by default.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "moves": {"type": "object"},
+                "save": {"type": "boolean", "default": True},
+                "dryRun": {"type": "boolean", "default": False},
+            },
+            "required": ["moves"],
+        },
+    },
+    {
         "name": "rotate_component",
         "title": "Rotate Component",
         "description": "Rotates a component by specified angle. Rotation is cumulative with existing rotation.",
@@ -526,6 +829,18 @@ COMPONENT_TOOLS = [
         "inputSchema": {"type": "object", "properties": {}},
     },
     {
+        "name": "get_component_geometry",
+        "title": "Get Component Geometry",
+        "description": "Returns separated footprint bboxes for body, pads, courtyard, keepout, fab, silk and text.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "reference": {"type": "string"},
+                "refs": {"type": "array", "items": {"type": "string"}},
+            },
+        },
+    },
+    {
         "name": "find_component",
         "title": "Find Components",
         "description": "Searches for components matching specified criteria. Supports partial matching on reference, value, or footprint patterns.",
@@ -563,6 +878,27 @@ COMPONENT_TOOLS = [
         },
     },
     {
+        "name": "get_pads",
+        "title": "Get Pads",
+        "description": "Returns pads for one component, selected refs, or all components.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "reference": {"type": "string"},
+                "refs": {"type": "array", "items": {"type": "string"}},
+            },
+        },
+    },
+    {
+        "name": "get_net_pads",
+        "title": "Get Net Pads",
+        "description": "Returns every pad attached to a net name or net code.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"net": {"type": "string"}, "netCode": {"type": "number"}},
+        },
+    },
+    {
         "name": "get_pad_position",
         "title": "Get Pad Position",
         "description": "Returns the position and properties of a specific pad on a component.",
@@ -583,6 +919,61 @@ COMPONENT_TOOLS = [
                 },
             },
             "required": ["reference"],
+        },
+    },
+    {
+        "name": "get_ratsnest",
+        "title": "Get Ratsnest",
+        "description": "Estimates ratsnest/airwire segments and lengths from current pad positions grouped by net.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "nets": {"type": "array", "items": {"type": "string"}},
+                "maxPadsPerNet": {"type": "number", "default": 128},
+            },
+        },
+    },
+    {
+        "name": "estimate_airwire_lengths",
+        "title": "Estimate Airwire Lengths",
+        "description": "Alias for get_ratsnest.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "nets": {"type": "array", "items": {"type": "string"}},
+                "maxPadsPerNet": {"type": "number", "default": 128},
+            },
+        },
+    },
+    {
+        "name": "check_placement_clearance",
+        "title": "Check Placement Clearance",
+        "description": "Classifies placement conflicts as body, courtyard, keepout, silk/text, or pad-clearance issues.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "refs": {"type": "array", "items": {"type": "string"}},
+                "margin": {"type": "number", "default": 0},
+                "padClearance": {"type": "number", "default": 0},
+            },
+        },
+    },
+    {
+        "name": "move_footprint_text",
+        "title": "Move Footprint Text",
+        "description": "Moves a footprint Reference/Value/user text field without moving the footprint.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "reference": {"type": "string"},
+                "field": {"type": "string"},
+                "x": {"type": "number"},
+                "y": {"type": "number"},
+                "rotation": {"type": "number"},
+                "layer": {"type": "string"},
+                "visible": {"type": "boolean"},
+            },
+            "required": ["reference", "field"],
         },
     },
     {
@@ -681,6 +1072,295 @@ COMPONENT_TOOLS = [
                 },
             },
             "required": ["references", "direction"],
+        },
+    },
+    {
+        "name": "check_courtyard_overlaps",
+        "title": "Check Courtyard Overlaps",
+        "description": (
+            "Detects courtyard overlaps between footprints and (optionally) flags "
+            "footprints whose courtyard extends past the board outline. "
+            "Returns overlap pairs with intersection extents and per-component "
+            "boundary violations, both in mm. Accepts a 'positions' dict to "
+            "evaluate a HYPOTHETICAL placement without modifying the board — "
+            "use this before committing a move_component / place_component call "
+            "to know if it will trigger DRC. "
+            "Approach ported from morningfire-pcb-automation "
+            "(https://github.com/NiNjA-CodE/morningfire-pcb-automation, "
+            "scripts/placement/check_overlaps.py); this version reads real "
+            "courtyard polygons from the board (not a static lookup table) and "
+            "supports virtual placement + rotation + clearance margin."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "positions": {
+                    "type": "object",
+                    "description": (
+                        "Virtual placements: map of reference designator to "
+                        "[x, y] or [x, y, rotation_degrees] in mm. Each listed "
+                        "ref is checked AS IF it were at the given coordinates. "
+                        "Unspecified refs use their current board position."
+                    ),
+                    "additionalProperties": {
+                        "type": "array",
+                        "items": {"type": "number"},
+                        "minItems": 2,
+                        "maxItems": 3,
+                    },
+                },
+                "refs": {
+                    "type": "array",
+                    "description": (
+                        "Limit the check to these refs (default: every " "footprint on the board)."
+                    ),
+                    "items": {"type": "string"},
+                },
+                "margin": {
+                    "type": "number",
+                    "description": (
+                        "Extra clearance in mm added around every courtyard "
+                        "(default 0). Useful to enforce a manufacturing keepout "
+                        "wider than the symbol's declared courtyard."
+                    ),
+                    "default": 0,
+                },
+                "include_boundary": {
+                    "type": "boolean",
+                    "description": (
+                        "Also flag courtyards that extend past the board outline " "(default true)."
+                    ),
+                    "default": True,
+                },
+                "board_outline": {
+                    "type": "object",
+                    "description": (
+                        "Optional override for the board outline bbox. Default: "
+                        "derived from Edge.Cuts."
+                    ),
+                    "properties": {
+                        "x1": {"type": "number"},
+                        "y1": {"type": "number"},
+                        "x2": {"type": "number"},
+                        "y2": {"type": "number"},
+                        "unit": {
+                            "type": "string",
+                            "enum": ["mm", "mil", "inch"],
+                            "default": "mm",
+                        },
+                    },
+                    "required": ["x1", "y1", "x2", "y2"],
+                },
+            },
+        },
+    },
+    {
+        "name": "suggest_placement",
+        "title": "Suggest Placement",
+        "description": (
+            "Propose an optimized PCB footprint placement that shortens net "
+            "length, orients parts toward their partners, and removes courtyard "
+            "overlaps — the heuristic an engineer does by eye against the "
+            "ratsnest. Force-directed clustering pulls connected parts together "
+            "(a converter's feedback divider and decoupling caps end up hugging "
+            "its IC), power/high-current nets are weighted to stay short & "
+            "direct, and each part is rotated (0/90/180/270) to face its "
+            "neighbours so airwires stop crossing. PCB ONLY — it does not touch "
+            "the schematic. DRY RUN by default: returns proposals "
+            "{ref:[x,y,rot]} plus a score (HPWL before/after, overlap counts) "
+            "WITHOUT modifying the board. Validate proposals via "
+            "check_courtyard_overlaps(positions=proposals), then re-run with "
+            "apply=true (or move_component per ref) before autoroute."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "refs": {
+                    "type": "array",
+                    "description": (
+                        "References to move (default: every non-locked " "footprint on the board)."
+                    ),
+                    "items": {"type": "string"},
+                },
+                "locked": {
+                    "type": "array",
+                    "description": (
+                        "References to hold fixed as anchors — connectors, "
+                        "mounting-constrained parts, RF, edge parts. They still "
+                        "pull movable parts. Footprints KiCad marks locked are "
+                        "added automatically."
+                    ),
+                    "items": {"type": "string"},
+                },
+                "apply": {
+                    "type": "boolean",
+                    "description": (
+                        "If true, move + rotate the components to the proposed "
+                        "positions. Default false (dry run — board untouched)."
+                    ),
+                    "default": False,
+                },
+                "iterations": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 1000,
+                    "description": "Force-directed relaxation passes (default 200, maximum 1000).",
+                    "default": 200,
+                },
+                "starts": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 12,
+                    "description": "Deterministic multi-start candidates (default 3).",
+                    "default": 3,
+                },
+                "grid_mm": {
+                    "type": "number",
+                    "description": "Snap proposed positions to this grid (default 0.5).",
+                    "default": 0.5,
+                },
+                "margin_mm": {
+                    "type": "number",
+                    "description": ("Extra keepout enforced between courtyards (default 0.3)."),
+                    "default": 0.3,
+                },
+                "rotate": {
+                    "type": "boolean",
+                    "description": (
+                        "Enable pin-facing rotation (default true). Disable to "
+                        "keep every part's current orientation."
+                    ),
+                    "default": True,
+                },
+                "spread": {
+                    "type": "boolean",
+                    "description": (
+                        "Enable density spreading (default true). The springs "
+                        "pack parts into a blob denser than they physically fit; "
+                        "spreading diffuses them across free board area so the "
+                        "result is legal (few/zero courtyard overlaps) instead "
+                        "of over-packed. Leave on for whole-board runs."
+                    ),
+                    "default": True,
+                },
+                "align": {
+                    "type": "boolean",
+                    "description": (
+                        "Tidy the result into rows/columns (default true). Snaps "
+                        "near-collinear part centers onto shared row (Y) and "
+                        "column (X) lines so passives line up cleanly with their "
+                        "centers aligned — like KiCad's Align Centers + "
+                        "Distribute — instead of organic offsets. Disable for a "
+                        "pure shortest-wire layout."
+                    ),
+                    "default": True,
+                },
+                "align_tol_mm": {
+                    "type": "number",
+                    "description": (
+                        "Max center spacing (mm) for parts to be pulled onto the "
+                        "same row/column line during align (default 1.5)."
+                    ),
+                    "default": 1.5,
+                },
+                "rotation_steps": {
+                    "type": "array",
+                    "description": (
+                        "Candidate quarter-turn orientations in degrees "
+                        "(default [0, 90, 180, 270]); each value must be a multiple of 90."
+                    ),
+                    "items": {"type": "number", "multipleOf": 90},
+                    "minItems": 1,
+                    "maxItems": 16,
+                    "default": [0, 90, 180, 270],
+                },
+                "rotation_passes": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 8,
+                    "description": "Greedy rotation sweeps per start (default 2, maximum 8).",
+                    "default": 2,
+                },
+                "spread_iters": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 500,
+                    "description": "Density-spreading passes per start (default 80, maximum 500).",
+                    "default": 80,
+                },
+                "legalize_iters": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 500,
+                    "description": "Overlap-legalization passes per start (default 200, maximum 500).",
+                    "default": 200,
+                },
+                "power_nets": {
+                    "type": "array",
+                    "description": (
+                        "Net-name fragments treated as high-current and pulled "
+                        "short & direct (case-insensitive substring match). "
+                        "Defaults to common power rails (VBAT, VBUS, VCC, 3V3, "
+                        "5V, ...). Pass [] to disable power weighting."
+                    ),
+                    "items": {"type": "string"},
+                },
+                "power_weight": {
+                    "type": "number",
+                    "description": "Pull multiplier for power nets (default 3.0).",
+                    "default": 3.0,
+                },
+                "decoupling_boost": {
+                    "type": "number",
+                    "description": (
+                        "Extra pull for 2-pin-passive <-> multi-pin-IC links so "
+                        "caps / feedback parts hug their IC (default 2.0)."
+                    ),
+                    "default": 2.0,
+                },
+                "bounds": {
+                    "type": "object",
+                    "description": (
+                        "SCOPED REGROUP: confine the MOVABLE parts to this box "
+                        "(mm) — e.g. the empty area beside one IC. Combine with "
+                        "`refs` (just that IC's passives) to regroup one cluster "
+                        "at a time; unlisted parts stay put as anchors. Far more "
+                        "reliable than a whole-board run on a dense board, which "
+                        "over-packs. Default: parts may use the whole board."
+                    ),
+                    "properties": {
+                        "x1": {"type": "number"},
+                        "y1": {"type": "number"},
+                        "x2": {"type": "number"},
+                        "y2": {"type": "number"},
+                        "unit": {
+                            "type": "string",
+                            "enum": ["mm", "mil", "inch"],
+                            "default": "mm",
+                        },
+                    },
+                    "required": ["x1", "y1", "x2", "y2"],
+                },
+                "board_outline": {
+                    "type": "object",
+                    "description": (
+                        "Optional override for the board containment bbox. "
+                        "Default: derived from Edge.Cuts."
+                    ),
+                    "properties": {
+                        "x1": {"type": "number"},
+                        "y1": {"type": "number"},
+                        "x2": {"type": "number"},
+                        "y2": {"type": "number"},
+                        "unit": {
+                            "type": "string",
+                            "enum": ["mm", "mil", "inch"],
+                            "default": "mm",
+                        },
+                    },
+                    "required": ["x1", "y1", "x2", "y2"],
+                },
+            },
         },
     },
     {
@@ -818,7 +1498,7 @@ ROUTING_TOOLS = [
                         "y": {"type": "number", "description": "Y coordinate"},
                         "unit": {
                             "type": "string",
-                            "enum": ["mm", "inch"],
+                            "enum": ["mm", "mil", "inch"],
                             "default": "mm",
                         },
                     },
@@ -865,7 +1545,7 @@ ROUTING_TOOLS = [
                         "y2": {"type": "number", "description": "Bottom Y coordinate"},
                         "unit": {
                             "type": "string",
-                            "enum": ["mm", "inch"],
+                            "enum": ["mm", "mil", "inch"],
                             "default": "mm",
                         },
                     },
@@ -873,6 +1553,152 @@ ROUTING_TOOLS = [
                 "includeVias": {
                     "type": "boolean",
                     "description": "Include vias in the result",
+                    "default": False,
+                },
+            },
+        },
+    },
+    {
+        "name": "query_zones",
+        "title": "Query Zones",
+        "description": "Queries copper zones (filled pours) on the board with optional filters by net, layer, or bounding box. Returns one entry per zone with net, layers, priority, fill state, and bounding box. Useful for auditing power planes and GND pours, which 'query_traces' does not include.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "net": {
+                    "type": "string",
+                    "description": "Filter by net name (e.g., 'GND', '+3V3')",
+                },
+                "layer": {
+                    "type": "string",
+                    "description": "Filter by layer name (e.g., 'In1.Cu', 'B.Cu'). Matches zones that include this layer in their layer set.",
+                },
+                "boundingBox": {
+                    "type": "object",
+                    "description": "Filter to zones whose bounding box overlaps this region",
+                    "properties": {
+                        "x1": {"type": "number", "description": "Left X coordinate"},
+                        "y1": {"type": "number", "description": "Top Y coordinate"},
+                        "x2": {"type": "number", "description": "Right X coordinate"},
+                        "y2": {"type": "number", "description": "Bottom Y coordinate"},
+                        "unit": {
+                            "type": "string",
+                            "enum": ["mm", "mil", "inch"],
+                            "default": "mm",
+                        },
+                    },
+                },
+            },
+        },
+    },
+    {
+        "name": "add_gnd_stitching_vias",
+        "title": "Add GND Stitching Vias",
+        "description": (
+            "Drop GND stitching vias across the board with collision "
+            "checking against every non-GND segment, via, and pad on "
+            "every copper layer (PTH vias penetrate the full stackup, "
+            "so missing one layer is the classic silent-short failure "
+            "mode that other GND-stitching tools have). Combines three "
+            "strategies: a regular `grid` across the interior, "
+            "`around_refs` (densify around named ICs like an MCU or "
+            "switching regulator), and `in_zones` (only place vias "
+            "where they actually land on a GND copper zone so they "
+            "stitch real polygons together rather than floating on "
+            "silkscreen). Supports `dryRun` to preview placements "
+            "without writing to the board. "
+            "Approach ported from morningfire-pcb-automation "
+            "(https://github.com/NiNjA-CodE/morningfire-pcb-automation, "
+            "scripts/ground/add_gnd_vias.py); this version reads "
+            "obstacles via the pcbnew API (handles rotation, picks up "
+            "net classes, integrates with the live in-memory board) "
+            "and adds the in-zones strategy + maxVias cap + dry-run."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "gndNet": {
+                    "type": "string",
+                    "description": (
+                        "Name of the ground net (default: auto-detect "
+                        "GND / GROUND / VSS / /GND)."
+                    ),
+                },
+                "strategies": {
+                    "type": "array",
+                    "description": (
+                        "Which placement strategies to combine (default: "
+                        "['grid']). Pass ['grid', 'around_refs', "
+                        "'in_zones'] for full coverage."
+                    ),
+                    "items": {
+                        "type": "string",
+                        "enum": ["grid", "around_refs", "in_zones"],
+                    },
+                },
+                "viaSize": {
+                    "type": "number",
+                    "description": "Via pad diameter in mm (default 0.6).",
+                    "default": 0.6,
+                },
+                "viaDrill": {
+                    "type": "number",
+                    "description": (
+                        "Via drill diameter in mm (default 0.3). " "Must be smaller than viaSize."
+                    ),
+                    "default": 0.3,
+                },
+                "clearance": {
+                    "type": "number",
+                    "description": (
+                        "Extra clearance beyond required between each new "
+                        "via and existing copper, in mm. Default 0.2."
+                    ),
+                    "default": 0.2,
+                },
+                "spacing": {
+                    "type": "number",
+                    "description": (
+                        "Grid spacing in mm for the `grid` and "
+                        "`around_refs` strategies. Default 5.0."
+                    ),
+                    "default": 5.0,
+                },
+                "densifyRefs": {
+                    "type": "array",
+                    "description": (
+                        "Reference designators to densify ground around "
+                        "(used by `around_refs` strategy). Good targets: "
+                        "MCUs, switching regulators, RF parts."
+                    ),
+                    "items": {"type": "string"},
+                },
+                "densifyRadius": {
+                    "type": "integer",
+                    "description": (
+                        "How many grid cells around each ref to try "
+                        "(default 2 = 5x5 candidate field per ref)."
+                    ),
+                    "default": 2,
+                },
+                "edgeMargin": {
+                    "type": "number",
+                    "description": ("Keep-out from the board edge in mm. Default 0.5."),
+                    "default": 0.5,
+                },
+                "maxVias": {
+                    "type": "integer",
+                    "description": (
+                        "Cap on total placements across all strategies "
+                        "(default unlimited). Useful when iterating."
+                    ),
+                },
+                "dryRun": {
+                    "type": "boolean",
+                    "description": (
+                        "If true, return the placements that would be "
+                        "made but don't modify the board. Default false."
+                    ),
                     "default": False,
                 },
             },
@@ -897,7 +1723,7 @@ ROUTING_TOOLS = [
                         "y": {"type": "number", "description": "Y coordinate"},
                         "unit": {
                             "type": "string",
-                            "enum": ["mm", "inch"],
+                            "enum": ["mm", "mil", "inch"],
                             "default": "mm",
                         },
                     },
@@ -1065,340 +1891,6 @@ ROUTING_TOOLS = [
 ]
 
 # =============================================================================
-# AUTOROUTE / HYBRID ROUTING TOOLS
-# =============================================================================
-
-AUTOROUTE_TOOLS = [
-    {
-        "name": "autoroute",
-        "title": "Default Hybrid Autoroute",
-        "description": "Runs the constraint-first hybrid autorouting orchestrator. This is the default autoroute entrypoint and no longer maps directly to bare Freerouting.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "boardPath": {"type": "string", "description": "Path to .kicad_pcb file"},
-                "strategy": {
-                    "type": "string",
-                    "enum": ["hybrid", "critical_only", "analysis_only"],
-                    "description": "Routing strategy",
-                },
-                "seed": {"type": "number", "description": "Deterministic seed"},
-                "profiles": {"type": "array", "items": {"type": "string"}},
-                "interfaces": {"type": "array", "items": {"type": "string"}},
-                "criticalClasses": {"type": "array", "items": {"type": "string"}},
-                "powerCurrentA": {
-                    "type": "number",
-                    "description": "Optional DC current in amps used to derive IPC-2221 minimum power trace widths",
-                },
-                "copperOz": {
-                    "type": "number",
-                    "description": "Copper weight in oz for IPC-2221 power-width synthesis",
-                },
-                "tempRiseC": {
-                    "type": "number",
-                    "description": "Allowed temperature rise in Celsius for IPC-2221 power-width synthesis",
-                },
-                "maxLengthMm": {
-                    "type": "number",
-                    "description": "Optional absolute length ceiling for HS single-ended nets",
-                },
-                "matchedLengthGroups": {
-                    "type": "array",
-                    "description": "Optional explicit matched-length groups such as DDR or address/data buses",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "nets": {"type": "array", "items": {"type": "string"}},
-                            "maxSkewMm": {"type": "number"},
-                            "type": {"type": "string"},
-                        },
-                        "required": ["nets"],
-                    },
-                },
-                "inferMatchedLengthGroups": {
-                    "type": "boolean",
-                    "description": "Infer bus-style matched-length groups automatically from interface-aware net naming.",
-                },
-                "autoMatchedLengthMaxSkewMm": {
-                    "type": "number",
-                    "minimum": 0,
-                    "description": "Override the default skew target used for auto-inferred matched-length groups.",
-                },
-                "autoMatchedLengthMinGroupSize": {
-                    "type": "integer",
-                    "minimum": 2,
-                    "description": "Minimum net count for an auto-inferred matched-length bus group.",
-                },
-                "autoMatchedLengthMaxGroupSize": {
-                    "type": "integer",
-                    "minimum": 2,
-                    "description": "Maximum net count for an auto-inferred matched-length bus group.",
-                },
-                "excludeFromFreeRouting": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "Net names to keep out of the bulk router. Pass [] to exclude nothing explicitly.",
-                },
-                "freeroutingJar": {"type": "string", "description": "Path to freerouting.jar"},
-                "maxPasses": {"type": "integer", "minimum": 1},
-                "timeout": {"type": "integer", "minimum": 1},
-                "maxReroutePasses": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "description": "Retry count for critical nets that fail in the first pass",
-                },
-                "orthorouteExecutable": {"type": "string", "description": "Optional external OrthoRoute executable"},
-                "refillZones": {
-                    "type": "boolean",
-                    "description": "Refill copper zones during post-route cleanup",
-                },
-                "autoCreateReferenceZones": {
-                    "type": "boolean",
-                    "description": "Create a deterministic ground reference zone automatically when high-speed nets exist but no ground plane is present.",
-                },
-                "referenceZoneNet": {"type": "string"},
-                "referenceZoneLayer": {"type": "string"},
-                "referenceZoneInsetMm": {"type": "number", "minimum": 0},
-                "referenceZoneClearanceMm": {"type": "number", "minimum": 0},
-                "referenceZoneMinWidthMm": {"type": "number", "minimum": 0},
-                "reportPath": {
-                    "type": "string",
-                    "description": "Optional DRC report output path used by QoR verification",
-                },
-                "qorReportPath": {
-                    "type": "string",
-                    "description": "Optional JSON QoR report output path",
-                },
-            },
-        },
-    },
-    {
-        "name": "autoroute_cfha",
-        "title": "Constraint-First Hybrid Autoroute",
-        "description": "Explicit entrypoint for the full CFHA orchestration pipeline.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "boardPath": {"type": "string", "description": "Path to .kicad_pcb file"},
-                "strategy": {
-                    "type": "string",
-                    "enum": ["hybrid", "critical_only", "analysis_only"],
-                },
-                "seed": {"type": "number"},
-                "profiles": {"type": "array", "items": {"type": "string"}},
-                "interfaces": {"type": "array", "items": {"type": "string"}},
-                "criticalClasses": {"type": "array", "items": {"type": "string"}},
-                "placementRoutingCorridors": {
-                    "type": "array",
-                    "items": {"type": "object"},
-                    "description": "Numeric breakout corridor reservations returned by sync_schematic_to_board as auto_place_routing_corridors. Used to prioritize critical routing and verify corridor congestion risk.",
-                },
-                "powerCurrentA": {"type": "number"},
-                "copperOz": {"type": "number"},
-                "tempRiseC": {"type": "number"},
-                "maxLengthMm": {"type": "number"},
-                "matchedLengthGroups": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "nets": {"type": "array", "items": {"type": "string"}},
-                            "maxSkewMm": {"type": "number"},
-                            "type": {"type": "string"},
-                        },
-                        "required": ["nets"],
-                    },
-                },
-                "inferMatchedLengthGroups": {"type": "boolean"},
-                "autoMatchedLengthMaxSkewMm": {"type": "number", "minimum": 0},
-                "autoMatchedLengthMinGroupSize": {"type": "integer", "minimum": 2},
-                "autoMatchedLengthMaxGroupSize": {"type": "integer", "minimum": 2},
-                "excludeFromFreeRouting": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "Net names to keep out of the bulk router. Pass [] to exclude nothing explicitly.",
-                },
-                "freeroutingJar": {"type": "string"},
-                "maxReroutePasses": {"type": "integer", "minimum": 1},
-                "orthorouteExecutable": {"type": "string"},
-                "refillZones": {"type": "boolean"},
-                "autoCreateReferenceZones": {"type": "boolean"},
-                "referenceZoneNet": {"type": "string"},
-                "referenceZoneLayer": {"type": "string"},
-                "referenceZoneInsetMm": {"type": "number", "minimum": 0},
-                "referenceZoneClearanceMm": {"type": "number", "minimum": 0},
-                "referenceZoneMinWidthMm": {"type": "number", "minimum": 0},
-                "reportPath": {"type": "string"},
-                "qorReportPath": {"type": "string"},
-            },
-        },
-    },
-    {
-        "name": "analyze_board_routing_context",
-        "title": "Analyze Routing Context",
-        "description": "Runs preflight board analysis for stackup, density, plane continuity, split-risk, and backend readiness.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "boardPath": {"type": "string", "description": "Path to .kicad_pcb file"},
-                "profiles": {"type": "array", "items": {"type": "string"}},
-                "interfaces": {"type": "array", "items": {"type": "string"}},
-            },
-        },
-    },
-    {
-        "name": "extract_routing_intents",
-        "title": "Extract Routing Intents",
-        "description": "Classifies nets into routing intents such as RF, HS_DIFF, POWER_SWITCHING, and GENERIC.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "boardPath": {"type": "string"},
-                "intentOverrides": {
-                    "type": "object",
-                    "description": "Explicit net-to-intent mapping overrides",
-                    "additionalProperties": {"type": "string"},
-                },
-                "inferMatchedLengthGroups": {"type": "boolean"},
-                "autoMatchedLengthMaxSkewMm": {"type": "number", "minimum": 0},
-                "autoMatchedLengthMinGroupSize": {"type": "integer", "minimum": 2},
-                "autoMatchedLengthMaxGroupSize": {"type": "integer", "minimum": 2},
-            },
-        },
-    },
-    {
-        "name": "generate_routing_constraints",
-        "title": "Generate Canonical Routing Constraints",
-        "description": "Builds and writes the canonical JSON routing constraint schema.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "boardPath": {"type": "string"},
-                "profiles": {"type": "array", "items": {"type": "string"}},
-                "interfaces": {"type": "array", "items": {"type": "string"}},
-                "criticalClasses": {"type": "array", "items": {"type": "string"}},
-                "placementRoutingCorridors": {
-                    "type": "array",
-                    "items": {"type": "object"},
-                    "description": "Numeric breakout corridor reservations returned by sync_schematic_to_board as auto_place_routing_corridors. These become placementRoutingCorridors in the canonical constraints artifact.",
-                },
-                "powerCurrentA": {"type": "number"},
-                "copperOz": {"type": "number"},
-                "tempRiseC": {"type": "number"},
-                "maxLengthMm": {"type": "number"},
-                "matchedLengthGroups": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "nets": {"type": "array", "items": {"type": "string"}},
-                            "maxSkewMm": {"type": "number"},
-                            "type": {"type": "string"},
-                        },
-                        "required": ["nets"],
-                    },
-                },
-                "inferMatchedLengthGroups": {"type": "boolean"},
-                "autoMatchedLengthMaxSkewMm": {"type": "number", "minimum": 0},
-                "autoMatchedLengthMinGroupSize": {"type": "integer", "minimum": 2},
-                "autoMatchedLengthMaxGroupSize": {"type": "integer", "minimum": 2},
-                "excludeFromFreeRouting": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "Net names to keep out of the bulk router. Pass [] to exclude nothing explicitly.",
-                },
-                "outputPath": {"type": "string"},
-            },
-        },
-    },
-    {
-        "name": "generate_kicad_dru",
-        "title": "Generate KiCad DRU Rules",
-        "description": "Compiles routing constraints into a .kicad_dru custom-rules artifact.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "boardPath": {"type": "string"},
-                "outputPath": {"type": "string"},
-            },
-        },
-    },
-    {
-        "name": "route_critical_nets",
-        "title": "Route Critical Nets",
-        "description": "Routes only critical nets using the embedded constraint-aware critical router.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "boardPath": {"type": "string"},
-                "criticalClasses": {"type": "array", "items": {"type": "string"}},
-                "criticalLayer": {"type": "string"},
-                "criticalWidthMm": {"type": "number"},
-                "maxReroutePasses": {"type": "integer", "minimum": 1},
-            },
-        },
-    },
-    {
-        "name": "run_freerouting",
-        "title": "Run Freerouting Bulk Router",
-        "description": "Runs Freerouting as the bulk-routing stage after critical nets have been reserved or completed.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "boardPath": {"type": "string"},
-                "freeroutingJar": {"type": "string"},
-                "maxPasses": {"type": "integer", "minimum": 1},
-                "timeout": {"type": "integer", "minimum": 1},
-                "seed": {"type": "number"},
-                "excludeNets": {"type": "array", "items": {"type": "string"}},
-                "dsnPath": {"type": "string"},
-                "sesPath": {"type": "string"},
-            },
-        },
-    },
-    {
-        "name": "post_tune_routes",
-        "title": "Post Tune Routes",
-        "description": "Runs post-route cleanup hooks such as connectivity rebuild, optional matched-length meander insertion for explicit bus groups, optional zone refill, and support-net healing for residual ground/power disconnects.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "boardPath": {"type": "string"},
-                "matchedLengthGroups": {"type": "array", "items": {"type": "object"}},
-                "autoTuneMatchedLengths": {"type": "boolean"},
-                "matchedLengthMinExtraMm": {"type": "number", "minimum": 0},
-                "matchedLengthMaxGroupSize": {"type": "integer", "minimum": 2},
-                "refillZones": {"type": "boolean"},
-                "autoCreateReferenceZones": {"type": "boolean"},
-                "referenceZoneNet": {"type": "string"},
-                "referenceZoneLayer": {"type": "string"},
-                "referenceZoneInsetMm": {"type": "number", "minimum": 0},
-                "referenceZoneClearanceMm": {"type": "number", "minimum": 0},
-                "referenceZoneMinWidthMm": {"type": "number", "minimum": 0},
-                "autoHealSupportNets": {"type": "boolean"},
-                "healingPasses": {"type": "integer", "minimum": 1},
-                "maxHealingViasPerNet": {"type": "integer", "minimum": 1},
-                "healingReportPath": {"type": "string"},
-            },
-        },
-    },
-    {
-        "name": "verify_routing_qor",
-        "title": "Verify Routing QoR",
-        "description": "Runs DRC and generates routing quality metrics and risk flags, including explicit matched-length group skew.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "boardPath": {"type": "string"},
-                "reportPath": {"type": "string"},
-                "qorReportPath": {"type": "string"},
-                "matchedLengthGroups": {"type": "array", "items": {"type": "object"}},
-            },
-        },
-    },
-]
-
-# =============================================================================
 # LIBRARY TOOLS
 # =============================================================================
 
@@ -1443,6 +1935,149 @@ LIBRARY_TOOLS = [
                 }
             },
             "required": ["library"],
+        },
+    },
+    {
+        "name": "list_library_table",
+        "title": "List Library Table Entries",
+        "description": (
+            "Read a sym-lib-table or fp-lib-table: nickname, type, URI and description of "
+            "every registered library. Each URI is resolved through ${KIPRJMOD}, KiCad's "
+            "built-in library directories (KICAD*_SYMBOL_DIR and friends), the path "
+            "variables configured in kicad_common.json and the environment, and reported "
+            "alongside whether the file is actually there -- which is how a stale row left "
+            'over from a library migration shows itself. A (type "Table") row is flagged '
+            "as an indirection, with a count of the libraries it stands for."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "tableType": {
+                    "type": "string",
+                    "enum": ["symbol", "footprint"],
+                    "default": "symbol",
+                    "description": "sym-lib-table ('symbol') or fp-lib-table ('footprint')",
+                },
+                "scope": {
+                    "type": "string",
+                    "enum": ["project", "global"],
+                    "default": "project",
+                    "description": "Project table (needs projectPath) or KiCad's user config",
+                },
+                "projectPath": {
+                    "type": "string",
+                    "description": "Path to the .kicad_pro or its directory, for scope=project",
+                },
+                "tablePath": {
+                    "type": "string",
+                    "description": "Path to the table file itself, bypassing scope resolution",
+                },
+            },
+        },
+    },
+    {
+        "name": "remove_library_table_entry",
+        "title": "Remove Library Table Entry",
+        "description": (
+            "Remove one or more entries from a sym-lib-table or fp-lib-table by nickname -- "
+            "the counterpart to register_symbol_library / register_footprint_library. The "
+            "table is re-parsed before it is written, so an edit that would leave it "
+            "unbalanced is refused rather than saved; the write is atomic and the previous "
+            "contents are kept in a sibling .mcp-backups/ directory. Use dryRun first when "
+            "the target is scope='global', which every project on the machine loads. "
+            'Removing a (type "Table") row unregisters every library in the table it '
+            "points at, and the result says so."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "tableType": {
+                    "type": "string",
+                    "enum": ["symbol", "footprint"],
+                    "default": "symbol",
+                    "description": "sym-lib-table ('symbol') or fp-lib-table ('footprint')",
+                },
+                "scope": {
+                    "type": "string",
+                    "enum": ["project", "global"],
+                    "default": "project",
+                    "description": "Project table (needs projectPath) or KiCad's user config",
+                },
+                "projectPath": {
+                    "type": "string",
+                    "description": "Path to the .kicad_pro or its directory, for scope=project",
+                },
+                "tablePath": {
+                    "type": "string",
+                    "description": "Path to the table file itself, bypassing scope resolution",
+                },
+                "libraryName": {"type": "string", "description": "Nickname to remove"},
+                "libraryNames": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Several nicknames to remove in one pass",
+                },
+                "dryRun": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Report what would be removed without writing the table",
+                },
+            },
+            # A destructive tool with no required argument can be fired with none
+            # at all; at least one nickname has to be named.
+            "anyOf": [{"required": ["libraryName"]}, {"required": ["libraryNames"]}],
+        },
+    },
+    {
+        "name": "set_library_table_uri",
+        "title": "Repoint Library Table Entry",
+        "description": (
+            "Repoint an existing library-table entry at a different file, keeping its "
+            "nickname, type and description. Use it to move a project onto "
+            "${KIPRJMOD}-relative paths, or to follow a library that was relocated, without "
+            "unregistering and re-registering it."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "tableType": {
+                    "type": "string",
+                    "enum": ["symbol", "footprint"],
+                    "default": "symbol",
+                    "description": "sym-lib-table ('symbol') or fp-lib-table ('footprint')",
+                },
+                "scope": {
+                    "type": "string",
+                    "enum": ["project", "global"],
+                    "default": "project",
+                    "description": "Project table (needs projectPath) or KiCad's user config",
+                },
+                "projectPath": {
+                    "type": "string",
+                    "description": "Path to the .kicad_pro or its directory, for scope=project",
+                },
+                "tablePath": {
+                    "type": "string",
+                    "description": "Path to the table file itself, bypassing scope resolution",
+                },
+                "libraryName": {
+                    "type": "string",
+                    "description": "Nickname of the entry to repoint",
+                },
+                "uri": {
+                    "type": "string",
+                    "description": (
+                        "New URI, e.g. ${KIPRJMOD}/../FOG_components.kicad_sym. Path variables "
+                        "are stored verbatim and only expanded to check the file exists."
+                    ),
+                },
+                "dryRun": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Report the new URI without writing the table",
+                },
+            },
+            "required": ["libraryName", "uri"],
         },
     },
     {
@@ -1523,6 +2158,66 @@ DESIGN_RULE_TOOLS = [
         "title": "Get DRC Violations",
         "description": "Returns a list of design rule violations from the most recent DRC run.",
         "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "assign_net_to_class",
+        "title": "Assign Net to Class",
+        "description": "Assigns an existing net to an existing net class to apply its design rules.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "net": {"type": "string", "description": "Name of the net"},
+                "netClass": {"type": "string", "description": "Name of the net class"},
+            },
+            "required": ["net", "netClass"],
+        },
+    },
+    {
+        "name": "check_clearance",
+        "title": "Check Clearance",
+        "description": "Checks the measured clearance between two PCB items against the board's minimum clearance design rule.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "item1": {
+                    "type": "object",
+                    "description": "First item: {type, id?, reference?}",
+                },
+                "item2": {
+                    "type": "object",
+                    "description": "Second item: {type, id?, reference?}",
+                },
+            },
+            "required": ["item1", "item2"],
+        },
+    },
+    {
+        "name": "set_layer_constraints",
+        "title": "Set Layer Constraints",
+        "description": "Sets per-layer minimum track width, clearance, and via dimensions via a .kicad_dru custom rule.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "layer": {"type": "string", "description": "Layer name (e.g. 'F.Cu')"},
+                "minTrackWidth": {
+                    "type": "number",
+                    "description": "Minimum track width for this layer (mm)",
+                },
+                "minClearance": {
+                    "type": "number",
+                    "description": "Minimum clearance for this layer (mm)",
+                },
+                "minViaDiameter": {
+                    "type": "number",
+                    "description": "Minimum via diameter for this layer (mm)",
+                },
+                "minViaDrill": {
+                    "type": "number",
+                    "description": "Minimum via drill size for this layer (mm)",
+                },
+            },
+            "required": ["layer"],
+        },
     },
 ]
 
@@ -1756,7 +2451,15 @@ SCHEMATIC_TOOLS = [
     {
         "name": "add_schematic_net_label",
         "title": "Add Net Label",
-        "description": "Adds a net label at exact coordinates on a schematic wire or pin endpoint. WARNING: x/y must match an existing wire endpoint or pin endpoint exactly — placing the label even 0.01mm away from a pin will result in an unconnected pin ERC error. To connect a component pin to a net by reference and pin number (recommended), use connect_to_net instead.",
+        "description": (
+            "Add a net label to a schematic. "
+            "PREFERRED: supply componentRef + pinNumber to snap the label to the exact pin endpoint — "
+            "this guarantees an electrical connection. "
+            "Alternatively supply position [x, y], but the coordinates must match the pin endpoint exactly "
+            "(even a 0.01 mm offset breaks the connection). "
+            "The response includes actual_position (coordinates actually used) and snapped_to_pin "
+            "(present when a pin reference was resolved)."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1768,21 +2471,45 @@ SCHEMATIC_TOOLS = [
                     "type": "string",
                     "description": "Name of the net (e.g., VCC, GND, SDA)",
                 },
-                "x": {"type": "number", "description": "X coordinate on schematic"},
-                "y": {"type": "number", "description": "Y coordinate on schematic"},
-                "rotation": {
+                "position": {
+                    "type": "array",
+                    "items": {"type": "number"},
+                    "minItems": 2,
+                    "maxItems": 2,
+                    "description": "Position [x, y] for the label. Required when componentRef/pinNumber are not given.",
+                },
+                "componentRef": {
+                    "type": "string",
+                    "description": "Component reference to snap label to (e.g. U1, R1). Use with pinNumber.",
+                },
+                "pinNumber": {
+                    "type": "string",
+                    "description": "Pin number or name on componentRef (e.g. '1', 'GND'). Use with componentRef.",
+                },
+                "labelType": {
+                    "type": "string",
+                    "enum": ["label", "global_label", "hierarchical_label"],
+                    "description": "Label type (default: label)",
+                    "default": "label",
+                },
+                "orientation": {
                     "type": "number",
                     "description": "Rotation angle in degrees (0, 90, 180, 270)",
                     "default": 0,
                 },
             },
-            "required": ["schematicPath", "netName", "x", "y"],
+            "required": ["schematicPath", "netName"],
         },
     },
     {
         "name": "connect_to_net",
         "title": "Connect Pin to Net",
-        "description": "Intelligently connects a component pin to a named net, automatically routing wires as needed.",
+        "description": (
+            "Connect a component pin to a named net by adding a wire stub and net label at the exact "
+            "pin endpoint. The response includes pin_location (exact pin coords), label_location "
+            "(where the label was placed), and wire_stub (the wire segment added) so you can confirm "
+            "the placement without a separate verification call."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1792,30 +2519,18 @@ SCHEMATIC_TOOLS = [
                 },
                 "componentRef": {
                     "type": "string",
-                    "description": "Component reference designator (e.g., U1, R1)",
+                    "description": "Component reference designator (e.g., R1, U3)",
                 },
                 "pinName": {
                     "type": "string",
-                    "description": "Pin name/number on the component",
-                },
-                "reference": {
-                    "type": "string",
-                    "description": "Alias for componentRef",
-                },
-                "pinNumber": {
-                    "type": "string",
-                    "description": "Alias for pinName",
+                    "description": "Pin number or name on the component",
                 },
                 "netName": {
                     "type": "string",
                     "description": "Name of the net to connect to",
                 },
             },
-            "required": ["schematicPath", "netName"],
-            "anyOf": [
-                {"required": ["componentRef", "pinName"]},
-                {"required": ["reference", "pinNumber"]},
-            ],
+            "required": ["schematicPath", "componentRef", "pinName", "netName"],
         },
     },
     {
@@ -1840,21 +2555,67 @@ SCHEMATIC_TOOLS = [
     {
         "name": "get_wire_connections",
         "title": "Get Wire Connections",
-        "description": "Returns all wires and component pins connected to the wire at a given point, by flood-filling through touching wires.",
+        "description": (
+            "Returns the net name and all wires and component pins connected at a given point. "
+            "Accepts either a component reference + pin number (e.g. reference='U1', pin='3') "
+            "or a schematic coordinate (x, y in mm). "
+            "The response includes: 'net' (label name or null for unnamed nets), "
+            "'pins' (all component pins on the net), 'wires' (all wire segments on the net), "
+            "and 'query_point' (the resolved coordinate used). "
+            "The query point must be at a wire endpoint or junction — wire midpoints are not matched. "
+            "Use get_schematic_pin_locations or list_schematic_wires to obtain exact endpoint coordinates."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "schematicPath": {
                     "type": "string",
-                    "description": "Path to schematic file",
+                    "description": "Path to the schematic file (.kicad_sch)",
+                },
+                "reference": {
+                    "type": "string",
+                    "description": "Component reference (e.g. U1, R1). Pair with pin.",
+                },
+                "pin": {
+                    "type": "string",
+                    "description": "Pin number or name (e.g. '3', 'SDA'). Pair with reference.",
                 },
                 "x": {
                     "type": "number",
-                    "description": "X coordinate of the point on the wire",
+                    "description": "X coordinate of a wire endpoint in mm. Pair with y.",
                 },
                 "y": {
                     "type": "number",
-                    "description": "Y coordinate of the point on the wire",
+                    "description": "Y coordinate of a wire endpoint in mm. Pair with x.",
+                },
+            },
+            "required": ["schematicPath"],
+        },
+    },
+    {
+        "name": "get_net_at_point",
+        "title": "Get Net At Point",
+        "description": (
+            "Returns the net name at a given (x, y) coordinate in a schematic, "
+            "or null if no net label or wire endpoint is present at that position. "
+            "Checks net label positions first, then wire endpoints. "
+            "Useful for quickly identifying what net occupies a specific coordinate "
+            "without traversing the full wire graph."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "schematicPath": {
+                    "type": "string",
+                    "description": "Path to the schematic file (.kicad_sch)",
+                },
+                "x": {
+                    "type": "number",
+                    "description": "X coordinate in mm",
+                },
+                "y": {
+                    "type": "number",
+                    "description": "Y coordinate in mm",
                 },
             },
             "required": ["schematicPath", "x", "y"],
@@ -1928,7 +2689,7 @@ SCHEMATIC_TOOLS = [
     {
         "name": "sync_schematic_to_board",
         "title": "Sync Schematic to PCB (F8)",
-        "description": "Reads net connections from the schematic and assigns them to matching component pads in the PCB board file. Equivalent to KiCAD Pcbnew F8 'Update PCB from Schematic'. On a blank PCB it can auto-place missing footprints from the schematic before assigning nets, returning placement clusters plus numeric routing corridor reservations for high-speed/RF/reference-sensitive breakouts.",
+        "description": "Reads net connections from the schematic and assigns them to matching component pads in the PCB board file. Equivalent to KiCAD Pcbnew F8 'Update PCB from Schematic'. Must be called after placing components and before routing traces, so that pad-to-net assignments are correct.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -1942,101 +2703,138 @@ SCHEMATIC_TOOLS = [
                 },
                 "autoPlaceMissingFootprints": {
                     "type": "boolean",
-                    "description": "If true, auto-place schematic footprints missing from the PCB. Defaults to true only when the board is blank.",
+                    "description": (
+                        "Place footprints added by this sync automatically. Defaults to true "
+                        "for a blank board and false when preserving an existing layout."
+                    ),
                 },
                 "placementStrategy": {
                     "type": "string",
                     "enum": ["routing_aware", "grid"],
-                    "description": "Auto-placement strategy for missing footprints. routing_aware clusters connected parts, pushes connectors toward edges, and emits routing corridor reservations; grid preserves the legacy deterministic grid behavior.",
-                },
-                "placementEdgeMarginMm": {
-                    "type": "number",
-                    "description": "Minimum distance to keep from the board outline when routing-aware auto-placement is used.",
-                },
-                "placementClusterGapMm": {
-                    "type": "number",
-                    "description": "Preferred spacing between routing-aware placement clusters.",
+                    "default": "routing_aware",
+                    "description": "Initial placement strategy for newly added footprints.",
                 },
                 "placementStartXmm": {
                     "type": "number",
-                    "description": "Grid fallback start X in mm, and the fallback origin when routing-aware placement has leftovers.",
+                    "description": "Optional placement origin X in millimetres.",
                 },
                 "placementStartYmm": {
                     "type": "number",
-                    "description": "Grid fallback start Y in mm, and the fallback origin when routing-aware placement has leftovers.",
+                    "description": "Optional placement origin Y in millimetres.",
                 },
                 "placementPitchXmm": {
                     "type": "number",
-                    "description": "Preferred horizontal spacing between auto-placed footprints in mm.",
+                    "exclusiveMinimum": 0,
+                    "default": 20,
+                    "description": "Horizontal footprint pitch in millimetres.",
                 },
                 "placementPitchYmm": {
                     "type": "number",
-                    "description": "Preferred vertical spacing between auto-placed footprints in mm.",
+                    "exclusiveMinimum": 0,
+                    "default": 15,
+                    "description": "Vertical footprint pitch in millimetres.",
                 },
                 "placementColumns": {
                     "type": "integer",
                     "minimum": 1,
-                    "description": "Column count used by the deterministic grid fallback.",
+                    "default": 6,
+                    "description": "Maximum columns for grid fallback placement.",
+                },
+                "placementEdgeMarginMm": {
+                    "type": "number",
+                    "minimum": 0,
+                    "default": 3,
+                    "description": "Minimum placement margin from the board edge in millimetres.",
+                },
+                "placementClusterGapMm": {
+                    "type": "number",
+                    "minimum": 0,
+                    "description": "Gap between routing-aware functional clusters in millimetres.",
                 },
             },
         },
     },
     {
-        "name": "validate_schematic_pcb_sync",
-        "title": "Validate Schematic/PCB Sync",
-        "description": "Checks that the PCB is a faithful physical view of the schematic: schematic footprints exist on the PCB, relevant PCB footprints exist in the schematic, and each PCB pad net matches the schematic netlist.",
+        "name": "backannotate_footprints",
+        "title": "Back-annotate Footprints (PCB to Schematic)",
+        "description": (
+            "Copy footprint assignments from a .kicad_pcb back into the schematic's "
+            "Footprint fields -- the reverse of sync_schematic_to_board. After a layout "
+            "pass the board is the side that is right: footprints get swapped in pcbnew, "
+            "and imported projects land with schematic-side fields that never matched the "
+            "placed parts. Matching is by reference designator, taken from each symbol's "
+            "(instances ...) block so a sheet placed more than once contributes all of its "
+            "designators; virtual references starting with '#' (power, ground) are skipped, "
+            "and every unit of a multi-unit symbol is updated. Only the quoted value is "
+            "rewritten, so field visibility, font and position survive. Nothing is written "
+            "for a reference the board uses twice, or for instances that share one Footprint "
+            "field but disagree on the board -- those are listed under 'conflicts'. "
+            "Footprints on the board with no matching symbol are listed under "
+            "'notInSchematic'. Instances missing a Footprint field get one added unless "
+            "addMissing is false. Use dryRun to see the diff first."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
+                "boardPath": {"type": "string", "description": "Path to the .kicad_pcb file"},
                 "schematicPath": {
                     "type": "string",
-                    "description": "Path to .kicad_sch file. If omitted, auto-detected from boardPath.",
+                    "description": (
+                        "Single sheet to update. Omit to walk the sheet tree from the root "
+                        "schematic named after the board, which is what a hierarchical "
+                        "design needs; local history, backup copies and other projects "
+                        "under the same directory are left alone."
+                    ),
                 },
-                "boardPath": {
-                    "type": "string",
-                    "description": "Path to .kicad_pcb file. If omitted, uses currently loaded board.",
-                },
-                "ignoreMechanicalFootprints": {
-                    "type": "boolean",
-                    "description": "Ignore mechanical-only PCB footprints such as mounting holes and fiducials (default: true).",
-                },
-                "ignoreReferences": {
+                "references": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Specific PCB references to ignore during comparison.",
+                    "description": "Limit the update to these reference designators",
                 },
-                "ignoreReferencePrefixes": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "PCB reference prefixes to ignore during comparison.",
-                },
-                "compareFootprints": {
+                "addMissing": {
                     "type": "boolean",
-                    "description": "Also compare schematic footprint IDs against PCB footprint IDs (default: true).",
+                    "default": True,
+                    "description": "Add a Footprint field to instances that have none",
+                },
+                "dryRun": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Report the changes without writing them",
                 },
             },
+            "required": ["boardPath"],
+        },
+    },
+    {
+        "name": "create_board_from_schematic",
+        "title": "Create Board From Schematic",
+        "description": "Creates a fresh .kicad_pcb file, then updates it from the schematic so footprints and nets are present.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "schematicPath": {"type": "string"},
+                "boardPath": {"type": "string"},
+                "overwrite": {"type": "boolean", "default": False},
+            },
+            "required": ["schematicPath"],
         },
     },
     {
         "name": "generate_netlist",
-        "title": "Generate Netlist",
-        "description": "Generates a netlist from the schematic showing all components and their net connections.",
+        "title": "Generate Netlist (JSON)",
+        "description": (
+            "Returns a structured JSON netlist from the schematic: component list "
+            "(reference, value, footprint) and net list (net name + all connected "
+            "component/pin pairs). Uses kicad-cli internally — requires a saved "
+            ".kicad_sch file. For writing to a file or exporting SPICE/Cadstar/OrcadPCB2 "
+            "format, use export_netlist instead."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "schematicPath": {
                     "type": "string",
-                    "description": "Path to schematic file",
-                },
-                "outputPath": {
-                    "type": "string",
-                    "description": "Optional path to save netlist file",
-                },
-                "format": {
-                    "type": "string",
-                    "enum": ["kicad", "json", "spice"],
-                    "description": "Netlist output format",
-                    "default": "json",
+                    "description": "Absolute path to the .kicad_sch schematic file",
                 },
             },
             "required": ["schematicPath"],
@@ -2071,28 +2869,6 @@ SCHEMATIC_TOOLS = [
                 "outputPath": {"type": "string", "description": "Path for output PDF"},
             },
             "required": ["schematicPath", "outputPath"],
-        },
-    },
-    {
-        "name": "add_schematic_junction",
-        "title": "Add Junction to Schematic",
-        "description": "Adds a junction (connection dot) at the specified coordinates on the schematic. Junctions are required in KiCAD to mark intentional connections where wires cross or where a wire branches off another wire. Without a junction, crossing wires are not electrically connected.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "schematicPath": {
-                    "type": "string",
-                    "description": "Path to schematic file",
-                },
-                "position": {
-                    "type": "array",
-                    "description": "The [x, y] coordinates where the junction should be placed. Must be on an existing wire intersection or branch point.",
-                    "items": {"type": "number"},
-                    "minItems": 2,
-                    "maxItems": 2,
-                },
-            },
-            "required": ["schematicPath", "position"],
         },
     },
     # --- Schematic Analysis Tools (read-only) ---
@@ -2205,6 +2981,469 @@ SCHEMATIC_TOOLS = [
             "required": ["schematicPath"],
         },
     },
+    {
+        "name": "find_orphaned_wires",
+        "title": "Find Orphaned Wires",
+        "description": (
+            "Find wire segments with at least one dangling endpoint — an endpoint not connected "
+            "to a component pin, net label, or another wire. "
+            "Orphaned wires cause ERC 'wire end unconnected' errors and indicate routing mistakes. "
+            "Does not require the KiCad UI to be running."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "schematicPath": {
+                    "type": "string",
+                    "description": "Path to the .kicad_sch schematic file",
+                }
+            },
+            "required": ["schematicPath"],
+        },
+    },
+    {
+        "name": "list_floating_labels",
+        "title": "List Floating Net Labels",
+        "description": (
+            "Returns all net labels in the schematic that are not connected to any component pin. "
+            "A label is 'floating' when no component pin's coordinate falls on the wire-network "
+            "reachable from the label's anchor position. "
+            "Floating labels indicate misplaced or off-grid labels that will cause ERC errors. "
+            "Does not require the KiCad UI to be running."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "schematicPath": {
+                    "type": "string",
+                    "description": "Path to the .kicad_sch schematic file",
+                }
+            },
+            "required": ["schematicPath"],
+        },
+    },
+    {
+        "name": "snap_to_grid",
+        "title": "Snap Schematic Elements to Grid",
+        "description": (
+            "Snap schematic element coordinates to the nearest grid point. "
+            "KiCAD eeschema uses exact integer matching (10 000 IU/mm) for connectivity, "
+            "so even a sub-pixel coordinate offset will make wires appear connected visually "
+            "but fail ERC checks. Running this tool before ERC eliminates that class of error. "
+            "Modifies the .kicad_sch file in place. "
+            "Does not require the KiCAD UI to be running."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "schematicPath": {
+                    "type": "string",
+                    "description": "Path to the .kicad_sch schematic file",
+                },
+                "gridSize": {
+                    "type": "number",
+                    "description": (
+                        "Grid spacing in mm (default: 1.27 — standard KiCAD schematic grid). "
+                        "Do NOT use 2.54: half of all valid KiCAD pin positions are at odd "
+                        "multiples of 1.27 mm and would be displaced 1.27 mm, breaking "
+                        "connectivity."
+                    ),
+                    "default": 1.27,
+                },
+                "elements": {
+                    "type": "array",
+                    "description": (
+                        "Element types to snap. "
+                        'Valid values: "wires", "junctions", "labels", "components". '
+                        'Defaults to ["wires", "junctions", "labels"] when omitted. '
+                        '"components" is opt-in because moving a component without re-routing '
+                        "its wires will create new mismatches."
+                    ),
+                    "items": {
+                        "type": "string",
+                        "enum": ["wires", "junctions", "labels", "components"],
+                    },
+                },
+            },
+            "required": ["schematicPath"],
+        },
+    },
+    {
+        "name": "lint_offgrid",
+        "title": "Lint Off-Grid Schematic Geometry",
+        "description": (
+            "Report every off-grid connection-relevant coordinate in a schematic — "
+            "wire/bus endpoints, symbol origins, label/junction/no_connect anchors — "
+            "and optionally snap them to the nearest grid point (fix=true). "
+            "KiCad's connection grid is fixed at 50 mil (1.27 mm) and junction "
+            "placement uses exact matching, so a single off-grid endpoint can poison "
+            "junction placement for a whole sheet. Fixes are byte-exact text splices "
+            "that preserve file formatting; (lib_symbols) content and property field "
+            "positions are never touched. Offenders more than 0.5 mm off-grid are "
+            "reported as needsHuman and never auto-snapped."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "schematicPath": {
+                    "type": "string",
+                    "description": "Path to the .kicad_sch schematic file",
+                },
+                "fix": {
+                    "type": "boolean",
+                    "description": "Snap offenders in place (default false: report only)",
+                    "default": False,
+                },
+                "gridSize": {
+                    "type": "number",
+                    "description": (
+                        "Grid spacing in mm (default: 1.27 = 50 mil, the KiCad " "connection grid)"
+                    ),
+                    "default": 1.27,
+                },
+            },
+            "required": ["schematicPath"],
+        },
+    },
+    {
+        "name": "suggest_schematic_declutter",
+        "title": "Suggest Schematic Declutter",
+        "description": (
+            "Re-orient overlapping net/global labels so their text lands in free "
+            "space and becomes readable. Each label's (at x,y) anchor is its "
+            "electrical connection point, so it is held FIXED — only the "
+            "orientation (0/90/180/270) and justification change, throwing the "
+            "text away from component bodies and other labels. Connectivity is "
+            "never altered. DRY RUN by default: returns proposals "
+            "[{name, at, from_angle, to_angle}] plus an overlap score "
+            "(before/after) WITHOUT modifying the schematic. Set apply=true to "
+            "rewrite the label orientations. Phase 1: labels only; symbol "
+            "spreading + wire reroute is a separate future capability."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "schematicPath": {
+                    "type": "string",
+                    "description": "Path to the .kicad_sch file.",
+                },
+                "margin": {
+                    "type": "number",
+                    "description": (
+                        "Extra clearance in mm when testing label overlap " "(default 0.3)."
+                    ),
+                    "default": 0.3,
+                },
+                "references": {
+                    "type": "array",
+                    "description": (
+                        "Limit which component bodies count as obstacles "
+                        "(default: every component on the sheet)."
+                    ),
+                    "items": {"type": "string"},
+                },
+                "apply": {
+                    "type": "boolean",
+                    "description": (
+                        "If true, rewrite the label orientations. Default false "
+                        "(dry run — schematic untouched, proposals only)."
+                    ),
+                    "default": False,
+                },
+            },
+            "required": ["schematicPath"],
+        },
+    },
+    {
+        "name": "update_symbol_from_library",
+        "title": "Update Symbol from Library",
+        "description": (
+            "Refresh embedded lib_symbols cache entries from a KiCad symbol library "
+            "(equivalent to KiCad's Update Symbol from Library). Skips mirror-cache "
+            "entries (__m0, __m90, …). Flattens (power) symbols for schematic format. "
+            "Pass projectsDir to update all schematics in a folder, or schematicPath "
+            "for one file."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "projectsDir": {
+                    "type": "string",
+                    "description": "Directory containing project subfolders with .kicad_sch files",
+                },
+                "schematicPath": {
+                    "type": "string",
+                    "description": "Single .kicad_sch file to update",
+                },
+                "schematicPaths": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Multiple .kicad_sch files",
+                },
+                "libraryName": {
+                    "type": "string",
+                    "description": "Symbol library nickname from sym-lib-table (e.g. Device, project_lib)",
+                },
+                "symbols": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional: update only these symbol names (without Library: prefix)",
+                },
+                "repairMirrorFromBackup": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Restore __m* mirror-cache lib_symbols blocks from backupDir first",
+                },
+                "backupDir": {
+                    "type": "string",
+                    "description": "Backup folder with matching .kicad_sch filenames (for repairMirrorFromBackup)",
+                },
+            },
+            "required": ["libraryName"],
+        },
+    },
+    {
+        "name": "add_library_symbol_property",
+        "title": "Add Property to Schematic Lib Symbol",
+        "description": (
+            "Add or update a custom property (Manufacturer, MPN, LCSC, etc.) on a "
+            "symbol definition in the schematic's lib_symbols section (.kicad_sch). "
+            "Note: changes live in the schematic cache only — they are overwritten by "
+            "update_symbol_from_library. For permanent library-wide changes, use "
+            "add_symbol_property on the .kicad_sym file first, then refresh."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "schematicPath": {"type": "string", "description": "Path to .kicad_sch file"},
+                "libraryName": {"type": "string", "description": "Symbol library nickname"},
+                "symbolName": {"type": "string", "description": "Symbol name"},
+                "propertyName": {"type": "string", "description": "Property name"},
+                "propertyValue": {"type": "string", "description": "Property value"},
+                "position": {
+                    "type": "object",
+                    "properties": {"x": {"type": "number"}, "y": {"type": "number"}},
+                },
+                "hide": {"type": "boolean", "default": False},
+            },
+            "required": [
+                "schematicPath",
+                "libraryName",
+                "symbolName",
+                "propertyName",
+                "propertyValue",
+            ],
+        },
+    },
+    {
+        "name": "add_symbol_property",
+        "title": "Add Property to Library Symbol",
+        "description": (
+            "Add or update a custom property on a symbol in a .kicad_sym library file. "
+            "The property is written on the symbol itself, not on one of its units, so "
+            "multi-unit symbols are handled correctly. This makes permanent library-wide "
+            "changes. After adding properties, use update_symbol_from_library to refresh "
+            "schematics that reference the updated symbol."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "libraryPath": {"type": "string", "description": "Path to .kicad_sym file"},
+                "symbolName": {"type": "string", "description": "Symbol name"},
+                "propertyName": {"type": "string", "description": "Property name"},
+                "propertyValue": {"type": "string", "description": "Property value"},
+                "position": {
+                    "type": "object",
+                    "properties": {"x": {"type": "number"}, "y": {"type": "number"}},
+                    "description": (
+                        "Placement in mm. Omit to keep an existing property where it is "
+                        "(new properties default to 0, 0)."
+                    ),
+                },
+                "hide": {
+                    "type": "boolean",
+                    "description": (
+                        "Hide the property. Omit to keep an existing property's current "
+                        "visibility (new properties default to visible)."
+                    ),
+                },
+            },
+            "required": ["libraryPath", "symbolName", "propertyName", "propertyValue"],
+        },
+    },
+    {
+        "name": "set_symbol_pin_type",
+        "title": "Set Pin Electrical Type in Symbol Library",
+        "description": (
+            "Set the electrical type (and optionally the graphic style) of pins in a "
+            ".kicad_sym library, filtered by symbol, pin number, pin name, or current type. "
+            "Use instead of a sed/regex pass over the library: a blind substitution also "
+            "rewrites matching words inside symbol names, Descriptions and (alternate ...) "
+            "pin functions, and cannot tell which symbol it is standing on. The replacement "
+            "token is validated first -- KiCAD refuses to load a library containing a pin "
+            "type it does not know. Typical use: imported or SnapEDA symbols arrive with "
+            "every pin 'unspecified' or 'bidirectional', flooding ERC with conflicts on nets "
+            "that are electrically fine. The library is replaced atomically, keeps its "
+            "existing line endings, and is copied to a sibling '.mcp-backups/' first "
+            "(path returned in 'backupPath'). 'changes' lists at most 200 per-pin records "
+            "with 'changesTruncated' saying when it was cut; 'changeCount' always carries "
+            "the true total."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "libraryPath": {"type": "string", "description": "Path to the .kicad_sym file"},
+                "type": {
+                    "type": "string",
+                    "enum": list(PIN_TYPES),
+                    "description": "New electrical type",
+                },
+                "style": {
+                    "type": "string",
+                    "enum": list(PIN_STYLES),
+                    "description": "New graphic style",
+                },
+                "symbols": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Top-level symbol names to change (not unit names like "
+                        "'R_0402_1_1'). Omit to change every symbol in the library."
+                    ),
+                },
+                "pinNumbers": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Only pins with these numbers",
+                },
+                "pinNames": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Only pins with these names",
+                },
+                "fromType": {
+                    "type": "string",
+                    "enum": list(PIN_TYPES),
+                    "description": (
+                        "Only pins currently of this type -- the safe way to do a bulk fix"
+                    ),
+                },
+                "dryRun": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Report what would change without writing",
+                },
+            },
+            "required": ["libraryPath"],
+        },
+    },
+    {
+        "name": "find_duplicate_symbols",
+        "title": "Find Duplicate Symbols in a Library",
+        "description": (
+            "Group symbols in a .kicad_sym that are the same part stored twice under "
+            "different names -- the residue of Eagle imports, SnapEDA downloads and parts "
+            "re-added because search did not find the existing name. KiCad reports nothing "
+            "here, because the names differ, which is also why grepping does not find it. "
+            "Matches on manufacturer part number (tolerating the inconsistent property "
+            "naming real libraries have: MPN, MP, 'MANUFACTURER PART NUMBER', 'PART "
+            "NUMBER'), on distributor part number, on Value+Footprint, on an identical "
+            "drawn body, or on near-identical names. Pass schematicPaths to count how many "
+            "instances each duplicate actually has, which turns the report into a decision: "
+            "the one nothing places is the one to retire."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "libraryPath": {"type": "string", "description": "Path to the .kicad_sym file"},
+                "matchBy": {
+                    "type": "array",
+                    "items": {"type": "string", "enum": list(DUPLICATE_STRATEGIES)},
+                    "default": list(DEFAULT_DUPLICATE_STRATEGIES),
+                    "description": (
+                        "How to decide two symbols are the same part. 'graphics' is off by "
+                        "default: every resistor in a library shares one body, so on "
+                        "passives it groups the whole family. 'name' is off by default "
+                        "because matching names that differ only in separators is the "
+                        "weakest signal here. Values that only mark a field as unfilled "
+                        "(N/A, TBD, -, ~) are never used as a key."
+                    ),
+                },
+                "schematicPaths": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        ".kicad_sch files or directories to scan for usage counts. "
+                        "Directories are searched recursively, skipping autosave sheets "
+                        "and backup/history folders, which are copies of sheets already "
+                        "being counted. Only placements of THIS library are counted (see "
+                        "libraryNicknames), and a sub-sheet instantiated more than once "
+                        "counts once per instantiation. Paths that do not exist come back "
+                        "in missingPaths rather than being silently ignored."
+                    ),
+                },
+                "libraryNicknames": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "The nickname(s) this library is registered under in a lib_id, if "
+                        "the file stem and the sym-lib-table entries beside the scanned "
+                        "sheets do not cover it. Placements naming another library are not "
+                        "counted: a bare 'R' here is not Device:R. The result reports the "
+                        "nicknames used (libraryNicknames) and the ones actually found in "
+                        "the sheets (nicknamesSeen)."
+                    ),
+                },
+                "minGroupSize": {
+                    "type": "integer",
+                    "default": 2,
+                    "description": "Only report groups with at least this many symbols",
+                },
+                "ignoreCase": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "Compare part numbers and values case-insensitively",
+                },
+            },
+            "required": ["libraryPath"],
+        },
+    },
+    {
+        "name": "replace_instance_lib_ids",
+        "title": "Replace Instance lib_ids (Library Migration)",
+        "description": (
+            "Replace lib_id references in schematic symbol instances per an explicit "
+            "old-to-new mapping — the mechanical layer of a library migration (e.g. "
+            "eagle_import symbols to curated library symbols). Mirror-variant "
+            "suffixes (__m0/__m90/__m180/__m270) get automatic angle correction; "
+            "each needs its own mapping entry. Only instances are rewritten; the "
+            "lib_symbols section is preserved (use update_symbol_from_library to "
+            "refresh definitions afterwards)."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "schematicPath": {
+                    "type": "string",
+                    "description": "Path to the .kicad_sch file",
+                },
+                "mapping": {
+                    "type": "object",
+                    "additionalProperties": {"type": "string"},
+                    "description": (
+                        "Map of old full lib_id to new full lib_id, e.g. "
+                        '{"eagle_import:C_100n": "Device:C"}. Values are used verbatim.'
+                    ),
+                },
+                "sourceLibrary": {
+                    "type": "string",
+                    "description": "Library prefix whose instances are candidates",
+                    "default": "eagle_import",
+                },
+            },
+            "required": ["schematicPath", "mapping"],
+        },
+    },
 ]
 
 # =============================================================================
@@ -2212,6 +3451,12 @@ SCHEMATIC_TOOLS = [
 # =============================================================================
 
 UI_TOOLS = [
+    {
+        "name": "get_backend_state",
+        "title": "Get Backend State",
+        "description": ("Returns backend, realtime, loaded project/board paths, and dirty state."),
+        "inputSchema": {"type": "object", "properties": {}},
+    },
     {
         "name": "check_kicad_ui",
         "title": "Check KiCAD UI Status",
@@ -2240,6 +3485,314 @@ UI_TOOLS = [
 ]
 
 # =============================================================================
+# VALIDATION TOOLS
+# =============================================================================
+
+VALIDATION_TOOLS = [
+    {
+        "name": "validate_schematic",
+        "title": "Validate Schematic File",
+        "description": (
+            "Check that a .kicad_sch file is structurally sound, reporting the line and "
+            "column of every fault. kicad-cli only says whether a file loads; this says "
+            "where it broke. Catches unbalanced parens, unterminated strings, trailing "
+            "content, and property/effects fragments orphaned directly under (kicad_sch), "
+            "which is what a truncated property rewrite leaves behind. A paren fault that "
+            "nets to zero is caught too, by the first line whose indentation stops "
+            "agreeing with its nesting depth. kicad-cli is then run on a throwaway copy "
+            "as the authoritative answer, so the file being validated is never modified. "
+            "'column' counts characters, so a tab counts once and the number will be "
+            "lower than an editor's ruler shows on indented lines. Run this after any "
+            "tool that edits a schematic."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "schematicPath": {"type": "string", "description": "Path to the .kicad_sch file"},
+                "runKicadCli": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": (
+                        "Confirm with kicad-cli on a copy. Set false for a fast "
+                        "structure-only check, or when KiCad is not installed."
+                    ),
+                },
+            },
+            "required": ["schematicPath"],
+        },
+    },
+    {
+        "name": "validate_symbol_library",
+        "title": "Validate Symbol Library File",
+        "description": (
+            "Check that a .kicad_sym file is structurally sound and will load, reporting "
+            "the line and column of every fault instead of a bare 'Unable to load "
+            "library'. Beyond paren/string structure it reports units whose names no "
+            "longer match their symbol (a rename that missed the NAME_0_1 sub-symbols "
+            "makes the whole library unloadable), (effects ...)/(at ...) fragments a "
+            "truncated property rewrite left inside a (symbol ...), units that escaped "
+            "their parent to the top level, and duplicate symbol names. kicad-cli is "
+            "run on a throwaway copy, so the library is never modified. 'column' counts "
+            "characters, so a tab counts once and the number will be lower than an "
+            "editor's ruler shows on indented lines. Run this after any tool that edits "
+            "a library."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "libraryPath": {"type": "string", "description": "Path to the .kicad_sym file"},
+                "runKicadCli": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": (
+                        "Confirm with kicad-cli on a copy. Set false for a fast "
+                        "structure-only check, or when KiCad is not installed."
+                    ),
+                },
+            },
+            "required": ["libraryPath"],
+        },
+    },
+]
+
+# =============================================================================
+# ROUTING ORCHESTRATION / MANUFACTURING GATES
+# =============================================================================
+
+CFHA_COMMON_PROPERTIES = {
+    "boardPath": {"type": "string", "description": "Board path; defaults to current board"},
+    "strategy": {
+        "type": "string",
+        "enum": ["hybrid", "critical_only", "analysis_only"],
+    },
+    "seed": {"type": "integer", "description": "Deterministic routing seed"},
+    "attempts": {"type": "integer", "minimum": 1, "default": 1},
+    "targetNets": {"type": "array", "items": {"type": "string"}},
+    "passSchedule": {
+        "type": "array",
+        "items": {"type": "integer", "minimum": 1},
+        "minItems": 1,
+    },
+    "maxPasses": {"type": "integer", "minimum": 1},
+    "timeout": {"type": "number", "exclusiveMinimum": 0},
+    "timeBudgetSec": {"type": "number", "exclusiveMinimum": 0},
+    "freeroutingJar": {"type": "string"},
+    "keepArtifacts": {"type": "boolean", "default": False},
+    "criticalClasses": {"type": "array", "items": {"type": "string"}},
+    "criticalLayer": {"type": "string"},
+    "criticalWidthMm": {"type": "number", "exclusiveMinimum": 0},
+    "placementRoutingCorridors": {
+        "type": "array",
+        "items": {"type": "object"},
+        "description": "Breakout corridor reservations returned by schematic-to-board sync",
+    },
+    "powerCurrentA": {"type": "number", "exclusiveMinimum": 0},
+    "copperOz": {"type": "number", "exclusiveMinimum": 0},
+    "tempRiseC": {"type": "number", "exclusiveMinimum": 0},
+    "maxLengthMm": {"type": "number", "exclusiveMinimum": 0},
+    "matchedLengthGroups": {
+        "type": "array",
+        "items": {
+            "type": "object",
+            "properties": {
+                "nets": {"type": "array", "items": {"type": "string"}},
+                "maxSkewMm": {"type": "number", "exclusiveMinimum": 0},
+                "type": {"type": "string"},
+            },
+            "required": ["nets"],
+        },
+    },
+    "inferMatchedLengthGroups": {"type": "boolean"},
+    "autoMatchedLengthMaxSkewMm": {"type": "number", "exclusiveMinimum": 0},
+    "autoMatchedLengthMinGroupSize": {"type": "integer", "minimum": 2},
+    "autoMatchedLengthMaxGroupSize": {"type": "integer", "minimum": 2},
+    "excludeFromFreeRouting": {"type": "array", "items": {"type": "string"}},
+    "excludeNets": {"type": "array", "items": {"type": "string"}},
+    "profiles": {"type": "array", "items": {"type": "string"}},
+    "interfaces": {"type": "array", "items": {"type": "string"}},
+    "intentOverrides": {"type": "object", "additionalProperties": {"type": "string"}},
+    "qorWeights": {"type": "object", "additionalProperties": {"type": "number"}},
+    "maxReroutePasses": {"type": "integer", "minimum": 0},
+    "orthorouteExecutable": {"type": "string"},
+    "skipBulkRoute": {"type": "boolean"},
+    "refillZones": {"type": "boolean"},
+    "autoTuneMatchedLengths": {"type": "boolean"},
+    "matchedLengthMinExtraMm": {"type": "number", "minimum": 0},
+    "matchedLengthMaxGroupSize": {"type": "integer", "minimum": 1},
+    "autoHealSupportNets": {"type": "boolean"},
+    "healingPasses": {"type": "integer", "minimum": 0},
+    "maxHealingViasPerNet": {"type": "integer", "minimum": 0},
+    "autoCreateReferenceZones": {"type": "boolean"},
+    "referenceZoneNet": {"type": "string"},
+    "referenceZoneLayer": {"type": "string"},
+    "referenceZoneInsetMm": {"type": "number", "minimum": 0},
+    "referenceZoneClearanceMm": {"type": "number", "minimum": 0},
+    "referenceZoneMinWidthMm": {"type": "number", "exclusiveMinimum": 0},
+    "reportPath": {"type": "string"},
+    "qorReportPath": {"type": "string"},
+    "outputPath": {"type": "string"},
+    "healingReportPath": {"type": "string"},
+    "dsnPath": {"type": "string"},
+    "sesPath": {"type": "string"},
+    "extraFreeroutingArgs": {"type": "array", "items": {"type": "string"}},
+}
+
+CFHA_TOOLS = [
+    {
+        "name": name,
+        "title": title,
+        "description": description,
+        "inputSchema": {"type": "object", "properties": dict(CFHA_COMMON_PROPERTIES)},
+    }
+    for name, title, description in [
+        (
+            "autoroute_cfha",
+            "Constraint-First Hybrid Autoroute",
+            "Run analysis, intent inference, rules, critical routing, best-of-N bulk routing, tuning, and QoR verification.",
+        ),
+        (
+            "analyze_board_routing_context",
+            "Analyze Routing Context",
+            "Audit stackup, routing density, reference continuity, and available backends.",
+        ),
+        (
+            "extract_routing_intents",
+            "Extract Routing Intents",
+            "Classify RF, differential, high-speed, analog, power, ground, and generic nets.",
+        ),
+        (
+            "generate_routing_constraints",
+            "Generate Routing Constraints",
+            "Generate the canonical constraint model used by every routing stage.",
+        ),
+        (
+            "generate_kicad_dru",
+            "Generate KiCad Rules",
+            "Compile canonical routing constraints into a KiCad .kicad_dru file.",
+        ),
+        (
+            "route_critical_nets",
+            "Route Critical Nets",
+            "Route protected critical nets before the bulk-router stage.",
+        ),
+        (
+            "run_freerouting",
+            "Run Best-of-N Freerouting",
+            "Bulk-route remaining nets with isolated artifacts and best-of-N SES scoring.",
+        ),
+        (
+            "post_tune_routes",
+            "Post-Tune Routes",
+            "Tune matched lengths, reference zones, and support-net continuity.",
+        ),
+        (
+            "verify_routing_qor",
+            "Verify Routing Quality",
+            "Run DRC and report completion, length, via, skew, and return-path quality metrics.",
+        ),
+    ]
+]
+
+MANUFACTURING_COMMON_PROPERTIES = {
+    "boardPath": {"type": "string", "description": "Board path; defaults to current board"},
+    "assemblyMode": {"type": "string", "enum": ["hand", "smt"], "default": "hand"},
+    "requirePartNumbers": {"type": "boolean", "default": True},
+    "handSolderMinPitchMm": {"type": "number", "exclusiveMinimum": 0, "default": 0.65},
+    "handSolderMinPadFeatureMm": {
+        "type": "number",
+        "exclusiveMinimum": 0,
+        "default": 0.35,
+    },
+    "fabLimits": {
+        "type": "object",
+        "properties": {
+            "minTrackWidthMm": {"type": "number", "exclusiveMinimum": 0},
+            "minClearanceMm": {"type": "number", "exclusiveMinimum": 0},
+            "minDrillMm": {"type": "number", "exclusiveMinimum": 0},
+            "minAnnularRingMm": {"type": "number", "exclusiveMinimum": 0},
+            "minCopperEdgeMm": {"type": "number", "exclusiveMinimum": 0},
+        },
+    },
+    "checkPlacement": {"type": "boolean", "default": True},
+    "courtyardMarginMm": {"type": "number", "minimum": 0},
+    "runDrc": {"type": "boolean", "default": True},
+    "reportPath": {"type": "string"},
+    "timeoutSec": {"type": "number", "exclusiveMinimum": 0, "default": 600},
+    "blockOnWarnings": {"type": "boolean", "default": False},
+}
+
+MANUFACTURING_TOOLS = [
+    {
+        "name": "analyze_manufacturing_readiness",
+        "title": "Analyze Manufacturing Readiness",
+        "description": "Gate a two-layer board on fabrication, placement, DRC, and assembly readiness.",
+        "inputSchema": {
+            "type": "object",
+            "properties": dict(MANUFACTURING_COMMON_PROPERTIES),
+        },
+    },
+    {
+        "name": "prepare_manufacturing_package",
+        "title": "Prepare Manufacturing Package",
+        "description": "Atomically export checksummed Gerber, drill, BOM, position, report, and ZIP artifacts.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                **MANUFACTURING_COMMON_PROPERTIES,
+                "outputDir": {"type": "string"},
+                "schematicPath": {"type": "string"},
+                "gerberLayers": {"type": "array", "items": {"type": "string"}},
+                "gerberPrecision": {"type": "integer", "minimum": 5, "maximum": 6},
+                "saveBeforeExport": {"type": "boolean", "default": True},
+                "allowUnsafe": {"type": "boolean", "default": False},
+            },
+        },
+    },
+]
+
+SCHEMATIC_POLISH_TOOLS = [
+    {
+        "name": "polish_schematic_readability",
+        "title": "Polish Schematic Readability",
+        "description": "Improve labels, junction dots, and optional block frames without changing connectivity.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "schematicPath": {"type": "string"},
+                "hideInternalLabels": {"type": "boolean", "default": True},
+                "internalLabelNames": {"type": "array", "items": {"type": "string"}},
+                "keepLabelNames": {"type": "array", "items": {"type": "string"}},
+                "internalLabelFontSize": {"type": "number", "exclusiveMinimum": 0},
+                "visibleLabelFontSize": {"type": "number", "exclusiveMinimum": 0},
+                "junctionDiameter": {"type": "number", "minimum": 0},
+                "blockFrames": {"type": "array", "items": {"type": "object"}},
+                "createBackup": {"type": "boolean", "default": False},
+                "backupSuffix": {"type": "string"},
+            },
+            "required": ["schematicPath"],
+        },
+    }
+]
+
+EXPORT_COMPATIBILITY_TOOLS = [
+    {
+        "name": "export_position_file",
+        "title": "Export Position File",
+        "description": "Compatibility placement-file export routed through kicad-cli.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "outputPath": {"type": "string"},
+                "format": {"type": "string", "enum": ["CSV", "ASCII"]},
+                "units": {"type": "string", "enum": ["mm", "mil", "inch"]},
+                "side": {"type": "string", "enum": ["top", "bottom", "both"]},
+            },
+            "required": ["outputPath"],
+        },
+    }
+]
+
+# =============================================================================
 # COMBINED TOOL SCHEMAS
 # =============================================================================
 
@@ -2251,12 +3804,16 @@ for tool in (
     + BOARD_TOOLS
     + COMPONENT_TOOLS
     + ROUTING_TOOLS
-    + AUTOROUTE_TOOLS
     + LIBRARY_TOOLS
     + DESIGN_RULE_TOOLS
     + EXPORT_TOOLS
     + SCHEMATIC_TOOLS
+    + CFHA_TOOLS
+    + MANUFACTURING_TOOLS
+    + SCHEMATIC_POLISH_TOOLS
+    + EXPORT_COMPATIBILITY_TOOLS
     + UI_TOOLS
+    + VALIDATION_TOOLS
 ):
     TOOL_SCHEMAS[tool["name"]] = tool
 

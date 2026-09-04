@@ -5,58 +5,19 @@ This module provides helpers for detecting the current platform and
 getting appropriate paths for KiCAD, configuration, logs, etc.
 """
 
+import json
 import logging
 import os
 import platform
 import sys
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
 
 class PlatformHelper:
     """Platform detection and path resolution utilities"""
-
-    @staticmethod
-    def get_kicad_appdirs() -> List[Path]:
-        """
-        Get potential KiCad AppImage AppDir locations on Linux.
-
-        Returns:
-            List of candidate AppDir paths in priority order
-        """
-        appdirs: List[Path] = []
-        seen = set()
-
-        env_candidates = [
-            os.environ.get("KICAD_APPDIR"),
-            os.environ.get("APPDIR"),
-            os.environ.get("SHARUN_DIR"),
-        ]
-
-        for candidate in env_candidates:
-            if not candidate:
-                continue
-            path = Path(candidate).expanduser()
-            if path.exists() and path not in seen:
-                appdirs.append(path)
-                seen.add(path)
-
-        if PlatformHelper.is_linux():
-            search_roots = [
-                Path.home() / ".local" / "opt",
-                Path("/opt"),
-            ]
-            for root in search_roots:
-                if not root.exists():
-                    continue
-                for appdir in sorted(root.glob("kicad-*/AppDir")):
-                    if appdir.exists() and appdir not in seen:
-                        appdirs.append(appdir)
-                        seen.add(appdir)
-
-        return appdirs
 
     @staticmethod
     def is_windows() -> bool:
@@ -92,38 +53,29 @@ class PlatformHelper:
         paths = []
 
         if PlatformHelper.is_windows():
-            # Windows: Check Program Files
-            program_files = [
-                Path("C:/Program Files/KiCad"),
-                Path("C:/Program Files (x86)/KiCad"),
-            ]
-            for pf in program_files:
-                # Check multiple KiCAD versions
-                for version in ["9.0", "9.1", "10.0", "8.0"]:
-                    path = pf / version / "lib" / "python3" / "dist-packages"
-                    if path.exists():
-                        paths.append(path)
+            # Discover install roots (registry + Program Files + custom C:\KiCad
+            # roots, newest first) via the shared helper so a relocated install is
+            # found here the same as by cli/footprint lookups (#286).
+            from utils.kicad_roots import kicad_install_roots
+
+            for root in kicad_install_roots():
+                # KiCad 10.0+ Windows: bin/Lib/site-packages
+                path = root / "bin" / "Lib" / "site-packages"
+                if path.exists():
+                    paths.append(path)
+                # KiCad 9.x Windows: lib/python3/dist-packages
+                path = root / "lib" / "python3" / "dist-packages"
+                if path.exists():
+                    paths.append(path)
 
         elif PlatformHelper.is_linux():
             # Linux: Check common installation paths
-            candidates = []
-
-            for appdir in PlatformHelper.get_kicad_appdirs():
-                candidates.extend(
-                    [
-                        *sorted(appdir.glob("shared/lib/python*/dist-packages")),
-                        *sorted(appdir.glob("lib/python*/dist-packages")),
-                    ]
-                )
-
-            candidates.extend(
-                [
+            candidates = [
                 Path("/usr/lib/kicad/lib/python3/dist-packages"),
                 Path("/usr/share/kicad/scripting/plugins"),
                 Path("/usr/local/lib/kicad/lib/python3/dist-packages"),
                 Path.home() / ".local/lib/kicad/lib/python3/dist-packages",
-                ]
-            )
+            ]
 
             # Also check based on Python version
             py_version = f"{sys.version_info.major}.{sys.version_info.minor}"
@@ -145,14 +97,7 @@ class PlatformHelper:
                 ]
             )
 
-            deduped_candidates = []
-            seen = set()
-            for candidate in candidates:
-                if candidate.exists() and candidate not in seen:
-                    deduped_candidates.append(candidate)
-                    seen.add(candidate)
-
-            paths = deduped_candidates
+            paths = [p for p in candidates if p.exists()]
 
         elif PlatformHelper.is_macos():
             # macOS: Check multiple KiCAD application bundle locations
@@ -221,15 +166,25 @@ class PlatformHelper:
         patterns = []
 
         if PlatformHelper.is_windows():
-            patterns = [
-                "C:/Program Files/KiCad/*/share/kicad/symbols/*.kicad_sym",
-                "C:/Program Files (x86)/KiCad/*/share/kicad/symbols/*.kicad_sym",
-            ]
+            # Build symbol-library globs from the shared install-root discovery
+            # (registry + Program Files + custom C:\KiCad roots) so libraries in a
+            # relocated install are found, not just Program Files ones (#286).
+            from utils.kicad_roots import kicad_install_roots
+
+            for root in kicad_install_roots():
+                symbols = root / "share" / "kicad" / "symbols"
+                # KiCAD 8/9 single-file libraries
+                patterns.append(str(symbols / "*.kicad_sym"))
+                # KiCAD 10 per-symbol directory libraries
+                patterns.append(str(symbols / "*.kicad_symdir" / "*.kicad_sym"))
         elif PlatformHelper.is_linux():
             patterns = [
                 "/usr/share/kicad/symbols/*.kicad_sym",
                 "/usr/local/share/kicad/symbols/*.kicad_sym",
                 str(Path.home() / ".local/share/kicad/symbols/*.kicad_sym"),
+                # KiCAD 10 per-symbol directory libraries
+                "/usr/share/kicad/symbols/*.kicad_symdir/*.kicad_sym",
+                "/usr/local/share/kicad/symbols/*.kicad_symdir/*.kicad_sym",
             ]
         elif PlatformHelper.is_macos():
             patterns = [
@@ -239,10 +194,23 @@ class PlatformHelper:
                     Path.home()
                     / "Applications/KiCad/KiCad.app/Contents/SharedSupport/symbols/*.kicad_sym"
                 ),
+                # KiCAD 10 per-symbol directory libraries
+                "/Applications/KiCad/KiCad.app/Contents/SharedSupport/symbols/*.kicad_symdir/*.kicad_sym",
             ]
 
         # Add user library paths for all platforms
         patterns.append(str(Path.home() / "Documents" / "KiCad" / "*" / "symbols" / "*.kicad_sym"))
+        patterns.append(
+            str(
+                Path.home()
+                / "Documents"
+                / "KiCad"
+                / "*"
+                / "symbols"
+                / "*.kicad_symdir"
+                / "*.kicad_sym"
+            )
+        )
 
         return patterns
 
@@ -316,12 +284,44 @@ class PlatformHelper:
             return PlatformHelper.get_config_dir() / "cache"
 
     @staticmethod
+    def get_data_dir() -> Path:
+        r"""
+        Get appropriate data directory for current platform
+
+        Used for application state that should persist across runs and is not
+        a transient cache (e.g. the JLCPCB parts database).
+
+        Follows platform conventions:
+        - Windows: %USERPROFILE%\.kicad-mcp\data
+        - Linux: $XDG_DATA_HOME/kicad-mcp or ~/.local/share/kicad-mcp
+        - macOS: ~/Library/Application Support/kicad-mcp
+
+        Returns:
+            Path to data directory
+        """
+        if PlatformHelper.is_windows():
+            return PlatformHelper.get_config_dir() / "data"
+        elif PlatformHelper.is_linux():
+            xdg_data = os.environ.get("XDG_DATA_HOME")
+            if xdg_data:
+                xdg_data_path = Path(xdg_data).expanduser()
+                if xdg_data_path.is_absolute():
+                    return xdg_data_path / "kicad-mcp"
+                logger.warning("Ignoring relative XDG_DATA_HOME: %s", xdg_data)
+            return Path.home() / ".local" / "share" / "kicad-mcp"
+        elif PlatformHelper.is_macos():
+            return Path.home() / "Library" / "Application Support" / "kicad-mcp"
+        else:
+            return PlatformHelper.get_config_dir() / "data"
+
+    @staticmethod
     def ensure_directories() -> None:
         """Create all necessary directories if they don't exist"""
         dirs_to_create = [
             PlatformHelper.get_config_dir(),
             PlatformHelper.get_log_dir(),
             PlatformHelper.get_cache_dir(),
+            PlatformHelper.get_data_dir(),
         ]
 
         for directory in dirs_to_create:
@@ -351,6 +351,45 @@ class PlatformHelper:
 
         return paths_added
 
+    @staticmethod
+    def load_kicad_env_vars() -> Dict[str, str]:
+        """
+        Load user-defined environment variables from kicad_common.json.
+
+        KiCad stores custom path variables (Preferences > Configure Paths) in
+        kicad_common.json under environment.vars. These are referenced in
+        sym-lib-table / fp-lib-table URIs, e.g. ``${SEEK}/mylib.kicad_sym``.
+
+        Returns:
+            Dict of variable name -> value (empty if not found or unreadable)
+        """
+        import json
+
+        env_vars = {}
+        kicad_common_paths = [
+            Path.home() / "Library" / "Preferences" / "kicad" / "10.0" / "kicad_common.json",
+            Path.home() / "Library" / "Preferences" / "kicad" / "9.0" / "kicad_common.json",
+            Path.home() / "Library" / "Preferences" / "kicad" / "8.0" / "kicad_common.json",
+            Path.home() / ".config" / "kicad" / "10.0" / "kicad_common.json",
+            Path.home() / ".config" / "kicad" / "9.0" / "kicad_common.json",
+            Path.home() / ".config" / "kicad" / "8.0" / "kicad_common.json",
+            Path.home() / "AppData" / "Roaming" / "kicad" / "10.0" / "kicad_common.json",
+            Path.home() / "AppData" / "Roaming" / "kicad" / "9.0" / "kicad_common.json",
+            Path.home() / "AppData" / "Roaming" / "kicad" / "8.0" / "kicad_common.json",
+        ]
+        for config_path in kicad_common_paths:
+            if config_path.exists():
+                try:
+                    with open(config_path, "r") as f:
+                        config = json.load(f)
+                    vars_ = config.get("environment", {}).get("vars", {})
+                    if isinstance(vars_, dict):
+                        env_vars.update({k: str(v) for k, v in vars_.items()})
+                    break
+                except (json.JSONDecodeError, KeyError, TypeError):
+                    pass
+        return env_vars
+
 
 # Convenience function for quick platform detection
 def detect_platform() -> dict:
@@ -371,6 +410,7 @@ def detect_platform() -> dict:
         "config_dir": str(PlatformHelper.get_config_dir()),
         "log_dir": str(PlatformHelper.get_log_dir()),
         "cache_dir": str(PlatformHelper.get_cache_dir()),
+        "data_dir": str(PlatformHelper.get_data_dir()),
         "kicad_python_paths": [str(p) for p in PlatformHelper.get_kicad_python_paths()],
     }
 

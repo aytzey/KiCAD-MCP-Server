@@ -1,0 +1,635 @@
+"""
+Tests for the Freerouting autoroute integration.
+
+Covers:
+  - FreeroutingCommands.check_freerouting (dependency detection)
+  - FreeroutingCommands.export_dsn (DSN export via pcbnew)
+  - FreeroutingCommands.import_ses (SES import via pcbnew)
+  - FreeroutingCommands.autoroute (full pipeline, direct + docker)
+  - Error handling: missing board, no runtime, missing JAR, timeouts
+  - _find_java, _docker_available, _java_version_ok helpers
+"""
+
+import sys
+import zipfile
+from pathlib import Path
+from typing import Any
+from unittest.mock import MagicMock, patch
+
+import pytest
+from commands.freerouting import (
+    FreeroutingCommands,
+    _docker_available,
+    _find_docker,
+    _find_java,
+    _java_version_ok,
+    protect_dsn_nets,
+)
+
+# pcbnew mock from conftest
+pcbnew_mock = sys.modules["pcbnew"]
+
+
+def _write_runnable_jar(path: Path, required_java_major: int = 21) -> None:
+    """Write the smallest JAR needed for runtime-compatibility inspection."""
+    class_file_major = required_java_major + 44
+    header = b"\xca\xfe\xba\xbe\x00\x00" + class_file_major.to_bytes(2, "big")
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("META-INF/MANIFEST.MF", "Manifest-Version: 1.0\nMain-Class: app.Main\n")
+        archive.writestr("app/Main.class", header)
+
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def reset_pcbnew_mock() -> Any:
+    """Reset pcbnew mock before each test."""
+    pcbnew_mock.reset_mock()
+    pcbnew_mock.ExportSpecctraDSN.side_effect = None
+    pcbnew_mock.ExportSpecctraDSN.return_value = MagicMock()
+    pcbnew_mock.ImportSpecctraSES.side_effect = None
+    pcbnew_mock.ImportSpecctraSES.return_value = MagicMock()
+    yield
+
+
+@pytest.fixture
+def mock_board() -> Any:
+    board = MagicMock()
+    board.GetFileName.return_value = "/tmp/test_project/test.kicad_pcb"
+    board.GetTracks.return_value = []
+    return board
+
+
+@pytest.fixture
+def cmds(mock_board: Any) -> Any:
+    return FreeroutingCommands(board=mock_board)
+
+
+@pytest.fixture
+def cmds_no_board() -> Any:
+    return FreeroutingCommands(board=None)
+
+
+@pytest.fixture(autouse=True)
+def _java_on_path(monkeypatch) -> None:
+    """Tests mock subprocess.run, so building the command must not require a
+    real JRE on the host. Tests that exercise _find_java itself hold their own
+    reference to the original function and are unaffected."""
+    import commands.freerouting as _fr
+
+    monkeypatch.setattr(_fr, "_find_java", lambda: "java")
+
+
+def _patch_direct_java() -> Any:
+    """Patch to simulate Java 21+ available locally."""
+    return patch.object(
+        FreeroutingCommands,
+        "_resolve_execution_mode",
+        return_value={"mode": "direct", "use_docker": False},
+    )
+
+
+def _patch_docker_mode() -> Any:
+    """Patch to simulate Docker execution mode."""
+    return patch.object(
+        FreeroutingCommands,
+        "_resolve_execution_mode",
+        return_value={"mode": "docker", "use_docker": True},
+    )
+
+
+def _patch_no_runtime() -> Any:
+    """Patch to simulate no Java and no Docker."""
+    return patch.object(
+        FreeroutingCommands,
+        "_resolve_execution_mode",
+        return_value={
+            "mode": "error",
+            "error": "Neither Java 21+ nor Docker found.",
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# check_freerouting
+# ---------------------------------------------------------------------------
+
+
+class TestCheckFreerouting:
+    def test_no_java_no_docker(self, cmds: Any) -> None:
+        with (
+            patch("commands.freerouting._find_java", return_value=None),
+            patch(
+                "commands.freerouting._docker_available",
+                return_value=False,
+            ),
+        ):
+            result = cmds.check_freerouting({"freeroutingJar": "/nonexistent.jar"})
+        assert result["success"] is True
+        assert result["java"]["found"] is False
+        assert result["docker"]["available"] is False
+        assert result["ready"] is False
+        assert result["execution_mode"] == "none"
+
+    def test_java_too_old_docker_available(self, cmds: Any, tmp_path: Any) -> None:
+        jar = tmp_path / "freerouting.jar"
+        _write_runnable_jar(jar)
+        with (
+            patch(
+                "commands.freerouting._find_java",
+                return_value="/usr/bin/java",
+            ),
+            patch(
+                "commands.freerouting._java_version_ok",
+                return_value=False,
+            ),
+            patch(
+                "commands.freerouting._docker_available",
+                return_value=True,
+            ),
+            patch("commands.freerouting.subprocess.run") as mock_run,
+        ):
+            mock_run.return_value = MagicMock(stderr='openjdk version "17.0.1"', stdout="")
+            result = cmds.check_freerouting({"freeroutingJar": str(jar)})
+        assert result["ready"] is True
+        assert result["execution_mode"] == "docker"
+
+    def test_java_21_direct(self, cmds: Any, tmp_path: Any) -> None:
+        jar = tmp_path / "freerouting.jar"
+        _write_runnable_jar(jar)
+        with (
+            patch(
+                "commands.freerouting._find_java",
+                return_value="/usr/bin/java",
+            ),
+            patch(
+                "commands.freerouting._java_version_ok",
+                return_value=True,
+            ),
+            patch(
+                "commands.freerouting._docker_available",
+                return_value=False,
+            ),
+            patch("commands.freerouting.subprocess.run") as mock_run,
+        ):
+            mock_run.return_value = MagicMock(stderr='openjdk version "21.0.1"', stdout="")
+            result = cmds.check_freerouting({"freeroutingJar": str(jar)})
+        assert result["ready"] is True
+        assert result["execution_mode"] == "direct"
+
+    def test_java_21_rejects_jar_compiled_for_java_25(self, cmds: Any, tmp_path: Any) -> None:
+        jar = tmp_path / "freerouting.jar"
+        _write_runnable_jar(jar, required_java_major=25)
+        with (
+            patch("commands.freerouting._find_java", return_value="/usr/bin/java"),
+            patch("commands.freerouting._docker_available", return_value=False),
+            patch("commands.freerouting.subprocess.run") as mock_run,
+        ):
+            mock_run.return_value = MagicMock(
+                returncode=0,
+                stderr='openjdk version "21.0.11"',
+                stdout="",
+            )
+            result = cmds.check_freerouting({"freeroutingJar": str(jar)})
+
+        assert result["ready"] is False
+        assert result["execution_mode"] == "none"
+        assert result["java"]["major"] == 21
+        assert result["java"]["compatible_with_jar"] is False
+        assert result["freerouting"]["required_java_major"] == 25
+
+
+# ---------------------------------------------------------------------------
+# export_dsn
+# ---------------------------------------------------------------------------
+
+
+class TestExportDsn:
+    def test_no_board(self, cmds_no_board: Any) -> None:
+        result = cmds_no_board.export_dsn({})
+        assert result["success"] is False
+        assert "No board" in result["message"]
+
+    def test_export_success(self, cmds: Any, tmp_path: Any) -> None:
+        board_path = str(tmp_path / "test.kicad_pcb")
+        dsn_path = str(tmp_path / "test.dsn")
+        cmds.board.GetFileName.return_value = board_path
+
+        pcbnew_mock.ExportSpecctraDSN.return_value = True
+        Path(dsn_path).write_text("(pcb test)")
+
+        result = cmds.export_dsn({})
+        assert result["success"] is True
+        assert result["path"] == dsn_path
+
+    def test_export_custom_path(self, cmds: Any, tmp_path: Any) -> None:
+        output = str(tmp_path / "custom.dsn")
+        pcbnew_mock.ExportSpecctraDSN.return_value = True
+        Path(output).write_text("(pcb test)")
+
+        result = cmds.export_dsn({"outputPath": output})
+        assert result["success"] is True
+        assert result["path"] == output
+
+    def test_export_failure(self, cmds: Any) -> None:
+        pcbnew_mock.ExportSpecctraDSN.side_effect = Exception("DSN error")
+        result = cmds.export_dsn({})
+        assert result["success"] is False
+        assert "DSN error" in result["errorDetails"]
+
+
+# ---------------------------------------------------------------------------
+# import_ses
+# ---------------------------------------------------------------------------
+
+
+class TestImportSes:
+    def test_no_board(self, cmds_no_board: Any) -> None:
+        result = cmds_no_board.import_ses({"sesPath": "/tmp/test.ses"})
+        assert result["success"] is False
+        assert "No board" in result["message"]
+
+    def test_missing_ses_path(self, cmds: Any) -> None:
+        result = cmds.import_ses({})
+        assert result["success"] is False
+        assert "Missing sesPath" in result["message"]
+
+    def test_ses_file_not_found(self, cmds: Any) -> None:
+        result = cmds.import_ses({"sesPath": "/nonexistent/test.ses"})
+        assert result["success"] is False
+        assert "not found" in result["message"]
+
+    def test_import_success(self, cmds: Any, tmp_path: Any) -> None:
+        ses_file = tmp_path / "test.ses"
+        ses_file.write_text("(session test)")
+
+        pcbnew_mock.ImportSpecctraSES.return_value = True
+        cmds.board.GetTracks.return_value = []
+
+        result = cmds.import_ses({"sesPath": str(ses_file)})
+        assert result["success"] is True
+
+    def test_import_failure(self, cmds: Any, tmp_path: Any) -> None:
+        ses_file = tmp_path / "test.ses"
+        ses_file.write_text("(session test)")
+
+        pcbnew_mock.ImportSpecctraSES.side_effect = Exception("SES error")
+        result = cmds.import_ses({"sesPath": str(ses_file)})
+        assert result["success"] is False
+        assert "SES error" in result["errorDetails"]
+
+
+# ---------------------------------------------------------------------------
+# autoroute (full pipeline)
+# ---------------------------------------------------------------------------
+
+
+class TestAutoroute:
+    def test_no_board(self, cmds_no_board: Any) -> None:
+        result = cmds_no_board.autoroute({})
+        assert result["success"] is False
+        assert "No board" in result["message"]
+
+    def test_no_runtime(self, cmds: Any, tmp_path: Any) -> None:
+        jar = tmp_path / "freerouting.jar"
+        jar.touch()
+        with _patch_no_runtime():
+            result = cmds.autoroute({"freeroutingJar": str(jar)})
+        assert result["success"] is False
+        assert "No suitable Java runtime" in result["message"]
+
+    def test_no_jar(self, cmds: Any) -> None:
+        result = cmds.autoroute({"freeroutingJar": "/nonexistent/freerouting.jar"})
+        assert result["success"] is False
+        assert "JAR not found" in result["message"]
+
+    @patch("commands.freerouting.subprocess.run")
+    def test_dsn_export_fails(self, mock_run: Any, cmds: Any, tmp_path: Any) -> None:
+        jar = tmp_path / "freerouting.jar"
+        jar.touch()
+
+        pcbnew_mock.ExportSpecctraDSN.side_effect = Exception("export fail")
+
+        with _patch_direct_java():
+            result = cmds.autoroute({"freeroutingJar": str(jar)})
+        assert result["success"] is False
+        assert "DSN export failed" in result["message"]
+
+    @patch("commands.freerouting.subprocess.run")
+    def test_freerouting_timeout(self, mock_run: Any, cmds: Any, tmp_path: Any) -> None:
+        import subprocess
+
+        jar = tmp_path / "freerouting.jar"
+        jar.touch()
+        board_dir = tmp_path / "project"
+        board_dir.mkdir()
+        board_file = board_dir / "test.kicad_pcb"
+        board_file.touch()
+        dsn_file = board_dir / "test.dsn"
+
+        cmds.board.GetFileName.return_value = str(board_file)
+        pcbnew_mock.ExportSpecctraDSN.side_effect = lambda b, p: (
+            Path(p).write_text("(pcb)"),
+            True,
+        )[1]
+        mock_run.side_effect = subprocess.TimeoutExpired(cmd="", timeout=10)
+
+        with _patch_direct_java():
+            result = cmds.autoroute({"freeroutingJar": str(jar), "timeout": 10})
+        assert result["success"] is False
+        assert "timed out" in result["message"]
+
+    @patch("commands.freerouting.subprocess.run")
+    def test_full_success_direct(self, mock_run: Any, cmds: Any, tmp_path: Any) -> None:
+        jar = tmp_path / "freerouting.jar"
+        jar.touch()
+        board_dir = tmp_path / "project"
+        board_dir.mkdir()
+        board_file = board_dir / "test.kicad_pcb"
+        board_file.touch()
+        dsn_file = board_dir / "test.dsn"
+        ses_file = board_dir / "test.ses"
+
+        cmds.board.GetFileName.return_value = str(board_file)
+
+        pcbnew_mock.ExportSpecctraDSN.side_effect = lambda b, p: (
+            Path(p).write_text("(pcb)"),
+            True,
+        )[1]
+
+        def _run_writes_ses(cmd, **kw):
+            Path(cmd[cmd.index("-do") + 1]).write_text("(session)")
+            return MagicMock(returncode=0, stdout="Routing completed", stderr="")
+
+        mock_run.side_effect = _run_writes_ses
+        pcbnew_mock.ImportSpecctraSES.return_value = True
+
+        track = MagicMock()
+        track.GetClass.return_value = "PCB_TRACK"
+        via = MagicMock()
+        via.GetClass.return_value = "PCB_VIA"
+        cmds.board.GetTracks.return_value = [track, track, via]
+
+        with _patch_direct_java():
+            result = cmds.autoroute({"freeroutingJar": str(jar)})
+
+        assert result["success"] is True
+        assert result["mode"] == "direct"
+        assert result["board_stats"]["tracks"] == 2
+        assert result["board_stats"]["vias"] == 1
+        assert "elapsed_seconds" in result
+
+    @patch("commands.freerouting.subprocess.run")
+    def test_full_success_docker(self, mock_run: Any, cmds: Any, tmp_path: Any) -> None:
+        jar = tmp_path / "freerouting.jar"
+        jar.touch()
+        board_dir = tmp_path / "project"
+        board_dir.mkdir()
+        board_file = board_dir / "test.kicad_pcb"
+        board_file.touch()
+        dsn_file = board_dir / "test.dsn"
+        ses_file = board_dir / "test.ses"
+
+        cmds.board.GetFileName.return_value = str(board_file)
+
+        staged = {}
+
+        def _export(b, p):
+            staged["dsn"] = Path(p)
+            Path(p).write_text("(pcb)")
+            return True
+
+        pcbnew_mock.ExportSpecctraDSN.side_effect = _export
+
+        def _run_writes_ses(cmd, **kw):
+            # Docker maps the staging dir to /work, so the '-do' argument is a
+            # container path; write the SES where the host will look for it.
+            staged["dsn"].with_name("test.ses").write_text("(session)")
+            return MagicMock(returncode=0, stdout="Routing completed", stderr="")
+
+        mock_run.side_effect = _run_writes_ses
+        pcbnew_mock.ImportSpecctraSES.return_value = True
+
+        cmds.board.GetTracks.return_value = [MagicMock()]
+
+        with (
+            _patch_docker_mode(),
+            patch(
+                "commands.freerouting._find_docker",
+                return_value="/usr/bin/docker",
+            ),
+        ):
+            result = cmds.autoroute({"freeroutingJar": str(jar)})
+
+        assert result["success"] is True
+        assert result["mode"] == "docker"
+        # Verify a container runtime was invoked
+        call_args = mock_run.call_args[0][0]
+        assert "run" in call_args
+        assert "--rm" in call_args
+
+    @patch("commands.freerouting.subprocess.run")
+    def test_freerouting_nonzero_exit(self, mock_run: Any, cmds: Any, tmp_path: Any) -> None:
+        jar = tmp_path / "freerouting.jar"
+        jar.touch()
+        board_dir = tmp_path / "project"
+        board_dir.mkdir()
+        board_file = board_dir / "test.kicad_pcb"
+        board_file.touch()
+        dsn_file = board_dir / "test.dsn"
+
+        cmds.board.GetFileName.return_value = str(board_file)
+        pcbnew_mock.ExportSpecctraDSN.side_effect = lambda b, p: (
+            Path(p).write_text("(pcb)"),
+            True,
+        )[1]
+        mock_run.return_value = MagicMock(returncode=1, stdout="", stderr="OutOfMemoryError")
+
+        with _patch_direct_java():
+            result = cmds.autoroute({"freeroutingJar": str(jar)})
+
+        assert result["success"] is False
+        assert "exited with code 1" in result["message"]
+
+
+def test_protect_dsn_nets_clears_exact_ratsnest_and_protects_existing_copper():
+    dsn = """(pcb demo
+  (network
+    (net \"USB D+\" (pins J1-1 U1-1))
+    (net GND (pins J1-2 U1-2)))
+  (wiring
+    (wire (path F.Cu 250 0 0 1000 0) (net \"USB D+\") (type route))
+    (via Via[0-1] 1000 0 (net \"USB D+\"))
+    (wire (path B.Cu 250 0 1 1000 1) (net GND) (type route))))"""
+
+    transformed, report = protect_dsn_nets(dsn, ["USB D+"])
+
+    assert report == {
+        "applied": True,
+        "strategy": "dsn_net_protection",
+        "protectedNets": ["USB D+"],
+        "pinSetsCleared": 1,
+        "copperItemsProtected": 2,
+    }
+    assert '(net "USB D+" (pins))' in transformed
+    assert "(net GND (pins J1-2 U1-2))" in transformed
+    assert transformed.count("(type protect)") == 2
+    assert "(net GND) (type route)" in transformed
+
+
+def test_protect_dsn_nets_fails_closed_when_requested_net_is_absent():
+    with pytest.raises(ValueError, match="MISSING"):
+        protect_dsn_nets("(pcb demo (network (net GND (pins J1-1))))", ["MISSING"])
+
+
+@patch("commands.freerouting.subprocess.run")
+def test_autoroute_protects_staged_dsn_before_launch(
+    mock_run: Any, cmds: Any, tmp_path: Any
+) -> None:
+    jar = tmp_path / "freerouting.jar"
+    jar.touch()
+    board_dir = tmp_path / "project"
+    board_dir.mkdir()
+    board_file = board_dir / "test.kicad_pcb"
+    board_file.touch()
+    cmds.board.GetFileName.return_value = str(board_file)
+    captured = {}
+
+    def export_dsn(_board, path):
+        Path(path).write_text(
+            "(pcb demo (network (net PWR (pins J1-1 U1-1)) (net SIG (pins J1-2 U1-2))) "
+            "(wiring (wire (path F.Cu 250 0 0 1000 0) (net PWR) (type route))))",
+            encoding="utf-8",
+        )
+        return True
+
+    pcbnew_mock.ExportSpecctraDSN.side_effect = export_dsn
+
+    def run_and_capture(command, **kwargs):
+        dsn_path = Path(command[command.index("-de") + 1])
+        captured["dsn"] = dsn_path.read_text(encoding="utf-8")
+        Path(command[command.index("-do") + 1]).write_text("(session)", encoding="utf-8")
+        return MagicMock(returncode=0, stdout="Routing completed", stderr="")
+
+    mock_run.side_effect = run_and_capture
+    pcbnew_mock.ImportSpecctraSES.return_value = True
+    with _patch_direct_java():
+        result = cmds.autoroute(
+            {"freeroutingJar": str(jar), "protectedNets": ["PWR"], "deferSave": True}
+        )
+
+    assert result["success"] is True
+    assert result["net_protection"]["protectedNets"] == ["PWR"]
+    assert "(net PWR (pins))" in captured["dsn"]
+    assert "(net SIG (pins J1-2 U1-2))" in captured["dsn"]
+    assert "(net PWR) (type protect)" in captured["dsn"]
+    cmds.board.Save.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Helper functions
+# ---------------------------------------------------------------------------
+
+
+class TestFindJava:
+    def test_finds_via_which(self, monkeypatch) -> None:
+        monkeypatch.delenv("FREEROUTING_JAVA", raising=False)
+        monkeypatch.delenv("JAVA_HOME", raising=False)
+        with patch(
+            "commands.freerouting.shutil.which",
+            return_value="/usr/bin/java",
+        ):
+            assert _find_java() == "/usr/bin/java"
+
+    def test_prefers_freerouting_java_override(self, monkeypatch, tmp_path: Path) -> None:
+        configured = tmp_path / "java.exe"
+        configured.touch()
+        monkeypatch.setenv("FREEROUTING_JAVA", str(configured))
+
+        assert _find_java() == str(configured)
+
+    def test_none_when_not_found(self) -> None:
+        with (
+            patch(
+                "commands.freerouting.shutil.which",
+                return_value=None,
+            ),
+            patch("os.path.isfile", return_value=False),
+        ):
+            assert _find_java() is None
+
+
+class TestFindDocker:
+    def test_finds_docker(self) -> None:
+        with patch(
+            "commands.freerouting.shutil.which",
+            side_effect=lambda x: "/usr/bin/docker" if x == "docker" else None,
+        ):
+            assert _find_docker() == "/usr/bin/docker"
+
+    def test_finds_podman(self) -> None:
+        with patch(
+            "commands.freerouting.shutil.which",
+            side_effect=lambda x: "/usr/bin/podman" if x == "podman" else None,
+        ):
+            assert _find_docker() == "/usr/bin/podman"
+
+    def test_none_when_not_found(self) -> None:
+        with patch(
+            "commands.freerouting.shutil.which",
+            return_value=None,
+        ):
+            assert _find_docker() is None
+
+
+class TestDockerAvailable:
+    def test_docker_found(self) -> None:
+        with (
+            patch(
+                "commands.freerouting._find_docker",
+                return_value="/usr/bin/docker",
+            ),
+            patch("commands.freerouting.subprocess.run") as mock_run,
+        ):
+            mock_run.return_value = MagicMock(returncode=0)
+            assert _docker_available() is True
+
+    def test_docker_not_installed(self) -> None:
+        with patch(
+            "commands.freerouting._find_docker",
+            return_value=None,
+        ):
+            assert _docker_available() is False
+
+    def test_docker_not_running(self) -> None:
+        with (
+            patch(
+                "commands.freerouting._find_docker",
+                return_value="/usr/bin/docker",
+            ),
+            patch("commands.freerouting.subprocess.run") as mock_run,
+        ):
+            mock_run.return_value = MagicMock(returncode=1)
+            assert _docker_available() is False
+
+
+class TestJavaVersionOk:
+    def test_java_21(self) -> None:
+        with patch("commands.freerouting.subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(stderr='openjdk version "21.0.1"', stdout="")
+            assert _java_version_ok("/usr/bin/java") is True
+
+    def test_java_17(self) -> None:
+        with patch("commands.freerouting.subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(stderr='openjdk version "17.0.18"', stdout="")
+            assert _java_version_ok("/usr/bin/java") is False
+
+    def test_java_error(self) -> None:
+        with patch(
+            "commands.freerouting.subprocess.run",
+            side_effect=Exception("not found"),
+        ):
+            assert _java_version_ok("/usr/bin/java") is False

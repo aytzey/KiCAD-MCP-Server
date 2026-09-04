@@ -121,12 +121,7 @@ class KiCADProcessManager:
                 return result.returncode == 0
 
             elif system == "Windows":
-                processes = KiCADProcessManager._windows_list_processes()
-                for proc in processes:
-                    name = (proc.get("name") or "").lower()
-                    if name in ("pcbnew.exe", "kicad.exe"):
-                        return True
-                return False
+                return bool(KiCADProcessManager.get_running_pids())
 
             else:
                 logger.warning(f"Process detection not implemented for {system}")
@@ -135,6 +130,22 @@ class KiCADProcessManager:
         except Exception as e:
             logger.error(f"Error checking if KiCAD is running: {e}")
             return False
+
+    @staticmethod
+    def get_running_pids() -> set[int]:
+        """Return PIDs of running KiCad GUI processes (Windows only)."""
+        if platform.system() != "Windows":
+            return set()
+        names = {"kicad.exe", "pcbnew.exe", "eeschema.exe"}
+        pids: set[int] = set()
+        for proc in KiCADProcessManager._windows_list_processes():
+            if (proc.get("name") or "").lower() not in names:
+                continue
+            try:
+                pids.add(int(proc["pid"]))
+            except (TypeError, ValueError):
+                pass
+        return pids
 
     @staticmethod
     def get_executable_path() -> Optional[Path]:
@@ -157,9 +168,9 @@ class KiCADProcessManager:
                 timeout=5 if system == "Windows" else None,
             )
             if result.returncode == 0:
-                path = result.stdout.strip().split("\n")[0]
-                logger.info(f"Found KiCAD executable: {path}")
-                return Path(path)
+                exe_path = result.stdout.strip().split("\n")[0]
+                logger.info(f"Found KiCAD executable: {exe_path}")
+                return Path(exe_path)
 
         # Platform-specific default paths
         if system == "Linux":

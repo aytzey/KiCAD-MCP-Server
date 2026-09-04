@@ -5,15 +5,43 @@ Project-related command implementations for KiCAD interface
 import logging
 import os
 import shutil
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 import pcbnew  # type: ignore
+from utils.kicad_project import write_kicad_pro
+from utils.project_settings_guard import (
+    preserve_project_settings,
+    restore_project_file_if_changed,
+    snapshot_project_file,
+)
 
 logger = logging.getLogger("kicad_interface")
 
 DEFAULT_BOARD_WIDTH_MM = 100.0
 DEFAULT_BOARD_HEIGHT_MM = 100.0
 DEFAULT_COPPER_LAYERS = 2
+
+
+def normalize_fs_path(path: Optional[str]) -> Optional[str]:
+    """Canonicalize a filesystem path for same-file comparison.
+
+    A plain string compare of two absolute paths is not a same-file test. On
+    Windows ``C:\\Project\\Board.kicad_pcb`` and ``c:\\project\\board.kicad_pcb``
+    name one file but compare unequal, which made Save As wrongly treat the
+    board's own file as a distinct, already-existing destination and refuse the
+    save. ``normcase`` folds case and separators; ``realpath`` resolves symlinks
+    and ``..`` segments. Use this only for comparisons — never as the path
+    written to, so symlinks stay intact.
+    """
+    if not path:
+        return None
+    candidate = os.path.abspath(os.path.expanduser(str(path)))
+    try:
+        candidate = os.path.realpath(candidate)
+    except OSError:  # pragma: no cover - realpath is best effort
+        pass
+    return os.path.normcase(candidate)
 
 
 class ProjectCommands:
@@ -48,11 +76,11 @@ class ProjectCommands:
                     "errorDetails": "boardUnit must be 'mm' or 'inch'",
                 }
 
-            if requested_copper_layers is None:
-                copper_layers = DEFAULT_COPPER_LAYERS
-            else:
-                copper_layers = int(requested_copper_layers)
-
+            copper_layers = (
+                DEFAULT_COPPER_LAYERS
+                if requested_copper_layers is None
+                else int(requested_copper_layers)
+            )
             if copper_layers < 2 or copper_layers % 2 != 0:
                 return {
                     "success": False,
@@ -89,15 +117,16 @@ class ProjectCommands:
                     board.SetDesignSettings(template_board.GetDesignSettings())
                     board.SetLayerStack(template_board.GetLayerStack())
 
-            # For blank projects, give LLM sessions a routable default workspace.
+            # A blank project must be immediately usable by placement and
+            # routing tools.  Keep an explicit template's stack-up unless the
+            # caller deliberately overrides the copper layer count.
             if not template or requested_copper_layers is not None:
                 board.SetCopperLayerCount(copper_layers)
 
             if not template:
                 from commands.board.outline import BoardOutlineCommands
 
-                outline_commands = BoardOutlineCommands(board)
-                outline_result = outline_commands.add_board_outline(
+                outline_result = BoardOutlineCommands(board).add_board_outline(
                     {
                         "shape": "rectangle",
                         "params": {
@@ -117,13 +146,17 @@ class ProjectCommands:
             board.SetFileName(board_path)
             pcbnew.SaveBoard(board_path, board)
 
-            # Create schematic from template (use expanded template with symbol definitions)
+            # Create schematic from a blank KiCad 10 template (empty lib_symbols,
+            # no placed symbols). The old template_with_symbols_expanded.kicad_sch
+            # pre-seeded _TEMPLATE_* symbols that leaked into every new project;
+            # the live add tool synthesizes its own lib_symbols via the dynamic
+            # loader, so a blank start is correct (issue #221, also closes #243).
             schematic_path = project_path.replace(".kicad_pro", ".kicad_sch")
             template_sch_path = os.path.join(
                 os.path.dirname(os.path.abspath(__file__)),
                 "..",
                 "templates",
-                "template_with_symbols_expanded.kicad_sch",
+                "blank.kicad_sch",
             )
 
             if os.path.exists(template_sch_path):
@@ -136,10 +169,10 @@ class ProjectCommands:
 
                 with open(schematic_path, "r", encoding="utf-8") as f:
                     content = f.read()
-                new_uuid = str(uuid_module.uuid4())
+                schematic_root_uuid = str(uuid_module.uuid4())
                 content = re.sub(
                     r"\(uuid [0-9a-fA-F-]+\)",
-                    f"(uuid {new_uuid})",
+                    f"(uuid {schematic_root_uuid})",
                     content,
                     count=1,  # Only replace first (schematic) UUID
                 )
@@ -154,41 +187,54 @@ class ProjectCommands:
                 )
                 import uuid as uuid_module
 
-                schematic_uuid = str(uuid_module.uuid4())
+                schematic_root_uuid = str(uuid_module.uuid4())
                 with open(schematic_path, "w", encoding="utf-8", newline="\n") as f:
-                    f.write('(kicad_sch (version 20250114) (generator "KiCAD-MCP-Server")\n\n')
-                    f.write(f"  (uuid {schematic_uuid})\n\n")
+                    # KiCad 10 schematic header (matches what eeschema writes for a
+                    # new file). The older 20250114 token is the KiCad 9 format and
+                    # is stale under KiCad 10 (issue #221).
+                    f.write(
+                        '(kicad_sch (version 20260101) (generator "eeschema")'
+                        ' (generator_version "10.0")\n\n'
+                    )
+                    f.write(f"  (uuid {schematic_root_uuid})\n\n")
                     f.write('  (paper "A4")\n\n')
                     f.write("  (lib_symbols\n  )\n\n")
                     f.write('  (sheet_instances\n    (path "/" (page "1"))\n  )\n')
                     f.write(")\n")
 
-            # Create project file with schematic reference
-            with open(project_path, "w") as f:
-                f.write("{\n")
-                f.write('  "board": {\n')
-                f.write(f'    "filename": "{os.path.basename(board_path)}"\n')
-                f.write("  },\n")
-                f.write('  "sheets": [\n')
-                f.write(f'    ["root", "{os.path.basename(schematic_path)}"]\n')
-                f.write("  ]\n")
-                f.write("}\n")
+            # Write a conformant KiCad 10 .kicad_pro (issue #220). The old
+            # hand-rolled stub carried only board.filename plus a sheets entry
+            # with the literal id "root"; KiCad regenerated defaults on open and
+            # discarded any intended configuration. write_kicad_pro emits the
+            # full structure KiCad 10 itself writes for a new project, with the
+            # sheets entry pointing at the real schematic root-sheet UUID.
+            write_kicad_pro(project_path, sheet_uuid=schematic_root_uuid)
 
             self.board = board
 
+            # Normalize returned paths to a single separator (forward slashes).
+            # os.path.join mixes separators on Windows when the caller passes a
+            # path with forward slashes (issue #224): the joined filename used a
+            # backslash while the rest used forward slashes. The on-disk writes
+            # above keep the OS-native paths; only the reported paths are
+            # normalized so callers get consistent, predictable values.
             return {
                 "success": True,
                 "message": f"Created project: {project_name}",
                 "project": {
                     "name": project_name,
-                    "path": project_path,
-                    "boardPath": board_path,
-                    "schematicPath": schematic_path,
+                    "path": Path(project_path).as_posix(),
+                    "boardPath": Path(board_path).as_posix(),
+                    "schematicPath": Path(schematic_path).as_posix(),
                     "defaults": {
                         "boardWidthMm": board_width_mm,
                         "boardHeightMm": board_height_mm,
                         "boardUnit": board_unit,
-                        "copperLayers": copper_layers if not template or requested_copper_layers is not None else None,
+                        "copperLayers": (
+                            copper_layers
+                            if not template or requested_copper_layers is not None
+                            else None
+                        ),
                     },
                 },
             }
@@ -221,8 +267,13 @@ class ProjectCommands:
             else:
                 board_path = filename
 
-            # Load the board
+            # Load the board. Opening is a read operation: some KiCad builds
+            # rewrite the sibling .kicad_pro during/after LoadBoard from a
+            # stale in-memory project model, dropping hand-edited
+            # net_settings — snapshot and restore it verbatim if it changed.
+            pro_snapshot = snapshot_project_file(board_path)
             board = pcbnew.LoadBoard(board_path)
+            restore_project_file_if_changed(board_path, pro_snapshot)
             self.board = board
 
             return {
@@ -253,14 +304,43 @@ class ProjectCommands:
                     "errorDetails": "Load or create a board first",
                 }
 
-            filename = params.get("filename")
+            filename = params.get("filename") or params.get("path")
+            current_filename = self.board.GetFileName()
+            save_filename = current_filename
+            is_save_as = False
             if filename:
                 # Save to new location
                 filename = os.path.abspath(os.path.expanduser(filename))
-                self.board.SetFileName(filename)
+                # Compare canonicalized paths: a case- or separator-different
+                # spelling of the loaded board file is the same file and must be
+                # an ordinary save, not an "already exists" Save As rejection.
+                is_save_as = normalize_fs_path(filename) != normalize_fs_path(current_filename)
+                if is_save_as and os.path.exists(filename) and not params.get("overwrite", False):
+                    return {
+                        "success": False,
+                        "message": f"Destination already exists: {filename}",
+                        "errorDetails": "Pass overwrite=true to replace it",
+                        "boardPath": filename,
+                    }
+                # A different spelling of the loaded file writes the board's own
+                # path, so the on-disk identity never drifts on a plain save.
+                save_filename = filename if is_save_as else (current_filename or filename)
 
-            # Save the board
-            pcbnew.SaveBoard(self.board.GetFileName(), self.board)
+            # Save first, then switch the in-memory identity. A failed Save As
+            # must not leave the BOARD claiming to own a destination that was
+            # never written successfully. Guarded: SaveBoard serializes project
+            # settings from a possibly stale model — preserve .kicad_pro
+            # net_settings around the write.
+            with preserve_project_settings(save_filename):
+                saved = pcbnew.SaveBoard(save_filename, self.board)
+            if saved is False:
+                return {
+                    "success": False,
+                    "message": f"Failed to save project to: {save_filename}",
+                    "errorDetails": "pcbnew.SaveBoard returned false",
+                }
+            if is_save_as:
+                self.board.SetFileName(filename)
 
             return {
                 "success": True,

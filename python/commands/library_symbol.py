@@ -8,11 +8,30 @@ and providing search functionality for component selection.
 import logging
 import os
 import re
+import threading
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Dict, List, Optional
 
+from utils.kicad_roots import kicad_install_roots
+from utils.platform_helper import PlatformHelper
+from utils.sexpr_format import QUOTED_VALUE, unescape_sexpr_string
+
 logger = logging.getLogger("kicad_interface")
+
+# Parsed-symbol cache shared across SymbolLibraryManager instances, keyed by the
+# resolved .kicad_sym file path.  A fresh manager (and its warm-up thread) is
+# created for every KiCADInterface; with an instance-only cache, each
+# construction re-parsed all 200+ libraries on a new daemon thread, so N
+# interfaces (e.g. one per test) spawned N concurrent warm threads that
+# saturated the CPU and piled up SymbolInfo objects — construction time grew
+# super-linearly. Keying by file path makes the parse happen once per process.
+# Entries are (mtime_ns, symbols) pairs: create_symbol / delete_symbol rewrite
+# .kicad_sym files mid-session, so a hit is honoured only while the file's
+# mtime matches what was parsed.
+_SYMBOL_CACHE_BY_PATH: Dict[str, tuple] = {}
+_SYMBOL_CACHE_LOCK = threading.Lock()
+_WARM_STARTED = False
 
 
 @dataclass
@@ -33,6 +52,7 @@ class SymbolInfo:
     stock: str = ""  # Stock (from JLCPCB libs)
     price: str = ""  # Price (from JLCPCB libs)
     lib_class: str = ""  # Basic/Preferred/Extended
+    sim_pins: str = ""  # Sim.Pins pin mapping (e.g. "1=in+ 2=in- 3=vcc 4=vee 5=out")
 
 
 class SymbolLibraryManager:
@@ -53,9 +73,52 @@ class SymbolLibraryManager:
         self.project_path = project_path
         self.libraries: Dict[str, str] = {}  # nickname -> path mapping
         self.symbol_cache: Dict[str, List[SymbolInfo]] = {}  # library -> [SymbolInfo]
+        self._cache_lock = threading.Lock()
         self._load_libraries()
+        self._warm_cache()
 
-    def _load_libraries(self):
+    def _warm_cache(self) -> None:
+        """Pre-parse all symbol libraries in the background so the first search
+        is fast.
+
+        Without warming, the first ``search_symbols`` call parses every
+        .kicad_sym file on demand, which can take tens of seconds across
+        200+ libraries. Warming pays that cost ahead of time.
+
+        Crucially this runs on a daemon thread so it does NOT block
+        ``__init__``. The interface is constructed before the process emits
+        its READY handshake to the TypeScript host; warming synchronously here
+        delayed (and on large libraries effectively prevented) that handshake,
+        so the MCP server never finished starting. ``list_symbols`` is
+        cache-locked, so on-demand parses race-free with this background warm.
+
+        Warming is started at most once per process (guarded by _WARM_STARTED):
+        the parsed results live in the process-wide _SYMBOL_CACHE_BY_PATH, so a
+        second manager would only re-warm data that is already cached.
+        """
+        # Tests (and any caller that doesn't need pre-warmed symbol search) can
+        # skip the speculative full-library parse entirely; on-demand parses via
+        # list_symbols still populate the shared cache lazily.
+        if os.environ.get("KICAD_SKIP_SYMBOL_WARMUP") == "1":
+            return
+
+        global _WARM_STARTED
+        with _SYMBOL_CACHE_LOCK:
+            if _WARM_STARTED:
+                return
+            _WARM_STARTED = True
+
+        def _warm() -> None:
+            for nickname in list(self.libraries.keys()):
+                try:
+                    self.list_symbols(nickname)
+                except Exception:
+                    logger.debug("Skipping unparseable library: %s", nickname)
+            logger.info("Symbol cache warm-up complete (%d libraries)", len(self.libraries))
+
+        threading.Thread(target=_warm, name="symbol-cache-warmup", daemon=True).start()
+
+    def _load_libraries(self) -> None:
         """Load libraries from sym-lib-table files"""
         # Load global libraries
         global_table = self._get_global_sym_lib_table()
@@ -98,7 +161,7 @@ class SymbolLibraryManager:
 
         return None
 
-    def _parse_sym_lib_table(self, table_path: Path):
+    def _parse_sym_lib_table(self, table_path: Path) -> None:
         """
         Parse sym-lib-table file
 
@@ -111,14 +174,19 @@ class SymbolLibraryManager:
             with open(table_path, "r", encoding="utf-8") as f:
                 content = f.read()
 
-            # Simple regex-based parser for lib entries
-            # Pattern: (lib (name "NAME")(type TYPE)(uri "URI")...)
-            lib_pattern = r'\(lib\s+\(name\s+"?([^")\s]+)"?\)\s*\(type\s+"?([^")\s]+)"?\)\s*\(uri\s+"?([^")\s]+)"?'
+            # Simple regex-based parser for lib entries. Name, type, and URI
+            # may be quoted or bare; quoted URIs can contain spaces.
+            lib_pattern = (
+                r"\(lib\s+"
+                r'\(name\s+(?:"([^"]+)"|([^"\)\s]+))\)\s*'
+                r'\(type\s+(?:"([^"]+)"|([^"\)\s]+))\)\s*'
+                r'\(uri\s+(?:"([^"]+)"|([^"\)\s]+))'
+            )
 
             for match in re.finditer(lib_pattern, content, re.IGNORECASE):
-                nickname = match.group(1)
-                lib_type = match.group(2)
-                uri = match.group(3)
+                nickname = match.group(1) or match.group(2)
+                lib_type = match.group(3) or match.group(4)
+                uri = match.group(5) or match.group(6)
 
                 if lib_type.lower() == "table":
                     table_uri = uri
@@ -163,8 +231,12 @@ class SymbolLibraryManager:
             "KICAD10_3RD_PARTY": self._find_3rd_party_dir(),
             "KICAD9_3RD_PARTY": self._find_3rd_party_dir(),
             "KICAD8_3RD_PARTY": self._find_3rd_party_dir(),
+            "KICAD_3RD_PARTY": self._find_3rd_party_dir(),
             "KISYSSYM": self._find_kicad_symbol_dir(),
         }
+
+        # Merge user-defined env vars from kicad_common.json
+        env_vars.update(PlatformHelper.load_kicad_env_vars())
 
         # Project directory
         if self.project_path:
@@ -194,12 +266,19 @@ class SymbolLibraryManager:
         possible_paths = [
             "/usr/share/kicad/symbols",
             "/usr/local/share/kicad/symbols",
-            "C:/Program Files/KiCad/9.0/share/kicad/symbols",
-            "C:/Program Files/KiCad/8.0/share/kicad/symbols",
             "/Applications/KiCad/KiCad.app/Contents/SharedSupport/symbols",
         ]
 
+        # Prepend Windows install roots from the shared discovery helper (registry
+        # + Program Files + custom C:\KiCad roots, newest first) so a relocated
+        # install's symbols are found the same as its footprints (#286) — this
+        # closes the gap where symbols stayed hardcoded to Program Files.
+        for root in reversed(kicad_install_roots()):
+            possible_paths.insert(0, str(root / "share" / "kicad" / "symbols"))
+
         # Check environment variable
+        if "KICAD10_SYMBOL_DIR" in os.environ:
+            possible_paths.insert(0, os.environ["KICAD10_SYMBOL_DIR"])
         if "KICAD9_SYMBOL_DIR" in os.environ:
             possible_paths.insert(0, os.environ["KICAD9_SYMBOL_DIR"])
         if "KICAD8_SYMBOL_DIR" in os.environ:
@@ -226,6 +305,8 @@ class SymbolLibraryManager:
             possible_paths.insert(0, os.environ["KICAD9_3RD_PARTY"])
         if "KICAD8_3RD_PARTY" in os.environ:
             possible_paths.insert(0, os.environ["KICAD8_3RD_PARTY"])
+        if "KICAD_3RD_PARTY" in os.environ:
+            possible_paths.insert(0, os.environ["KICAD_3RD_PARTY"])
 
         for path in possible_paths:
             if os.path.isdir(path):
@@ -268,11 +349,42 @@ class SymbolLibraryManager:
                 # Find the start position of this symbol
                 start_pos = match.start()
 
-                # Extract properties from this symbol block
-                # We need to find the matching closing paren - use a simple heuristic
-                # Look for the next 2000 characters for properties
-                block_end = min(start_pos + 5000, len(content))
-                symbol_block = content[start_pos:block_end]
+                # Walk forward tracking parenthesis depth to find the true end of
+                # the block. Parens inside quoted strings (e.g. a Description like
+                # "MCU (LQFP-64)") must be ignored, otherwise the depth counter
+                # never rebalances and the walk runs to EOF for every symbol —
+                # turning a multi-MB library into an O(n^2) scan (minutes per file)
+                # and falsely flagging well-formed symbols as malformed.
+                depth = 0
+                i = start_pos
+                end_pos = start_pos
+                in_string = False
+                while i < len(content):
+                    ch = content[i]
+                    if in_string:
+                        if ch == "\\":
+                            i += 2  # skip escaped char
+                            continue
+                        if ch == '"':
+                            in_string = False
+                    elif ch == '"':
+                        in_string = True
+                    elif ch == "(":
+                        depth += 1
+                    elif ch == ")":
+                        depth -= 1
+                        if depth == 0:
+                            end_pos = i + 1
+                            break
+                    i += 1
+
+                if end_pos == start_pos:
+                    logger.warning(
+                        f"Malformed symbol block for '{symbol_name}' in {library_path}; skipping"
+                    )
+                    continue
+
+                symbol_block = content[start_pos:end_pos]
 
                 # Extract properties
                 properties = self._extract_properties(symbol_block)
@@ -292,6 +404,7 @@ class SymbolLibraryManager:
                     stock=properties.get("Stock", ""),
                     price=properties.get("Price", ""),
                     lib_class=properties.get("Class", ""),
+                    sim_pins=properties.get("Sim.Pins", ""),
                 )
 
                 symbols.append(symbol_info)
@@ -308,11 +421,11 @@ class SymbolLibraryManager:
         properties = {}
 
         # Pattern for properties: (property "KEY" "VALUE" ...)
-        prop_pattern = r'\(property\s+"([^"]+)"\s+"([^"]*)"'
+        prop_pattern = r"\(property\s+" + QUOTED_VALUE + r"\s+" + QUOTED_VALUE
 
         for match in re.finditer(prop_pattern, symbol_block):
-            key = match.group(1)
-            value = match.group(2)
+            key = unescape_sexpr_string(match.group(1))
+            value = unescape_sexpr_string(match.group(2))
             properties[key] = value
 
         return properties
@@ -336,19 +449,43 @@ class SymbolLibraryManager:
             List of SymbolInfo objects
         """
         # Check cache first
-        if library_nickname in self.symbol_cache:
-            return self.symbol_cache[library_nickname]
+        cached = self.symbol_cache.get(library_nickname)
+        if cached is not None:
+            return cached
 
         library_path = self.libraries.get(library_nickname)
         if not library_path:
             logger.warning(f"Library not found: {library_nickname}")
             return []
 
-        # Parse the library file
+        # Then the process-wide cache keyed by file path, so the same library is
+        # parsed once even across many manager instances / warm-up threads. The
+        # hit is honoured only while the file's mtime matches what was parsed —
+        # create_symbol / delete_symbol rewrite .kicad_sym files mid-session.
+        def _lib_mtime_ns() -> Optional[int]:
+            try:
+                return os.stat(library_path).st_mtime_ns
+            except OSError:
+                return None
+
+        current_mtime = _lib_mtime_ns()
+        with _SYMBOL_CACHE_LOCK:
+            entry = _SYMBOL_CACHE_BY_PATH.get(library_path)
+        if entry is not None and entry[0] == current_mtime:
+            shared = entry[1]
+            with self._cache_lock:
+                self.symbol_cache[library_nickname] = shared
+            return shared
+
+        # Parse the library file (cold — pay it once per process per file).
         symbols = self._parse_kicad_sym_file(library_path, library_nickname)
 
-        # Cache the results
-        self.symbol_cache[library_nickname] = symbols
+        # Cache the results. Guarded so an on-demand parse and the background
+        # warm-up thread can't corrupt the dict mid-update.
+        with _SYMBOL_CACHE_LOCK:
+            _SYMBOL_CACHE_BY_PATH[library_path] = (current_mtime, symbols)
+        with self._cache_lock:
+            self.symbol_cache[library_nickname] = symbols
 
         return symbols
 
@@ -370,7 +507,7 @@ class SymbolLibraryManager:
         query_lower = query.lower()
 
         # Determine which libraries to search
-        libraries_to_search = self.libraries.keys()
+        libraries_to_search: list[str] = list(self.libraries.keys())
         if library_filter:
             filter_lower = library_filter.lower()
             libraries_to_search = [
@@ -496,9 +633,61 @@ class SymbolLibraryCommands:
         """Initialize with optional library manager"""
         self.library_manager = library_manager or SymbolLibraryManager()
 
+    @staticmethod
+    def _derive_project_path(params: Dict) -> Optional[Path]:
+        """Derive a project directory from caller-supplied params.
+
+        Accepts an explicit project directory or .kicad_pro file via projectPath,
+        or any related file path (schematicPath/boardPath) — in which case the
+        nearest ancestor containing sym-lib-table or a .kicad_pro is used.
+        """
+        for key in ("projectPath", "project_path"):
+            value = params.get(key)
+            if value:
+                p = Path(value).expanduser()
+                if p.suffix == ".kicad_pro" or p.is_file():
+                    p = p.parent
+                return p
+
+        for key in ("schematicPath", "boardPath"):
+            value = params.get(key)
+            if value:
+                start = Path(value).expanduser().parent
+                for ancestor in [start, *start.parents]:
+                    if (ancestor / "sym-lib-table").exists() or list(ancestor.glob("*.kicad_pro")):
+                        return ancestor
+                return start
+
+        return None
+
+    def use_project(self, project_path: Optional[Path]) -> None:
+        """Switch the underlying manager to load project-scope libraries.
+
+        Callers (e.g. open_project / create_project) use this to make
+        `<project>/sym-lib-table` visible to subsequent search/list/info calls
+        without requiring every caller to pass projectPath.
+        """
+        if project_path is None:
+            return
+        # Patch (SER2RJ45): keep cache when project_path matches AND libraries were
+        # actually loaded. Original early-return skipped rebuild even when the cache
+        # was empty (e.g. first call after create_project, before sym-lib-table existed).
+        if (
+            self.library_manager.project_path == project_path
+            and len(self.library_manager.libraries) > 0
+        ):
+            return
+        logger.info(f"Rebuilding SymbolLibraryManager for project: {project_path}")
+        self.library_manager = SymbolLibraryManager(project_path=project_path)
+
+    def _ensure_manager_for(self, params: Dict) -> None:
+        """Rebuild the library manager if the caller's project differs."""
+        self.use_project(self._derive_project_path(params))
+
     def list_symbol_libraries(self, params: Dict) -> Dict:
         """List all available symbol libraries"""
         try:
+            self._ensure_manager_for(params)
             libraries = self.library_manager.list_libraries()
             return {"success": True, "libraries": libraries, "count": len(libraries)}
         except Exception as e:
@@ -515,6 +704,8 @@ class SymbolLibraryCommands:
             query = params.get("query", "")
             if not query:
                 return {"success": False, "message": "Missing query parameter"}
+
+            self._ensure_manager_for(params)
 
             limit = params.get("limit", 20)
             library_filter = params.get("library")
@@ -537,6 +728,8 @@ class SymbolLibraryCommands:
             library = params.get("library")
             if not library:
                 return {"success": False, "message": "Missing library parameter"}
+
+            self._ensure_manager_for(params)
 
             # Check if library exists in sym-lib-table
             if library not in self.library_manager.libraries:
@@ -573,6 +766,8 @@ class SymbolLibraryCommands:
             symbol_spec = params.get("symbol")
             if not symbol_spec:
                 return {"success": False, "message": "Missing symbol parameter"}
+
+            self._ensure_manager_for(params)
 
             result = self.library_manager.find_symbol(symbol_spec)
 

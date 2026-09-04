@@ -11,16 +11,15 @@ KiCAD 9 .kicad_mod format reference:
 import logging
 import os
 import re
+import shutil
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from utils.sexpr_format import escape_sexpr_string
+
 logger = logging.getLogger("kicad_interface")
 
-KICAD9_FORMAT_VERSION = "20250114"  # .kicad_sch schematic files
-# Emit a KiCad 7/8-compatible footprint syntax so generated libraries load on
-# the system installations we encounter in MCP test environments as well as on
-# newer KiCad builds.
-KICAD9_FOOTPRINT_VERSION = "20211014"
+KICAD9_FOOTPRINT_VERSION = "20241229"  # .kicad_mod footprint files
 
 
 def _fmt(v: float) -> str:
@@ -108,16 +107,15 @@ class FootprintCreator:
         lines: List[str] = []
 
         # ---- header ----
-        lines.append(
-            f'(footprint "{name}" (version {KICAD9_FOOTPRINT_VERSION}) (generator pcbnew)'
-        )
+        lines.append(f'(footprint "{name}"')
+        lines.append(f"  (version {KICAD9_FOOTPRINT_VERSION})")
+        lines.append(f'  (generator "kicad-mcp")')
+        lines.append(f'  (generator_version "9.0")')
         lines.append(f'  (layer "F.Cu")')
         if description:
             lines.append(f'  (descr "{_esc(description)}")')
         if tags:
             lines.append(f'  (tags "{_esc(tags)}")')
-        if any(pad.get("type", "smd").lower() in {"thru_hole", "np_thru_hole"} for pad in pads):
-            lines.append("  (attr through_hole)")
         lines.append("")
 
         # ---- reference / value text ----
@@ -126,23 +124,20 @@ class FootprintCreator:
         val_x = value_position.get("x", 0.0) if value_position else 0.0
         val_y = value_position.get("y", 1.27) if value_position else 1.27
 
-        lines.append(
-            f'  (fp_text reference "REF**" (at {_fmt(ref_x)} {_fmt(ref_y)}) (layer "F.SilkS")'
-        )
+        lines.append(f'  (property "Reference" "REF**" (at {_fmt(ref_x)} {_fmt(ref_y)} 0)')
+        lines.append(f'    (layer "F.SilkS")')
+        lines.append(f'    (uuid "{_new_uuid()}")')
         lines.append(f"    (effects (font (size 1 1) (thickness 0.15)))")
-        lines.append(f'    (tstamp "{_new_uuid()}")')
         lines.append(f"  )")
-        lines.append(
-            f'  (fp_text value "{_esc(name)}" (at {_fmt(val_x)} {_fmt(val_y)}) (layer "F.Fab")'
-        )
+        lines.append(f'  (property "Value" "{_esc(name)}" (at {_fmt(val_x)} {_fmt(val_y)} 0)')
+        lines.append(f'    (layer "F.Fab")')
+        lines.append(f'    (uuid "{_new_uuid()}")')
         lines.append(f"    (effects (font (size 1 1) (thickness 0.15)))")
-        lines.append(f'    (tstamp "{_new_uuid()}")')
         lines.append(f"  )")
-        lines.append(
-            '  (fp_text user "${REFERENCE}" (at 0 0) (layer "F.Fab")'
-        )
+        lines.append(f'  (property "Datasheet" "" (at 0 0 0)')
+        lines.append(f'    (layer "F.Fab")')
+        lines.append(f'    (uuid "{_new_uuid()}")')
         lines.append(f"    (effects (font (size 1 1) (thickness 0.15)))")
-        lines.append(f'    (tstamp "{_new_uuid()}")')
         lines.append(f"  )")
         lines.append("")
 
@@ -245,7 +240,10 @@ class FootprintCreator:
                     changes.append(f"drill (inserted)→{new_drill}")
             if shape:
                 block, n = re.subn(
-                    r'(pad\s+"[^"]*"\s+\w+\s+)\w+', lambda m: m.group(1) + shape, block, count=1
+                    r'(pad\s+"[^"]*"\s+\w+\s+)\w+',
+                    lambda m: str(m.group(1)) + shape,
+                    block,
+                    count=1,
                 )
                 if n:
                     changes.append(f"shape→{shape}")
@@ -293,6 +291,214 @@ class FootprintCreator:
             "footprint_path": str(path),
             "pad_number": pad_number,
             "updated": updated,
+        }
+
+    @staticmethod
+    def _find_model_blocks(text: str) -> List[Dict[str, Any]]:
+        """Return brace-balanced ``(model ...)`` blocks as {start,end,text,filename}."""
+        blocks: List[Dict[str, Any]] = []
+        idx = 0
+        while True:
+            start = text.find("(model", idx)
+            if start == -1:
+                break
+            depth = 0
+            i = start
+            end = -1
+            while i < len(text):
+                c = text[i]
+                if c == "(":
+                    depth += 1
+                elif c == ")":
+                    depth -= 1
+                    if depth == 0:
+                        end = i + 1
+                        break
+                i += 1
+            if end == -1:
+                break
+            blk = text[start:end]
+            fm = re.search(r'\(model\s+"?([^")\s]+)"?', blk)
+            blocks.append(
+                {"start": start, "end": end, "text": blk, "filename": fm.group(1) if fm else ""}
+            )
+            idx = end
+        return blocks
+
+    def add_3d_model(
+        self,
+        footprint_path: str,
+        model_path: str,
+        offset: Optional[Dict[str, float]] = None,
+        scale: Optional[Dict[str, float]] = None,
+        rotate: Optional[Dict[str, float]] = None,
+        replace: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        Add or replace a 3D model ``(model ...)`` block in a .kicad_mod file.
+
+        Parameters
+        ----------
+        footprint_path : str
+            Full path to the .kicad_mod file.
+        model_path : str
+            Path to the 3D model (.step/.stp/.wrl). KiCad env vars such as
+            ``${KIPRJMOD}`` or ``${KICAD10_3DMODEL_DIR}`` are allowed.
+        offset, scale, rotate : dict or None – ``{"x":..,"y":..,"z":..}``.
+            Defaults: offset 0/0/0, scale 1/1/1, rotate 0/0/0 (units: mm / deg).
+        replace : bool
+            If True (default), an existing model with the same filename is replaced
+            (avoids duplicates). If False and the same model already exists, nothing
+            is changed.
+        """
+        path = Path(footprint_path)
+        if not path.exists():
+            return {"success": False, "error": f"File not found: {footprint_path}"}
+
+        off = offset or {}
+        scl = scale or {}
+        rot = rotate or {}
+
+        model_block = (
+            f'\t(model "{model_path}"\n'
+            f'\t\t(offset (xyz {_fmt(off.get("x", 0))} {_fmt(off.get("y", 0))} {_fmt(off.get("z", 0))}))\n'
+            f'\t\t(scale (xyz {_fmt(scl.get("x", 1))} {_fmt(scl.get("y", 1))} {_fmt(scl.get("z", 1))}))\n'
+            f'\t\t(rotate (xyz {_fmt(rot.get("x", 0))} {_fmt(rot.get("y", 0))} {_fmt(rot.get("z", 0))}))\n'
+            f"\t)"
+        )
+
+        content = path.read_text(encoding="utf-8")
+        if "(footprint" not in content:
+            return {"success": False, "error": f"Not a footprint file: {footprint_path}"}
+
+        removed = 0
+        blocks = self._find_model_blocks(content)
+        same = [b for b in blocks if b["filename"] == model_path]
+        if same and not replace:
+            return {
+                "success": True,
+                "footprint_path": str(path),
+                "added": False,
+                "note": "Model with this filename already present (replace=false)",
+            }
+        # Remove matching blocks (back-to-front so offsets stay valid)
+        for b in sorted(same, key=lambda x: x["start"], reverse=True):
+            content = content[: b["start"]] + content[b["end"] :]
+            removed += 1
+
+        rstripped = content.rstrip()
+        insert_pos = rstripped.rfind(")")
+        if insert_pos == -1:
+            return {"success": False, "error": "Malformed footprint (no closing paren)"}
+
+        new_content = rstripped[:insert_pos] + model_block + "\n" + rstripped[insert_pos:] + "\n"
+        path.write_text(new_content, encoding="utf-8")
+        logger.info(f"add_3d_model: {model_path} -> {path.name} (replaced {removed})")
+
+        return {
+            "success": True,
+            "footprint_path": str(path),
+            "model": model_path,
+            "added": True,
+            "replaced": removed,
+        }
+
+    def import_3d_model(
+        self,
+        model_path: str,
+        project_path: str,
+        library_dir: Optional[str] = None,
+        new_name: Optional[str] = None,
+        overwrite: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        Copy a 3D model file into the project's ``*.3dshapes`` library and return
+        a portable ``${KIPRJMOD}/...`` path ready for use in a footprint.
+
+        Parameters
+        ----------
+        model_path : str
+            Path to the source 3D model (.step/.stp/.wrl/.wings).
+        project_path : str
+            Path to the .kicad_pro file or the project directory. Used both to
+            locate the default 3dshapes folder and to compute ${KIPRJMOD}.
+        library_dir : str or None
+            Target ``*.3dshapes`` directory. If relative, it is resolved against
+            the project directory. Default: ``<project_dir>/<project>.3dshapes``.
+        new_name : str or None
+            Rename the copied file (extension kept from source if omitted).
+        overwrite : bool
+            Overwrite an existing destination file (default False).
+        """
+        src = Path(model_path)
+        if not src.exists() or not src.is_file():
+            return {"success": False, "error": f"Source model not found: {model_path}"}
+
+        valid_ext = {".step", ".stp", ".wrl", ".wings", ".x3d", ".igs", ".iges"}
+        if src.suffix.lower() not in valid_ext:
+            return {
+                "success": False,
+                "error": f"Unsupported 3D model extension '{src.suffix}'. "
+                f"Expected one of: {', '.join(sorted(valid_ext))}",
+            }
+
+        # Resolve project directory and name
+        pp = Path(project_path)
+        if pp.suffix == ".kicad_pro":
+            project_dir = pp.parent
+            project_name = pp.stem
+        elif pp.is_dir():
+            project_dir = pp
+            pro = next(iter(sorted(pp.glob("*.kicad_pro"))), None)
+            project_name = pro.stem if pro else pp.name
+        else:
+            return {
+                "success": False,
+                "error": f"projectPath must be a .kicad_pro file or a directory: {project_path}",
+            }
+        project_dir = project_dir.resolve()
+
+        # Resolve target 3dshapes directory
+        if library_dir:
+            ld = Path(library_dir)
+            target_dir = ld if ld.is_absolute() else (project_dir / ld)
+        else:
+            target_dir = project_dir / f"{project_name}.3dshapes"
+        target_dir = target_dir.resolve()
+        target_dir.mkdir(parents=True, exist_ok=True)
+
+        # Destination file
+        if new_name:
+            dest_name = new_name if Path(new_name).suffix else new_name + src.suffix
+        else:
+            dest_name = src.name
+        dest = target_dir / dest_name
+
+        if dest.exists() and not overwrite and dest.resolve() != src.resolve():
+            return {
+                "success": False,
+                "error": f"Destination already exists (use overwrite=true): {dest}",
+            }
+
+        if dest.resolve() != src.resolve():
+            shutil.copy2(src, dest)
+
+        # Compute portable ${KIPRJMOD} path
+        try:
+            rel = dest.resolve().relative_to(project_dir).as_posix()
+            kiprjmod_path = "${KIPRJMOD}/" + rel
+        except ValueError:
+            # Destination is outside the project tree – fall back to absolute
+            kiprjmod_path = dest.resolve().as_posix()
+
+        logger.info(f"import_3d_model: {src} -> {dest}")
+        return {
+            "success": True,
+            "source": str(src),
+            "destination": str(dest),
+            "library_dir": str(target_dir),
+            "modelPath": kiprjmod_path,
+            "note": "Use 'modelPath' with add_footprint_3d_model or add_component_3d_model.",
         }
 
     def list_footprint_libraries(self, search_paths: Optional[List[str]] = None) -> Dict[str, Any]:
@@ -433,8 +639,13 @@ class FootprintCreator:
 
 
 def _esc(s: str) -> str:
-    """Escape double-quotes inside S-Expression string values."""
-    return s.replace('"', '\\"')
+    """Escape a value for an S-expression double-quoted token.
+
+    Delegates so there is one implementation: escaping quotes without
+    escaping backslashes first is a no-op on exactly the values that break
+    the file (#336).
+    """
+    return escape_sexpr_string(s)
 
 
 def _new_uuid() -> str:
@@ -488,7 +699,7 @@ def _pad_lines(pad: Dict[str, Any]) -> List[str]:
     if shape == "roundrect":
         lines.append(f"    (roundrect_rratio {_fmt(rr_ratio)})")
 
-    lines.append(f'    (tstamp "{_new_uuid()}")')
+    lines.append(f'    (uuid "{_new_uuid()}")')
     lines.append(f"  )")
     return lines
 
@@ -499,17 +710,14 @@ def _rect_lines(rect: Dict[str, Any], layer: str, default_width: float = 0.05) -
     x2 = _fmt(rect.get("x2", 1.0))
     y2 = _fmt(rect.get("y2", 1.0))
     w = _fmt(rect.get("width", default_width))
-    segments = [
-        ((x1, y1), (x2, y1)),
-        ((x2, y1), (x2, y2)),
-        ((x2, y2), (x1, y2)),
-        ((x1, y2), (x1, y1)),
+    return [
+        f"  (fp_rect",
+        f"    (start {x1} {y1})",
+        f"    (end {x2} {y2})",
+        f"    (stroke (width {w}) (type default))",
+        f"    (fill none)",
+        f'    (layer "{layer}")',
+        f'    (uuid "{_new_uuid()}")',
+        f"  )",
+        "",
     ]
-    lines: List[str] = []
-    for start, end in segments:
-        lines.append(
-            f'  (fp_line (start {start[0]} {start[1]}) (end {end[0]} {end[1]}) '
-            f'(layer "{layer}") (width {w}) (tstamp "{_new_uuid()}"))'
-        )
-    lines.append("")
-    return lines

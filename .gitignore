@@ -87,6 +87,13 @@ data/
 Thumbs.db
 Desktop.ini
 
+# Generated local config files (contain machine-specific paths)
+windows-mcp-config.json
+.mcp.json
+
 # Personal notes / local contributions (not for upstream)
 myContribution/
-graphify-out/cache
+CLAUDE.md
+
+inspect-tools.mjs
+resources/images/icon_b64.txt

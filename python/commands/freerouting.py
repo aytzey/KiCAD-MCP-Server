@@ -11,11 +11,17 @@ Supports two execution modes:
 
 import logging
 import os
+import re
 import shutil
 import subprocess
+import tempfile
 import time
+import zipfile
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+from utils.project_netclasses import apply_net_classes_to_board, load_project_net_classes
+from utils.project_settings_guard import preserve_project_settings
 
 logger = logging.getLogger("kicad_interface")
 
@@ -25,11 +31,32 @@ DEFAULT_FREEROUTING_JAR = os.environ.get(
     os.path.join(os.path.expanduser("~"), ".kicad-mcp", "freerouting.jar"),
 )
 
-DOCKER_IMAGE = "eclipse-temurin:21-jre"
+MIN_JAVA_MAJOR = 21
+DOCKER_IMAGE = f"eclipse-temurin:{MIN_JAVA_MAJOR}-jre"
+
+# Default schedule of `-mp` (max passes) values used when ``attempts`` > 1.
+# Cycles through a range that empirically produces enough variation between
+# runs to surface a better result than any single fixed value. Ported from
+# morningfire-pcb-automation/scripts/routing/freeroute_runner.py.
+DEFAULT_PASS_SCHEDULE = [50, 60, 65, 70, 75, 80, 85, 90, 55, 95]
 
 
 def _find_java() -> Optional[str]:
     """Find java executable on the system."""
+    configured = os.environ.get("FREEROUTING_JAVA")
+    if configured:
+        configured = os.path.expandvars(os.path.expanduser(configured))
+        if os.path.isfile(configured):
+            return configured
+        logger.warning("FREEROUTING_JAVA does not point to a file: %s", configured)
+
+    java_home = os.environ.get("JAVA_HOME")
+    if java_home:
+        executable = "java.exe" if os.name == "nt" else "java"
+        candidate = os.path.join(java_home, "bin", executable)
+        if os.path.isfile(candidate):
+            return candidate
+
     java = shutil.which("java")
     if java:
         return java
@@ -64,8 +91,8 @@ def _docker_available() -> bool:
         return False
 
 
-def _java_version_ok(java_exe: str) -> bool:
-    """Check if local Java is version 21+."""
+def _java_version_info(java_exe: str) -> Tuple[Optional[str], Optional[int]]:
+    """Return the Java version banner and major version for an executable."""
     try:
         proc = subprocess.run(
             [java_exe, "-version"],
@@ -74,15 +101,220 @@ def _java_version_ok(java_exe: str) -> bool:
             timeout=10,
         )
         output = proc.stderr or proc.stdout
-        # Parse version like: openjdk version "17.0.18"
-        for line in output.split("\n"):
-            if "version" in line:
-                ver = line.split('"')[1] if '"' in line else ""
-                major = int(ver.split(".")[0])
-                return major >= 21
+        version_line = next(
+            (line.strip() for line in output.splitlines() if "version" in line), None
+        )
+        if version_line:
+            match = re.search(r'version\s+"?(\d+)', version_line)
+            if match:
+                return version_line, int(match.group(1))
     except Exception:
         pass
-    return False
+    return None, None
+
+
+def _java_version_ok(java_exe: str) -> bool:
+    """Check if local Java meets Freerouting's baseline runtime requirement."""
+    _version, major = _java_version_info(java_exe)
+    return major is not None and major >= MIN_JAVA_MAJOR
+
+
+def _matching_sexpr_end(text: str, start: int) -> int:
+    """Return the exclusive end of an S-expression, respecting strings/comments."""
+    depth = 0
+    in_string = False
+    escaped = False
+    in_comment = False
+    for index in range(start, len(text)):
+        char = text[index]
+        if in_comment:
+            if char in "\r\n":
+                in_comment = False
+            continue
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == ";":
+            in_comment = True
+        elif char == '"':
+            in_string = True
+        elif char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth == 0:
+                return index + 1
+    return -1
+
+
+def _read_sexpr_atom(text: str, start: int) -> Tuple[Optional[str], int]:
+    index = start
+    while index < len(text) and text[index].isspace():
+        index += 1
+    if index >= len(text) or text[index] in "()":
+        return None, index
+    if text[index] != '"':
+        end = index
+        while end < len(text) and not text[end].isspace() and text[end] not in "()":
+            end += 1
+        return text[index:end], end
+
+    index += 1
+    value: List[str] = []
+    escaped = False
+    while index < len(text):
+        char = text[index]
+        if escaped:
+            value.append(char)
+            escaped = False
+        elif char == "\\":
+            escaped = True
+        elif char == '"':
+            return "".join(value), index + 1
+        else:
+            value.append(char)
+        index += 1
+    return None, index
+
+
+def _iter_named_sexprs(text: str, head: str) -> Iterable[Tuple[int, int]]:
+    """Yield all ``(head ...)`` spans, including nested expressions."""
+    index = 0
+    while index < len(text):
+        start = text.find("(", index)
+        if start < 0:
+            return
+        parsed_head, _ = _read_sexpr_atom(text, start + 1)
+        if parsed_head == head:
+            end = _matching_sexpr_end(text, start)
+            if end < 0:
+                raise ValueError(f"Unbalanced ({head} ...) expression in Specctra DSN")
+            yield start, end
+        index = start + 1
+
+
+def _sexpr_first_value(block: str) -> Optional[str]:
+    head, cursor = _read_sexpr_atom(block, 1)
+    if head is None:
+        return None
+    value, _ = _read_sexpr_atom(block, cursor)
+    return value
+
+
+def protect_dsn_nets(dsn_text: str, protected_nets: Iterable[Any]) -> Tuple[str, Dict[str, Any]]:
+    """Protect exact nets in a temporary Specctra DSN.
+
+    Freerouting's ``-inc`` flag targets net *classes* and is unreliable in the
+    v2.2.x headless CLI.  Exact-net protection is instead encoded directly in
+    the staged DSN: remove each protected net's ratsnest pins and mark any
+    existing wire/via copper as ``type protect``.  The user's board/project
+    files are never rewritten by this transform.
+    """
+    requested = list(dict.fromkeys(str(net) for net in protected_nets if str(net)))
+    if not requested:
+        return dsn_text, {
+            "applied": True,
+            "strategy": "dsn_net_protection",
+            "protectedNets": [],
+            "pinSetsCleared": 0,
+            "copperItemsProtected": 0,
+        }
+    requested_set = set(requested)
+    found: set[str] = set()
+    pin_sets_cleared = 0
+    replacements: List[Tuple[int, int, str]] = []
+
+    for start, end in _iter_named_sexprs(dsn_text, "net"):
+        block = dsn_text[start:end]
+        name = _sexpr_first_value(block)
+        pins_blocks = list(_iter_named_sexprs(block, "pins"))
+        if name not in requested_set or not pins_blocks:
+            continue
+        found.add(name)
+        updated = block
+        for pins_start, pins_end in reversed(pins_blocks):
+            updated = updated[:pins_start] + "(pins)" + updated[pins_end:]
+            pin_sets_cleared += 1
+        replacements.append((start, end, updated))
+
+    missing = [name for name in requested if name not in found]
+    if missing:
+        raise ValueError(
+            "Protected net(s) were not found in the exported DSN: " + ", ".join(missing)
+        )
+    transformed = dsn_text
+    for start, end, updated in sorted(replacements, reverse=True):
+        transformed = transformed[:start] + updated + transformed[end:]
+
+    copper_replacements: List[Tuple[int, int, str]] = []
+    copper_items_protected = 0
+    for item_head in ("wire", "via"):
+        for start, end in _iter_named_sexprs(transformed, item_head):
+            block = transformed[start:end]
+            net_name = None
+            for net_start, net_end in _iter_named_sexprs(block, "net"):
+                net_name = _sexpr_first_value(block[net_start:net_end])
+                break
+            if net_name not in requested_set:
+                continue
+            type_blocks = list(_iter_named_sexprs(block, "type"))
+            if type_blocks:
+                type_start, type_end = type_blocks[0]
+                updated = block[:type_start] + "(type protect)" + block[type_end:]
+            else:
+                updated = block[:-1].rstrip() + " (type protect))"
+            copper_replacements.append((start, end, updated))
+            copper_items_protected += 1
+
+    for start, end, updated in sorted(copper_replacements, reverse=True):
+        transformed = transformed[:start] + updated + transformed[end:]
+
+    return transformed, {
+        "applied": True,
+        "strategy": "dsn_net_protection",
+        "protectedNets": requested,
+        "pinSetsCleared": pin_sets_cleared,
+        "copperItemsProtected": copper_items_protected,
+    }
+
+
+def _jar_required_java_major(jar_path: str) -> Tuple[Optional[int], Optional[str]]:
+    """Inspect the runnable main class and return its required Java major.
+
+    Java class-file 65 requires Java 21, 69 requires Java 25, and in general
+    the runtime major is the class-file major minus 44. Inspecting the class
+    header is deterministic and avoids launching a GUI-capable JAR merely to
+    decide whether the selected runtime can load it.
+    """
+    try:
+        with zipfile.ZipFile(jar_path) as archive:
+            manifest = archive.read("META-INF/MANIFEST.MF").decode("utf-8", errors="replace")
+            # Manifest continuation lines begin with one space. Unfold them so
+            # a long Main-Class value is handled correctly.
+            unfolded = re.sub(r"\r?\n ", "", manifest)
+            match = re.search(r"^Main-Class:\s*(\S+)\s*$", unfolded, re.MULTILINE)
+            if not match:
+                return None, "JAR manifest has no Main-Class entry"
+            class_path = match.group(1).replace(".", "/") + ".class"
+            with archive.open(class_path) as class_file:
+                header = class_file.read(8)
+    except (OSError, KeyError, zipfile.BadZipFile) as exc:
+        return None, f"JAR inspection failed: {exc}"
+
+    if len(header) != 8 or header[:4] != b"\xca\xfe\xba\xbe":
+        return None, "JAR main class has an invalid class-file header"
+    class_file_major = int.from_bytes(header[6:8], byteorder="big")
+    return max(MIN_JAVA_MAJOR, class_file_major - 44), None
+
+
+def _docker_image_for_jar(jar_path: str) -> str:
+    required_major, _error = _jar_required_java_major(jar_path)
+    return f"eclipse-temurin:{required_major or MIN_JAVA_MAJOR}-jre"
 
 
 def _build_freerouting_cmd(
@@ -91,10 +323,21 @@ def _build_freerouting_cmd(
     ses_path: str,
     passes: int,
     use_docker: bool,
+    single_thread: bool = False,
 ) -> List[str]:
-    """Build the command to run Freerouting."""
+    """Build the command to run Freerouting.
+
+    ``single_thread`` forces ``-mt 1`` (single-threaded optimisation).
+    Freerouting 2.x's multi-threaded optimiser is documented to produce
+    clearance violations in some cases (the runtime even prints a warning);
+    best-of-N callers should pass this so each attempt's score reflects a
+    valid routed board, not an artefact of MT optimisation.
+    """
+    extra = ["-mt", "1"] if single_thread else []
     if use_docker:
         docker_exe = _find_docker()
+        if docker_exe is None:
+            raise RuntimeError("Docker/Podman executable not found")
         board_dir = os.path.dirname(dsn_path)
         dsn_name = os.path.basename(dsn_path)
         ses_name = os.path.basename(ses_path)
@@ -107,7 +350,7 @@ def _build_freerouting_cmd(
             f"{jar_path}:/app/{jar_name}:ro",
             "-v",
             f"{board_dir}:/work",
-            DOCKER_IMAGE,
+            _docker_image_for_jar(jar_path),
             "java",
             "-jar",
             f"/app/{jar_name}",
@@ -115,11 +358,15 @@ def _build_freerouting_cmd(
             f"/work/{dsn_name}",
             "-do",
             f"/work/{ses_name}",
+            "--gui.enabled=false",
             "-mp",
             str(passes),
+            *extra,
         ]
     else:
         java_exe = _find_java()
+        if java_exe is None:
+            raise RuntimeError("Java executable not found")
         return [
             java_exe,
             "-jar",
@@ -128,53 +375,278 @@ def _build_freerouting_cmd(
             dsn_path,
             "-do",
             ses_path,
+            "--gui.enabled=false",
             "-mp",
             str(passes),
+            *extra,
         ]
+
+
+# ---------------------------------------------------------------------------
+# Best-of-N scoring helpers (ported from morningfire-pcb-automation)
+# ---------------------------------------------------------------------------
+#
+# Approach lifted from
+#   https://github.com/NiNjA-CodE/morningfire-pcb-automation
+#   scripts/routing/freeroute_runner.py::score_ses
+#
+# Single-shot Freerouting on dense boards routinely leaves 1–7 nets
+# unrouted. Re-running with varied --max-passes values surfaces a better
+# solution most of the time; the scoring function below picks the best
+# SES across attempts.
+# ---------------------------------------------------------------------------
+
+_SES_NET_RE = re.compile(r"\(net\s+(\S+)\s*\n\s*\(wire")
+
+
+def _describe_exit(code: Any) -> str:
+    """Human-readable suffix for a Freerouting exit code (#249).
+
+    A user cancelling the run (or an OOM killer, or a console close) surfaces
+    as a raw process exit code -- on Windows a force-killed JVM reports
+    4294967295 (0xFFFFFFFF), which reads like a Java failure rather than
+    "someone stopped it". Decode the known shapes so the error message says
+    what actually happened; return "" when the code carries no extra meaning.
+    """
+    if not isinstance(code, int):
+        return ""
+    # Windows NTSTATUS-shaped codes and POSIX negative-signal codes cannot
+    # collide (POSIX exit codes are 0..255 or small negatives), so decode
+    # both unconditionally rather than gating on os.name -- that also lets
+    # the Linux CI exercise the Windows decodings.
+    known_nt = {
+        0xFFFFFFFF: "process was terminated externally (force-kill)",
+        0xC000013A: "process was interrupted (Ctrl+C or console closed)",
+        0xC0000005: "JVM crashed with an access violation",
+    }
+    desc = known_nt.get(code & 0xFFFFFFFF)
+    if desc:
+        return f" -- {desc}"
+    if code < 0:
+        import signal
+
+        try:
+            name = signal.Signals(-code).name
+        except ValueError:
+            name = str(-code)
+        return f" -- process was killed by signal {name}"
+    return ""
+
+
+def _trim_shared_freerouting_log(max_bytes: int = 5 * 1024 * 1024) -> None:
+    """Best-effort cap on Freerouting's own shared DEBUG log (#249).
+
+    Freerouting 2.x writes an unbounded DEBUG log to a fixed path shared by
+    every run (observed growing to 9+ MB in three runs). We cannot pass it a
+    log level across all bundled JAR versions, so truncate the file when it
+    exceeds the cap after a run. Failures (file locked, absent) are ignored.
+    """
+    try:
+        log_path = Path(tempfile.gettempdir()) / "freerouting" / "freerouting.log"
+        if log_path.is_file() and log_path.stat().st_size > max_bytes:
+            with open(log_path, "w", encoding="utf-8"):
+                pass
+    except OSError:
+        pass
+
+
+def _score_ses(ses_text: str, target_nets: Iterable[str]) -> Dict[str, Any]:
+    """Score a Specctra SES file by routing completeness.
+
+    Score = (nets_routed * 1000) + segments + 50000_if_all_targets_routed
+
+    The ``nets_routed * 1000`` term dominates segment count so an attempt
+    that routes one more net always beats an attempt with marginally more
+    segments. The target-net bonus is huge so any attempt that routes all
+    critical nets wins, regardless of segment count.
+
+    Returns: ``{"score": int, "nets": int, "segments": int, "vias": int,
+                "targets_found": [...], "targets_missing": [...]}``
+    """
+    nets = set(_SES_NET_RE.findall(ses_text))
+    # Strip wrapping quotes if Freerouting emits them.
+    clean_nets = {n.strip('"') for n in nets}
+    segments = len(re.findall(r"\(wire", ses_text))
+    vias = len(re.findall(r"\(via ", ses_text))
+
+    targets = set(target_nets) if target_nets else set()
+    found = sorted(targets & clean_nets)
+    missing = sorted(targets - clean_nets)
+
+    score = len(clean_nets) * 1000 + segments
+    if targets and not missing:
+        score += 50_000
+
+    return {
+        "score": score,
+        "nets": len(clean_nets),
+        "segments": segments,
+        "vias": vias,
+        "targets_found": found,
+        "targets_missing": missing,
+    }
+
+
+# SES net-name tokens are written as ``(net "NAME" ...`` (quoted), the same form
+# the DSN carries; capture the three parts so only the quoted name is rewritten
+# and surrounding whitespace is preserved.
+_SES_NET_TOKEN_RE = re.compile(r'(\(net\s+")([^"]*)(")')
+
+
+def _reconcile_ses_net_names(
+    ses_text: str, board_net_names: Iterable[str]
+) -> Tuple[str, List[str]]:
+    """Re-add a leading ``/`` to SES net names that lost it on the DSN round-trip.
+
+    KiCad's global-label nets are named with a leading ``/`` (e.g. ``/GND``). A
+    Specctra DSN round-trip through Freerouting can drop that prefix, so
+    ``ImportSpecctraSES`` fails the exact-string net lookup and creates a *new*
+    slashless net, leaving the original unconnected (issue #246).
+
+    For each ``(net "NAME" ...`` token, if ``NAME`` is not itself a board net but
+    ``/NAME`` is, rewrite it to ``/NAME``. Names that already match a board net
+    (slashed or not) are left untouched, so this is idempotent and only touches
+    genuinely-orphaned names. Returns ``(rewritten_text, remapped_names)``.
+    """
+    board = set(board_net_names)
+
+    remapped: List[str] = []
+
+    def _repl(match: "re.Match[str]") -> str:
+        name = match.group(2)
+        if name and name not in board and ("/" + name) in board:
+            remapped.append(name)
+            return f"{match.group(1)}/{name}{match.group(3)}"
+        return match.group(0)
+
+    return _SES_NET_TOKEN_RE.sub(_repl, ses_text), remapped
 
 
 class FreeroutingCommands:
     """Handles Freerouting autoroute operations."""
 
-    def __init__(self, board=None):
+    def __init__(self, board: Any = None) -> None:
         self.board = board
+
+    def _apply_project_net_classes(self, board_path: Optional[str]) -> Dict[str, Any]:
+        """Push the project's net classes into the loaded board before DSN
+        export (#302).
+
+        Net-class definitions live in ``.kicad_pro``, which the headless
+        ``LoadBoard()`` path never reads, so without this every net is
+        exported under ``kicad_default`` at Default width — a power net
+        reaches Freerouting at signal width with no warning. Applying the
+        classes to the board's NET_SETTINGS makes ``ExportSpecctraDSN``
+        natively emit per-class rules and via padstacks.
+
+        Best-effort: never raises. The returned report goes into the tool
+        response so a dropped class is loud, not silent.
+        """
+        pro_path = os.path.splitext(board_path)[0] + ".kicad_pro" if board_path else ""
+        try:
+            settings = load_project_net_classes(pro_path)
+        except ValueError as exc:
+            return {
+                "applied": [],
+                "warning": f"{exc}; DSN exported with Default-class rules only",
+            }
+        if settings is None:
+            return {
+                "applied": [],
+                "warning": (
+                    "no .kicad_pro found next to the board; net-class rules are "
+                    "unknown, so every net is exported at Default width/clearance"
+                ),
+            }
+        custom = [c["name"] for c in settings["classes"] if c.get("name") != "Default"]
+        try:
+            report = apply_net_classes_to_board(self.board, settings)
+        except Exception as exc:
+            detail = (
+                f"project defines net classes {custom} but they could not be "
+                f"applied ({exc}); DSN exported with Default-class rules only"
+                if custom
+                else f"could not apply project net settings ({exc})"
+            )
+            return {"applied": [], "warning": detail}
+        report["projectFile"] = pro_path
+        if report["applied"]:
+            logger.info(f"Applied project net classes to board: {report['applied']}")
+        return report
 
     def _resolve_execution_mode(self, jar_path: str) -> Dict[str, Any]:
         """Determine how to run Freerouting: direct or docker.
 
         Returns dict with 'mode', 'use_docker', or 'error'.
         """
+        required_major, inspection_error = _jar_required_java_major(jar_path)
+        if inspection_error or required_major is None:
+            return {
+                "mode": "error",
+                "error": inspection_error or "Could not determine the JAR runtime requirement",
+            }
+
         java_exe = _find_java()
-        if java_exe and _java_version_ok(java_exe):
-            return {"mode": "direct", "use_docker": False}
+        _java_version, java_major = _java_version_info(java_exe) if java_exe else (None, None)
+        if java_exe and java_major is not None and java_major >= required_major:
+            return {
+                "mode": "direct",
+                "use_docker": False,
+                "java_major": java_major,
+                "required_java_major": required_major,
+            }
 
         if _docker_available():
-            return {"mode": "docker", "use_docker": True}
+            return {
+                "mode": "docker",
+                "use_docker": True,
+                "required_java_major": required_major,
+            }
 
         if java_exe:
             return {
                 "mode": "error",
                 "error": (
-                    f"Java found at {java_exe} but version < 21. "
-                    "Freerouting 2.x requires Java 21+. "
-                    "Install Java 21+ or Docker."
+                    f"Java {java_major or 'unknown'} found at {java_exe}, but the selected "
+                    f"Freerouting JAR requires Java {required_major}+. "
+                    "Set FREEROUTING_JAVA to a compatible runtime or install Docker."
                 ),
             }
         return {
             "mode": "error",
             "error": (
-                "Neither Java 21+ nor Docker found. " "Install one of them to use Freerouting."
+                f"Neither Java {required_major}+ nor Docker found. "
+                "Install one of them to use Freerouting."
             ),
         }
 
     def autoroute(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Run Freerouting autorouter on the current board.
 
-        Flow:
-        1. Export board to Specctra DSN
-        2. Run Freerouting CLI on DSN -> SES
-        3. Import SES back into the board
-        4. Save the board
+        Single-attempt flow (default):
+            1. Export board to Specctra DSN
+            2. Run Freerouting CLI on DSN -> SES (one pass with ``maxPasses``)
+            3. Import SES back into the board
+            4. Save the board
+
+        Best-of-N flow (``attempts > 1``):
+            1. Export DSN once
+            2. Run Freerouting ``attempts`` times, varying ``--max-passes``
+               per the ``passSchedule`` (defaults to a built-in schedule
+               of 10 spread-out values).
+            3. Score each SES by (nets_routed * 1000) + segments, plus a
+               50,000-point bonus when every ``targetNets`` entry routed.
+            4. Keep the highest-scoring SES; import that one into the board.
+
+        Single-attempt behaviour is unchanged when ``attempts`` is omitted
+        or set to 1, so existing callers do not need updates.
+
+        The best-of-N scoring approach is ported from
+        morningfire-pcb-automation
+        (https://github.com/NiNjA-CodE/morningfire-pcb-automation,
+        scripts/routing/freeroute_runner.py). On dense boards a single
+        run regularly leaves 1–7 nets unrouted; cycling through a few
+        ``-mp`` values typically gets the count to zero.
         """
         try:
             import pcbnew
@@ -207,6 +679,30 @@ class FreeroutingCommands:
         timeout = params.get("timeout", 300)
         passes = params.get("maxPasses", 20)
 
+        # Best-of-N parameters
+        attempts_raw = params.get("attempts", 1)
+        try:
+            attempts = int(attempts_raw) if attempts_raw is not None else 1
+        except (TypeError, ValueError):
+            return {
+                "success": False,
+                "message": "Invalid attempts value",
+                "errorDetails": f"attempts must be a positive integer; got {attempts_raw!r}",
+            }
+        if attempts < 1:
+            return {
+                "success": False,
+                "message": "Invalid attempts value",
+                "errorDetails": "attempts must be >= 1",
+            }
+        target_nets = list(params.get("targetNets") or [])
+        pass_schedule = list(params.get("passSchedule") or DEFAULT_PASS_SCHEDULE)
+        if not pass_schedule:
+            pass_schedule = [passes]
+        extra_args = [str(arg) for arg in params.get("extraFreeroutingArgs", []) or []]
+        seed_flag = params.get("freeroutingSeedFlag")
+        seed = params.get("seed")
+
         # Validate Freerouting JAR
         if not os.path.isfile(jar_path):
             return {
@@ -230,13 +726,92 @@ class FreeroutingCommands:
 
         use_docker = exec_mode["use_docker"]
 
-        # Set up file paths
+        # Set up file paths. Artifacts are staged in a fresh per-run temp
+        # directory instead of the user's project directory (#249): every
+        # failure exit used to leave .dsn/.ses/_best.ses litter next to the
+        # board, and a stale .ses from an earlier run could satisfy the
+        # exists-check below and be imported as if it were this run's output.
+        # A fresh directory makes cross-run staleness structurally impossible;
+        # keepArtifacts=true copies the files back out for debugging.
+        keep_artifacts = bool(params.get("keepArtifacts", False))
         board_dir = os.path.dirname(board_path)
         board_stem = Path(board_path).stem
-        dsn_path = os.path.join(board_dir, f"{board_stem}.dsn")
-        ses_path = os.path.join(board_dir, f"{board_stem}.ses")
+        staging_dir = tempfile.mkdtemp(prefix="kicad-mcp-autoroute-")
+        dsn_path = os.path.join(staging_dir, f"{board_stem}.dsn")
+        ses_path = os.path.join(staging_dir, f"{board_stem}.ses")
+        best_ses_path = os.path.join(staging_dir, f"{board_stem}_best.ses")
+        kept_paths: Dict[str, str] = {}
 
-        # Step 1: Export DSN
+        try:
+            return self._autoroute_staged(
+                params,
+                board_path=board_path,
+                board_dir=board_dir,
+                board_stem=board_stem,
+                dsn_path=dsn_path,
+                ses_path=ses_path,
+                best_ses_path=best_ses_path,
+                keep_artifacts=keep_artifacts,
+                kept_paths=kept_paths,
+                jar_path=jar_path,
+                timeout=timeout,
+                passes=passes,
+                attempts=attempts,
+                target_nets=target_nets,
+                pass_schedule=pass_schedule,
+                extra_args=extra_args,
+                seed_flag=str(seed_flag) if seed_flag else None,
+                seed=seed,
+                use_docker=use_docker,
+            )
+        finally:
+            # Runs on every exit -- success, failure return, or exception --
+            # so no artefact can outlive the run unless explicitly kept.
+            if keep_artifacts:
+                for src in (dsn_path, ses_path, best_ses_path):
+                    try:
+                        if os.path.isfile(src):
+                            dest = os.path.join(board_dir, os.path.basename(src))
+                            shutil.copy2(src, dest)
+                            kept_paths[os.path.basename(src)] = dest
+                    except OSError as copy_err:
+                        logger.warning(f"Could not keep artifact {src}: {copy_err}")
+            shutil.rmtree(staging_dir, ignore_errors=True)
+            _trim_shared_freerouting_log()
+
+    def _autoroute_staged(
+        self,
+        params: Dict[str, Any],
+        *,
+        board_path: str,
+        board_dir: str,
+        board_stem: str,
+        dsn_path: str,
+        ses_path: str,
+        best_ses_path: str,
+        keep_artifacts: bool,
+        kept_paths: Dict[str, str],
+        jar_path: str,
+        timeout: Any,
+        passes: Any,
+        attempts: int,
+        target_nets: List[Any],
+        pass_schedule: List[Any],
+        extra_args: List[str],
+        seed_flag: Optional[str],
+        seed: Any,
+        use_docker: bool,
+    ) -> Dict[str, Any]:
+        """Body of autoroute, running against a staged artifact directory."""
+        import pcbnew
+
+        # Apply the project's net classes so the DSN carries per-class
+        # width/clearance rules instead of routing everything at Default (#302)
+        netclass_report = self._apply_project_net_classes(board_path)
+        if netclass_report.get("warning"):
+            logger.warning(f"Net-class application: {netclass_report['warning']}")
+
+        # Step 1: Export DSN (once, regardless of attempt count)
         logger.info(f"Exporting DSN to {dsn_path}")
         try:
             result = pcbnew.ExportSpecctraDSN(self.board, dsn_path)
@@ -260,60 +835,206 @@ class FreeroutingCommands:
                 "errorDetails": f"Expected at: {dsn_path}",
             }
 
+        protected_nets = list(params.get("protectedNets") or [])
+        net_protection = {
+            "applied": True,
+            "strategy": "dsn_net_protection",
+            "protectedNets": [],
+            "pinSetsCleared": 0,
+            "copperItemsProtected": 0,
+        }
+        if protected_nets:
+            try:
+                dsn_text = Path(dsn_path).read_text(encoding="utf-8")
+                protected_text, net_protection = protect_dsn_nets(dsn_text, protected_nets)
+                Path(dsn_path).write_text(protected_text, encoding="utf-8")
+            except Exception as exc:
+                return {
+                    "success": False,
+                    "message": "Could not protect excluded nets in Freerouting input",
+                    "errorDetails": str(exc),
+                    "net_protection": {
+                        "applied": False,
+                        "strategy": "dsn_net_protection",
+                        "protectedNets": protected_nets,
+                    },
+                }
+
         dsn_size = os.path.getsize(dsn_path)
         logger.info(f"DSN exported: {dsn_size} bytes")
 
-        # Step 2: Run Freerouting
-        cmd = _build_freerouting_cmd(jar_path, dsn_path, ses_path, passes, use_docker)
-
+        # Step 2: Run Freerouting (single or multiple attempts)
         mode_label = "docker" if use_docker else "direct"
-        logger.info(f"Running Freerouting ({mode_label}): {' '.join(cmd)}")
-        start_time = time.time()
+        total_start = time.time()
+        attempt_results: List[Dict[str, Any]] = []
+        best_score = -1
+        best_attempt_idx = -1
+        best_proc_stdout = ""
 
-        try:
-            proc = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                cwd=board_dir,
+        # If only one attempt, use the legacy maxPasses value (preserves
+        # exact backward-compatible behaviour). Otherwise cycle through
+        # passSchedule. Always run single-threaded when scoring multiple
+        # attempts so the optimiser doesn't introduce clearance violations
+        # that would distort the comparison.
+        for idx in range(attempts):
+            if attempts == 1:
+                attempt_passes = passes
+                single_thread = False
+            else:
+                attempt_passes = pass_schedule[idx % len(pass_schedule)]
+                single_thread = True
+
+            cmd = _build_freerouting_cmd(
+                jar_path,
+                dsn_path,
+                ses_path,
+                attempt_passes,
+                use_docker,
+                single_thread=single_thread,
             )
-            elapsed = round(time.time() - start_time, 1)
+            cmd.extend(extra_args)
+            if seed_flag and seed is not None:
+                try:
+                    attempt_seed = int(seed) + idx
+                except (TypeError, ValueError):
+                    return {
+                        "success": False,
+                        "message": "Invalid seed value",
+                        "errorDetails": f"seed must be an integer; got {seed!r}",
+                    }
+                cmd.extend([seed_flag, str(attempt_seed)])
+            logger.info(
+                f"Freerouting attempt {idx + 1}/{attempts} "
+                f"(mp={attempt_passes}, mode={mode_label})"
+            )
 
-            if proc.returncode != 0:
+            # Remove the previous attempt's SES before launching: an attempt
+            # that exits 0 without writing output must read as "no SES", not
+            # silently re-score its predecessor's file (#249).
+            try:
+                os.remove(ses_path)
+            except FileNotFoundError:
+                pass
+
+            attempt_start = time.time()
+            try:
+                proc = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                    cwd=os.path.dirname(dsn_path),
+                )
+                attempt_elapsed = round(time.time() - attempt_start, 1)
+            except subprocess.TimeoutExpired:
                 return {
                     "success": False,
-                    "message": (f"Freerouting exited with code " f"{proc.returncode}"),
-                    "errorDetails": proc.stderr or proc.stdout,
-                    "elapsed_seconds": elapsed,
-                    "mode": mode_label,
+                    "message": f"Freerouting timed out after {timeout}s",
+                    "errorDetails": "Increase timeout or reduce board complexity",
+                    "attempts_completed": idx,
                 }
-        except subprocess.TimeoutExpired:
+            except Exception as e:
+                return {
+                    "success": False,
+                    "message": "Failed to run Freerouting",
+                    "errorDetails": str(e),
+                    "attempts_completed": idx,
+                }
+
+            if proc.returncode != 0:
+                # Don't abort the whole best-of-N just because one attempt
+                # exits nonzero — record it and move on.
+                exit_note = _describe_exit(proc.returncode)
+                attempt_results.append(
+                    {
+                        "attempt": idx + 1,
+                        "max_passes": attempt_passes,
+                        "elapsed_seconds": attempt_elapsed,
+                        "ok": False,
+                        "exit_code": proc.returncode,
+                        "exit_reason": exit_note.lstrip(" -") or "nonzero exit",
+                        "stderr": (proc.stderr or "")[:200],
+                    }
+                )
+                if attempts == 1:
+                    return {
+                        "success": False,
+                        "message": (f"Freerouting exited with code {proc.returncode}{exit_note}"),
+                        "errorDetails": proc.stderr or proc.stdout,
+                        "elapsed_seconds": attempt_elapsed,
+                        "mode": mode_label,
+                    }
+                continue
+
+            if not os.path.isfile(ses_path):
+                attempt_results.append(
+                    {
+                        "attempt": idx + 1,
+                        "max_passes": attempt_passes,
+                        "elapsed_seconds": attempt_elapsed,
+                        "ok": False,
+                        "error": "no SES produced",
+                    }
+                )
+                if attempts == 1:
+                    return {
+                        "success": False,
+                        "message": "Freerouting did not produce SES output",
+                        "errorDetails": (f"Expected at: {ses_path}. Stdout: {proc.stdout[:500]}"),
+                        "elapsed_seconds": attempt_elapsed,
+                    }
+                continue
+
+            # Score this attempt
+            with open(ses_path, "r", encoding="utf-8", errors="replace") as fh:
+                ses_text = fh.read()
+            score_info = _score_ses(ses_text, target_nets)
+            score = score_info["score"]
+            attempt_results.append(
+                {
+                    "attempt": idx + 1,
+                    "max_passes": attempt_passes,
+                    "elapsed_seconds": attempt_elapsed,
+                    "ok": True,
+                    **score_info,
+                }
+            )
+            logger.info(
+                f"  attempt {idx + 1}: score={score} "
+                f"({score_info['nets']} nets, {score_info['segments']} segs, "
+                f"{score_info['vias']} vias)"
+            )
+
+            if score > best_score:
+                best_score = score
+                best_attempt_idx = idx
+                best_proc_stdout = proc.stdout or ""
+                # Snapshot the SES that produced this score so later
+                # attempts (which overwrite ses_path) don't clobber it.
+                shutil.copy2(ses_path, best_ses_path)
+
+        elapsed = round(time.time() - total_start, 1)
+
+        if best_attempt_idx == -1:
             return {
                 "success": False,
-                "message": (f"Freerouting timed out after {timeout}s"),
-                "errorDetails": ("Increase timeout or reduce board complexity"),
-            }
-        except Exception as e:
-            return {
-                "success": False,
-                "message": "Failed to run Freerouting",
-                "errorDetails": str(e),
+                "message": "All Freerouting attempts failed",
+                "errorDetails": "No attempt produced a usable SES file",
+                "elapsed_seconds": elapsed,
+                "attempts": attempt_results,
             }
 
-        # Check SES output
-        if not os.path.isfile(ses_path):
-            return {
-                "success": False,
-                "message": "Freerouting did not produce SES output",
-                "errorDetails": (f"Expected at: {ses_path}. " f"Stdout: {proc.stdout[:500]}"),
-                "elapsed_seconds": elapsed,
-            }
+        # Restore the winning SES as the canonical output file
+        if attempts > 1:
+            shutil.copy2(best_ses_path, ses_path)
 
         ses_size = os.path.getsize(ses_path)
-        logger.info(f"SES produced: {ses_size} bytes in {elapsed}s")
+        logger.info(
+            f"Best SES: attempt {best_attempt_idx + 1}, score={best_score}, "
+            f"{ses_size} bytes (total {elapsed}s)"
+        )
 
-        # Step 3: Import SES
+        # Step 3: Import the winning SES
         logger.info(f"Importing SES from {ses_path}")
         try:
             result = pcbnew.ImportSpecctraSES(self.board, ses_path)
@@ -321,8 +1042,9 @@ class FreeroutingCommands:
                 return {
                     "success": False,
                     "message": "SES import failed",
-                    "errorDetails": (f"ImportSpecctraSES returned: {result}"),
+                    "errorDetails": f"ImportSpecctraSES returned: {result}",
                     "elapsed_seconds": elapsed,
+                    "attempts": attempt_results,
                 }
         except Exception as e:
             return {
@@ -330,13 +1052,18 @@ class FreeroutingCommands:
                 "message": "SES import failed",
                 "errorDetails": str(e),
                 "elapsed_seconds": elapsed,
+                "attempts": attempt_results,
             }
 
-        # Step 4: Save board
-        try:
-            self.board.Save(board_path)
-        except Exception as e:
-            logger.warning(f"Board save after autoroute failed: {e}")
+        # The CFHA orchestrator defers persistence to KiCADInterface so its
+        # external-change hash guard, rotating backup, and project-settings
+        # preservation remain the single write authority.
+        if not params.get("deferSave", False):
+            try:
+                with preserve_project_settings(board_path):
+                    self.board.Save(board_path)
+            except Exception as e:
+                logger.warning(f"Board save after autoroute failed: {e}")
 
         # Collect stats
         tracks = self.board.GetTracks()
@@ -348,19 +1075,37 @@ class FreeroutingCommands:
             else:
                 track_count += 1
 
-        return {
+        response: Dict[str, Any] = {
             "success": True,
             "message": f"Autoroute completed in {elapsed}s",
             "mode": mode_label,
-            "dsn_path": dsn_path,
-            "ses_path": ses_path,
+            # Artifacts are staged in a temp dir and removed after the run
+            # (#249); with keepArtifacts=true they are copied next to the
+            # board and these fields point at the kept copies.
+            "artifacts_kept": keep_artifacts,
+            "dsn_path": (
+                os.path.join(board_dir, os.path.basename(dsn_path)) if keep_artifacts else None
+            ),
+            "ses_path": (
+                os.path.join(board_dir, os.path.basename(ses_path)) if keep_artifacts else None
+            ),
             "elapsed_seconds": elapsed,
+            "net_protection": net_protection,
             "board_stats": {
                 "tracks": track_count,
                 "vias": via_count,
             },
-            "freerouting_stdout": (proc.stdout[:1000] if proc.stdout else ""),
+            "netClasses": netclass_report,
+            "freerouting_stdout": best_proc_stdout[:1000],
         }
+        if attempts > 1:
+            response["attempts"] = attempt_results
+            response["best_attempt"] = best_attempt_idx + 1
+            response["best_score"] = best_score
+            response["best_ses_path"] = (
+                os.path.join(board_dir, os.path.basename(best_ses_path)) if keep_artifacts else None
+            )
+        return response
 
     def export_dsn(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Export the board to Specctra DSN format only."""
@@ -393,6 +1138,12 @@ class FreeroutingCommands:
                     "errorDetails": ("Provide outputPath or have a board open"),
                 }
 
+        # Apply the project's net classes so the DSN carries per-class
+        # width/clearance rules instead of routing everything at Default (#302)
+        netclass_report = self._apply_project_net_classes(board_path)
+        if netclass_report.get("warning"):
+            logger.warning(f"Net-class application: {netclass_report['warning']}")
+
         try:
             result = pcbnew.ExportSpecctraDSN(self.board, output_path)
             if result is not True and result != 0:
@@ -414,7 +1165,24 @@ class FreeroutingCommands:
             "message": f"Exported DSN to {output_path}",
             "path": output_path,
             "size_bytes": file_size,
+            "netClasses": netclass_report,
         }
+
+    def _board_net_names(self) -> List[str]:
+        """All net names currently on the loaded board (same enumeration as
+        ``get_nets_list``). Returns ``[]`` if no board or on any read error."""
+        names: List[str] = []
+        if not self.board:
+            return names
+        try:
+            netinfo = self.board.GetNetInfo()
+            for code in range(netinfo.GetNetCount()):
+                net = netinfo.GetNetItem(code)
+                if net:
+                    names.append(net.GetNetname())
+        except Exception as e:
+            logger.warning(f"Could not enumerate board net names: {e}")
+        return names
 
     def import_ses(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Import a Specctra SES file into the board."""
@@ -449,8 +1217,36 @@ class FreeroutingCommands:
                 "errorDetails": f"File not found: {ses_path}",
             }
 
+        # Reconcile net names that lost their leading '/' on the DSN round-trip
+        # so pcbnew's exact-string lookup binds routed tracks to the real board
+        # nets instead of creating phantom slashless duplicates (#246). Any
+        # failure here falls back to importing the original file unchanged.
+        import_path = ses_path
+        reconciled_temp: Optional[str] = None
+        remapped: List[str] = []
         try:
-            result = pcbnew.ImportSpecctraSES(self.board, ses_path)
+            board_net_names = self._board_net_names()
+            with open(ses_path, "r", encoding="utf-8") as f:
+                ses_text = f.read()
+            fixed_text, remapped = _reconcile_ses_net_names(ses_text, board_net_names)
+            if remapped:
+                fd, reconciled_temp = tempfile.mkstemp(
+                    suffix=".ses", prefix="reconciled-", dir=os.path.dirname(ses_path) or None
+                )
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    f.write(fixed_text)
+                import_path = reconciled_temp
+                logger.info(
+                    "Reconciled %d SES net name(s) to their '/'-prefixed board nets: %s",
+                    len(remapped),
+                    sorted(set(remapped)),
+                )
+        except Exception as e:
+            logger.warning(f"SES net-name reconciliation skipped ({e}); importing original file")
+            import_path = ses_path
+
+        try:
+            result = pcbnew.ImportSpecctraSES(self.board, import_path)
             if result is not True and result != 0:
                 return {
                     "success": False,
@@ -463,11 +1259,18 @@ class FreeroutingCommands:
                 "message": "SES import failed",
                 "errorDetails": str(e),
             }
+        finally:
+            if reconciled_temp and os.path.isfile(reconciled_temp):
+                try:
+                    os.remove(reconciled_temp)
+                except OSError:
+                    pass
 
         board_path = params.get("boardPath") or self.board.GetFileName()
         if board_path:
             try:
-                self.board.Save(board_path)
+                with preserve_project_settings(board_path):
+                    self.board.Save(board_path)
             except Exception as e:
                 logger.warning(f"Board save after SES import failed: {e}")
 
@@ -475,7 +1278,7 @@ class FreeroutingCommands:
         track_count = sum(1 for t in tracks if t.GetClass() != "PCB_VIA")
         via_count = sum(1 for t in tracks if t.GetClass() == "PCB_VIA")
 
-        return {
+        response: Dict[str, Any] = {
             "success": True,
             "message": f"Imported SES from {ses_path}",
             "board_stats": {
@@ -483,6 +1286,10 @@ class FreeroutingCommands:
                 "vias": via_count,
             },
         }
+        if remapped:
+            # Report the net-name repairs so callers can see the '/'-prefix fix ran.
+            response["netsRemapped"] = sorted(set(remapped))
+        return response
 
     def check_freerouting(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Check if Freerouting and Java/Docker are available."""
@@ -491,31 +1298,32 @@ class FreeroutingCommands:
         # Check local Java
         java_exe = _find_java()
         java_version = None
-        java_21_ok = False
+        java_major = None
         if java_exe:
-            try:
-                proc = subprocess.run(
-                    [java_exe, "-version"],
-                    capture_output=True,
-                    text=True,
-                    timeout=10,
-                )
-                java_version = (proc.stderr or proc.stdout).strip().split("\n")[0]
-                java_21_ok = _java_version_ok(java_exe)
-            except Exception:
-                pass
+            java_version, java_major = _java_version_info(java_exe)
 
         # Check Docker/Podman
         docker_exe = _find_docker()
         has_docker = _docker_available()
 
         jar_exists = os.path.isfile(jar_path)
-        ready = jar_exists and (java_21_ok or has_docker)
+        required_java_major: Optional[int] = None
+        inspection_error: Optional[str] = None
+        if jar_exists:
+            required_java_major, inspection_error = _jar_required_java_major(jar_path)
+        java_21_ok = java_major is not None and java_major >= MIN_JAVA_MAJOR
+        java_compatible = (
+            required_java_major is not None
+            and java_major is not None
+            and java_major >= required_java_major
+        )
+        jar_runnable = jar_exists and inspection_error is None and required_java_major is not None
+        ready = jar_runnable and (java_compatible or has_docker)
 
         mode = "none"
-        if java_21_ok:
+        if java_compatible:
             mode = "direct"
-        elif has_docker:
+        elif jar_runnable and has_docker:
             mode = "docker"
 
         return {
@@ -525,16 +1333,20 @@ class FreeroutingCommands:
                 "found": java_exe is not None,
                 "path": java_exe,
                 "version": java_version,
+                "major": java_major,
                 "java_21_ok": java_21_ok,
+                "compatible_with_jar": java_compatible,
             },
             "docker": {
                 "available": has_docker,
                 "path": docker_exe,
-                "image": DOCKER_IMAGE,
+                "image": _docker_image_for_jar(jar_path) if jar_runnable else DOCKER_IMAGE,
             },
             "freerouting": {
                 "jar_found": jar_exists,
                 "jar_path": jar_path,
+                "required_java_major": required_java_major,
+                "inspection_error": inspection_error,
             },
             "execution_mode": mode,
             "ready": ready,

@@ -13,7 +13,7 @@ orchestration problem instead of a single "magic autorouter" call:
 7. Post-route tuning hooks
 8. DRC + QoR verification
 
-The implementation is intentionally pragmatic for phase 1:
+The implementation deliberately keeps its routing policy transparent:
 - Critical routing is deterministic and conservative
 - Freerouting remains the bulk-router backend
 - External OrthoRoute is optional; the built-in orthogonal planner is the
@@ -29,7 +29,6 @@ import os
 import re
 import shutil
 import subprocess
-import sys
 import time
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
@@ -37,7 +36,10 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import pcbnew
-from commands.freerouting import DEFAULT_FREEROUTING_JAR, _build_freerouting_cmd
+from commands.freerouting import DEFAULT_FREEROUTING_JAR, _build_freerouting_cmd, _find_java
+from utils.board_items import delete_board_item
+from utils.kicad_dru import persist_managed_rule_block
+from utils.sexpr_format import escape_sexpr_string
 
 logger = logging.getLogger("kicad_interface")
 
@@ -329,11 +331,28 @@ def _profile_merge(profiles: Sequence[str], interfaces: Sequence[str]) -> Dict[s
     return merged
 
 
+def _escape_rule_string_literal(value: str) -> str:
+    """Escape a value inside a KiCad rule-expression string literal.
+
+    Conditions are stored as a double-quoted S-expression containing an
+    expression whose string literals use apostrophes. Unicode escapes keep
+    hostile delimiters inside the expression literal through both parsers.
+    """
+    escaped: List[str] = []
+    for character in str(value):
+        codepoint = ord(character)
+        if character in {"'", '"', "\\", "(", ")", "\r", "\n"} or codepoint < 0x20:
+            escaped.append(f"\\u{codepoint:04X}")
+        else:
+            escaped.append(character)
+    return "".join(escaped)
+
+
 def _condition_for_nets(nets: Iterable[str]) -> Optional[str]:
     net_list = [net for net in sorted(set(nets)) if net]
     if not net_list:
         return None
-    return " || ".join(f"A.NetName == '{net}'" for net in net_list)
+    return " || ".join(f"A.NetName == '{_escape_rule_string_literal(net)}'" for net in net_list)
 
 
 def _clearance_condition_for_nets(
@@ -349,12 +368,9 @@ def _clearance_condition_for_nets(
     excluded = {net for net in (exclude_nets or []) if net}
     clauses: List[str] = []
     for net in sources:
-        parts = [f"A.NetName == '{net}'"]
+        parts = [f"A.NetName == '{_escape_rule_string_literal(net)}'"]
         for other in sorted(excluded):
-            if other == net:
-                parts.append(f"B.NetName != '{other}'")
-            else:
-                parts.append(f"B.NetName != '{other}'")
+            parts.append(f"B.NetName != '{_escape_rule_string_literal(other)}'")
         clauses.append("(" + " && ".join(parts) + ")")
     return " || ".join(clauses)
 
@@ -362,6 +378,7 @@ def _clearance_condition_for_nets(
 # ---------------------------------------------------------------------------
 #  IPC-2221 current capacity calculation
 # ---------------------------------------------------------------------------
+
 
 def ipc2221_trace_width_mm(
     current_a: float,
@@ -382,7 +399,7 @@ def ipc2221_trace_width_mm(
         return 0.0
     k = 0.048 if is_external else 0.024
     # Solve for A (mil^2): A = (I / (k * dT^0.44))^(1/0.725)
-    area_mil2 = (current_a / (k * (temp_rise_c ** 0.44))) ** (1.0 / 0.725)
+    area_mil2 = (current_a / (k * (temp_rise_c**0.44))) ** (1.0 / 0.725)
     thickness_mil = copper_oz * 1.378  # 1 oz = 1.378 mil (35 um)
     width_mil = area_mil2 / thickness_mil
     width_mm = width_mil * 0.0254
@@ -441,9 +458,7 @@ def compute_weighted_qor_score(
     skew = float(metrics.get("maxDiffSkewMm", 0))
     skew_limit = 0.25  # default
     if constraints:
-        skew_limit = float(
-            constraints.get("defaults", {}).get("hs_diff_skew_mm", 0.25)
-        )
+        skew_limit = float(constraints.get("defaults", {}).get("hs_diff_skew_mm", 0.25))
     diff_skew_ratio = skew / max(skew_limit, 0.01)
     matched_group_skew_ratio = float(metrics.get("maxMatchedGroupSkewRatio", 0.0))
     worst_skew_ratio = max(diff_skew_ratio, matched_group_skew_ratio)
@@ -453,9 +468,7 @@ def compute_weighted_qor_score(
     uncoupled = float(metrics.get("maxUncoupledMm", 0))
     uncoupled_limit = 3.0
     if constraints:
-        uncoupled_limit = float(
-            constraints.get("defaults", {}).get("hs_diff_uncoupled_mm", 3.0)
-        )
+        uncoupled_limit = float(constraints.get("defaults", {}).get("hs_diff_uncoupled_mm", 3.0))
     uncoupled_ratio = uncoupled / max(uncoupled_limit, 0.01)
     sub["uncoupled"] = max(0.0, 1.0 - max(0.0, uncoupled_ratio - 1.0))
 
@@ -479,11 +492,9 @@ def compute_weighted_qor_score(
         "subScores": {k: round(v, 4) for k, v in sub.items()},
         "weights": {k: w.get(k, 0) for k in sub},
         "grade": (
-            "A" if score >= 0.85 else
-            "B" if score >= 0.70 else
-            "C" if score >= 0.50 else
-            "D" if score >= 0.30 else
-            "F"
+            "A"
+            if score >= 0.85
+            else "B" if score >= 0.70 else "C" if score >= 0.50 else "D" if score >= 0.30 else "F"
         ),
     }
 
@@ -502,8 +513,12 @@ def compile_kicad_dru(constraints: Dict[str, Any]) -> str:
         if not condition:
             continue
 
-        lines.append(f'(rule "{rule["name"]}"')
-        lines.append(f'  (condition "{condition}")')
+        rule_name = escape_sexpr_string(str(rule["name"]))
+        if "\r" in str(condition) or "\n" in str(condition):
+            raise ValueError("KiCad rule conditions must be single-line strings")
+        serialized_condition = escape_sexpr_string(str(condition))
+        lines.append(f'(rule "{rule_name}"')
+        lines.append(f'  (condition "{serialized_condition}")')
 
         constraint = rule["constraint"]
         if constraint == "diff_pair_gap":
@@ -627,39 +642,54 @@ class AutorouteCFHACommands:
     def set_ipc_board_api(self, ipc_board_api: Any) -> None:
         self.ipc_board_api = ipc_board_api
 
-    def _ensure_board(self, params: Dict[str, Any]) -> Tuple[Optional[pcbnew.BOARD], Optional[Path], Optional[Dict[str, Any]]]:
+    def _ensure_board(
+        self, params: Dict[str, Any]
+    ) -> Tuple[Optional[pcbnew.BOARD], Optional[Path], Optional[Dict[str, Any]]]:
         if self.board:
             board_path = self.board.GetFileName()
             if board_path:
-                if not params.get("boardPath") or Path(params["boardPath"]).resolve() == Path(
-                    board_path
-                ).resolve():
+                if (
+                    not params.get("boardPath")
+                    or Path(params["boardPath"]).resolve() == Path(board_path).resolve()
+                ):
                     return self.board, Path(board_path), None
 
         board_path_param = params.get("boardPath")
         if not board_path_param:
-            return None, None, {
-                "success": False,
-                "message": "No board is loaded",
-                "errorDetails": "Open a board first or provide boardPath",
-            }
+            return (
+                None,
+                None,
+                {
+                    "success": False,
+                    "message": "No board is loaded",
+                    "errorDetails": "Open a board first or provide boardPath",
+                },
+            )
 
         board_path = Path(board_path_param).expanduser().resolve()
         if not board_path.is_file():
-            return None, None, {
-                "success": False,
-                "message": "Board file not found",
-                "errorDetails": str(board_path),
-            }
+            return (
+                None,
+                None,
+                {
+                    "success": False,
+                    "message": "Board file not found",
+                    "errorDetails": str(board_path),
+                },
+            )
 
         try:
             board = pcbnew.LoadBoard(str(board_path))
         except Exception as exc:
-            return None, board_path, {
-                "success": False,
-                "message": "Failed to load board",
-                "errorDetails": str(exc),
-            }
+            return (
+                None,
+                board_path,
+                {
+                    "success": False,
+                    "message": "Failed to load board",
+                    "errorDetails": str(exc),
+                },
+            )
 
         self.set_board(board)
         return board, board_path, None
@@ -667,8 +697,10 @@ class AutorouteCFHACommands:
     def _detect_backends(self, params: Dict[str, Any]) -> BackendAvailability:
         ipc_available = self.ipc_board_api is not None
         external_orthoroute = params.get("orthorouteExecutable") or os.environ.get("ORTHOROUTE_BIN")
-        if external_orthoroute and not shutil.which(external_orthoroute) and not os.path.isfile(
+        if (
             external_orthoroute
+            and not shutil.which(external_orthoroute)
+            and not os.path.isfile(external_orthoroute)
         ):
             external_orthoroute = None
 
@@ -786,7 +818,9 @@ class AutorouteCFHACommands:
                             if total_area > 0:
                                 edge_bias = (right_area - left_area) / total_area
                             else:
-                                edge_bias = ((left + right) / 2.0 - center_x) / max(board_right - board_left, 1e-6)
+                                edge_bias = ((left + right) / 2.0 - center_x) / max(
+                                    board_right - board_left, 1e-6
+                                )
                             zone_data["leftArea"] = round(left_area, 4)
                             zone_data["rightArea"] = round(right_area, 4)
                             zone_data["edgeBias"] = round(edge_bias, 4)
@@ -815,9 +849,14 @@ class AutorouteCFHACommands:
     def _track_edge_pressure_by_layer(self, board: pcbnew.BOARD) -> Dict[str, Dict[str, float]]:
         profile: Dict[str, Dict[str, float]] = {}
         bounds = self._board_bounds_mm(board)
-        left_edge = bounds[0] if bounds else None
-        right_edge = bounds[2] if bounds else None
-        width = max((right_edge - left_edge), 1e-6) if bounds else None
+        if bounds:
+            left_edge = bounds[0]
+            right_edge = bounds[2]
+            width: Optional[float] = max(right_edge - left_edge, 1e-6)
+        else:
+            left_edge = None
+            right_edge = None
+            width = None
 
         for item in board.GetTracks():
             try:
@@ -836,7 +875,12 @@ class AutorouteCFHACommands:
                 continue
 
             bucket = "center"
-            if bounds is not None and left_edge is not None and right_edge is not None and width is not None:
+            if (
+                bounds is not None
+                and left_edge is not None
+                and right_edge is not None
+                and width is not None
+            ):
                 midpoint_x: Optional[float] = None
                 try:
                     start = item.GetStart()
@@ -905,9 +949,7 @@ class AutorouteCFHACommands:
             return None
 
         occupied_ground_layers = {
-            zone.get("layer")
-            for zone in zones
-            if _best_intent(zone.get("net", "")) == "GROUND"
+            zone.get("layer") for zone in zones if _best_intent(zone.get("net", "")) == "GROUND"
         }
         internal_layers = [
             layer
@@ -945,7 +987,9 @@ class AutorouteCFHACommands:
         if not copper_layers:
             return None, []
 
-        candidate_layers = [layer for layer in copper_layers if layer != reference_layer] or list(copper_layers)
+        candidate_layers = [layer for layer in copper_layers if layer != reference_layer] or list(
+            copper_layers
+        )
         candidates: List[Dict[str, Any]] = []
         split_risk_set = {str(layer) for layer in split_risk_layers}
 
@@ -963,9 +1007,13 @@ class AutorouteCFHACommands:
 
             total_pressure = float(track_pressure_by_layer.get(layer, 0.0) or 0.0)
             layer_edge_profile = edge_pressure_by_layer.get(layer, {})
-            edge_bucket = preferred_entry_edge if preferred_entry_edge in {"left", "right"} else "center"
+            edge_bucket = (
+                preferred_entry_edge if preferred_entry_edge in {"left", "right"} else "center"
+            )
             edge_pressure = float(layer_edge_profile.get(edge_bucket, total_pressure) or 0.0)
-            weighted_edge_pressure = edge_pressure * (1.0 + max(0.0, float(reference_continuity_score or 0.0)))
+            weighted_edge_pressure = edge_pressure * (
+                1.0 + max(0.0, float(reference_continuity_score or 0.0))
+            )
             if reference_layer and str(reference_layer).startswith("In"):
                 outer_bias_rank = 0 if layer == "F.Cu" else (1 if layer == "B.Cu" else 2)
             else:
@@ -997,11 +1045,7 @@ class AutorouteCFHACommands:
 
     @staticmethod
     def _inventory_pad_refs(info: Dict[str, Any]) -> List[str]:
-        refs = {
-            str(ref)
-            for ref in info.get("pad_refs", []) or []
-            if ref
-        }
+        refs = {str(ref) for ref in info.get("pad_refs", []) or [] if ref}
         for pad in info.get("pads", []) or []:
             ref = pad.get("ref")
             if ref:
@@ -1046,7 +1090,9 @@ class AutorouteCFHACommands:
     ) -> Optional[float]:
         if not points or target is None:
             return None
-        return sum(math.hypot(point[0] - target[0], point[1] - target[1]) for point in points) / len(points)
+        return sum(
+            math.hypot(point[0] - target[0], point[1] - target[1]) for point in points
+        ) / len(points)
 
     def _select_reference_ground_net(
         self,
@@ -1057,11 +1103,7 @@ class AutorouteCFHACommands:
         inventory: Dict[str, Any],
     ) -> Tuple[Optional[str], Dict[str, Any]]:
         candidate_names = list(dict.fromkeys(str(name) for name in ground_candidates if name))
-        sensitive_names = {
-            str(name)
-            for name in sensitive_nets
-            if name and str(name) in inventory
-        }
+        sensitive_names = {str(name) for name in sensitive_nets if name and str(name) in inventory}
         sensitive_refs = set()
         sensitive_points: List[PointMm] = []
         for net_name in sensitive_names:
@@ -1103,11 +1145,7 @@ class AutorouteCFHACommands:
                     "sharedRefs": shared_refs,
                     "avgDistanceMm": round(avg_distance, 4) if avg_distance is not None else None,
                     "existingZoneLayers": sorted(
-                        {
-                            zone.get("layer")
-                            for zone in info.get("zones", [])
-                            if zone.get("layer")
-                        }
+                        {zone.get("layer") for zone in info.get("zones", []) if zone.get("layer")}
                     ),
                 }
             )
@@ -1181,9 +1219,7 @@ class AutorouteCFHACommands:
             total_weight = sum(weight for _, weight in zone_biases) or 1.0
             avg_bias = sum(bias * weight for bias, weight in zone_biases) / total_weight
             ground_centroid_x = (
-                sum(zone_centroids) / len(zone_centroids)
-                if zone_centroids
-                else None
+                sum(zone_centroids) / len(zone_centroids) if zone_centroids else None
             )
             return {
                 "preferredEntryEdge": self._preferred_edge_from_bias(avg_bias),
@@ -1191,7 +1227,9 @@ class AutorouteCFHACommands:
                 "referenceContinuityScore": round(min(1.0, abs(avg_bias)), 4),
                 "topologyCueSource": "zone_affinity",
                 "sensitiveCentroidXmm": None,
-                "groundCentroidXmm": round(ground_centroid_x, 4) if ground_centroid_x is not None else None,
+                "groundCentroidXmm": (
+                    round(ground_centroid_x, 4) if ground_centroid_x is not None else None
+                ),
             }
 
         sensitive_refs = list(ground_selection.get("sensitiveRefs", []) or [])
@@ -1223,7 +1261,9 @@ class AutorouteCFHACommands:
                 "entryEdgeBias": 0.0,
                 "referenceContinuityScore": 0.0,
                 "topologyCueSource": "none",
-                "sensitiveCentroidXmm": round(sensitive_centroid[0], 4) if sensitive_centroid else None,
+                "sensitiveCentroidXmm": (
+                    round(sensitive_centroid[0], 4) if sensitive_centroid else None
+                ),
                 "groundCentroidXmm": round(ground_centroid[0], 4) if ground_centroid else None,
             }
 
@@ -1323,11 +1363,7 @@ class AutorouteCFHACommands:
                 ),
             )
         elif copper_layers:
-            internal_layers = [
-                layer
-                for layer in copper_layers
-                if layer not in {"F.Cu", "B.Cu"}
-            ]
+            internal_layers = [layer for layer in copper_layers if layer not in {"F.Cu", "B.Cu"}]
             if internal_layers:
                 preferred_zone_layer = min(
                     internal_layers,
@@ -1337,7 +1373,9 @@ class AutorouteCFHACommands:
                     ),
                 )
             else:
-                outer_candidates = [layer for layer in copper_layers if layer in {"F.Cu", "B.Cu"}] or copper_layers
+                outer_candidates = [
+                    layer for layer in copper_layers if layer in {"F.Cu", "B.Cu"}
+                ] or copper_layers
                 preferred_zone_layer = min(
                     outer_candidates,
                     key=lambda layer: (
@@ -1353,14 +1391,18 @@ class AutorouteCFHACommands:
             sensitive_nets=hs_nets,
             inventory=inventory,
         )
-        preferred_signal_layer, signal_layer_candidates = self._preferred_signal_layer_for_reference(
-            copper_layers=copper_layers,
-            reference_layer=preferred_zone_layer,
-            split_risk_layers=split_risk_layers,
-            track_pressure_by_layer=dict(analysis_summary.get("trackPressureByLayer", {}) or {}),
-            edge_pressure_by_layer=dict(analysis_summary.get("edgePressureByLayer", {}) or {}),
-            preferred_entry_edge=topology_cue["preferredEntryEdge"],
-            reference_continuity_score=float(topology_cue["referenceContinuityScore"] or 0.0),
+        preferred_signal_layer, signal_layer_candidates = (
+            self._preferred_signal_layer_for_reference(
+                copper_layers=copper_layers,
+                reference_layer=preferred_zone_layer,
+                split_risk_layers=split_risk_layers,
+                track_pressure_by_layer=dict(
+                    analysis_summary.get("trackPressureByLayer", {}) or {}
+                ),
+                edge_pressure_by_layer=dict(analysis_summary.get("edgePressureByLayer", {}) or {}),
+                preferred_entry_edge=topology_cue["preferredEntryEdge"],
+                reference_continuity_score=float(topology_cue["referenceContinuityScore"] or 0.0),
+            )
         )
         should_auto_create = bool(hs_nets and ground_net and not existing_ground_zone_layers)
 
@@ -1532,7 +1574,8 @@ class AutorouteCFHACommands:
             sensitive_nets = [
                 net_name
                 for net_name in inventory
-                if _best_intent(net_name) in {"HS_SINGLE", "RF"} or _diff_partner_name(net_name) in inventory
+                if _best_intent(net_name) in {"HS_SINGLE", "RF"}
+                or _diff_partner_name(net_name) in inventory
             ]
         if not sensitive_nets:
             return {
@@ -1542,6 +1585,7 @@ class AutorouteCFHACommands:
             }
 
         explicit_net = params.get("referenceZoneNet") or reference_planning.get("groundNet")
+        ground_net: Optional[str]
         if explicit_net:
             ground_net = str(explicit_net)
             if ground_net not in inventory:
@@ -1568,10 +1612,16 @@ class AutorouteCFHACommands:
                 intents=constraints_data.get("intents", []),
                 inventory=inventory,
             )
+            if not ground_net:
+                return {
+                    "success": True,
+                    "created": False,
+                    "message": "No usable ground net is present on the board",
+                }
 
         selected_ground_zone_layers = sorted(
             {
-                zone.get("layer")
+                str(zone["layer"])
                 for zone in zones
                 if zone.get("net") == ground_net and zone.get("layer")
             }
@@ -1675,13 +1725,17 @@ class AutorouteCFHACommands:
             critical_layer_source = "referencePlanning"
         if not critical_layer:
             copper_layers = self._board_layers(board)
-            critical_layer = "F.Cu" if "F.Cu" in copper_layers else (copper_layers[0] if copper_layers else None)
+            critical_layer = (
+                "F.Cu" if "F.Cu" in copper_layers else (copper_layers[0] if copper_layers else None)
+            )
             critical_layer_source = "default"
 
         stage_params = dict(params)
         if reference_planning.get("groundNet") and not stage_params.get("referenceZoneNet"):
             stage_params["referenceZoneNet"] = reference_planning["groundNet"]
-        if reference_planning.get("preferredZoneLayer") and not stage_params.get("referenceZoneLayer"):
+        if reference_planning.get("preferredZoneLayer") and not stage_params.get(
+            "referenceZoneLayer"
+        ):
             stage_params["referenceZoneLayer"] = reference_planning["preferredZoneLayer"]
 
         if reference_planning.get("shouldAutoCreate"):
@@ -1694,7 +1748,9 @@ class AutorouteCFHACommands:
             if not reference_zone_result.get("success"):
                 return {
                     "success": False,
-                    "message": reference_zone_result.get("message", "Pre-route reference planning failed"),
+                    "message": reference_zone_result.get(
+                        "message", "Pre-route reference planning failed"
+                    ),
                     "referencePlanning": reference_planning,
                     "referenceZone": reference_zone_result,
                     "criticalLayer": critical_layer,
@@ -1725,7 +1781,7 @@ class AutorouteCFHACommands:
         }
 
     def _refill_zones(self, board: pcbnew.BOARD, board_path: Path) -> Dict[str, Any]:
-        """Refill zones using the best available backend, with a subprocess fallback."""
+        """Refill zones in memory; the interface performs the guarded save."""
         if self.routing_commands is not None and hasattr(self.routing_commands, "refill_zones"):
             try:
                 return self.routing_commands.refill_zones({})
@@ -1744,41 +1800,18 @@ class AutorouteCFHACommands:
                 logger.debug("IPC zone refill failed", exc_info=True)
 
         try:
-            board.Save(str(board_path))
-        except Exception:
-            logger.debug("Board save before zone refill fallback failed", exc_info=True)
-
-        script = (
-            "import pcbnew\n"
-            f"board = pcbnew.LoadBoard({str(board_path)!r})\n"
-            "filler = pcbnew.ZONE_FILLER(board)\n"
-            "filler.Fill(board.Zones())\n"
-            f"board.Save({str(board_path)!r})\n"
-            "print('ok')\n"
-        )
-        try:
-            proc = subprocess.run(
-                [sys.executable, "-c", script],
-                capture_output=True,
-                text=True,
-                timeout=60,
-            )
-        except subprocess.TimeoutExpired:
-            return {
-                "success": False,
-                "message": "Zone refill timed out in fallback subprocess",
-            }
-
-        if proc.returncode == 0 and "ok" in (proc.stdout or ""):
+            filler = pcbnew.ZONE_FILLER(board)
+            filler.Fill(board.Zones())
             return {
                 "success": True,
-                "message": "Zones refilled via subprocess fallback",
+                "message": "Zones refilled via SWIG backend",
             }
-        return {
-            "success": False,
-            "message": "Zone refill failed",
-            "errorDetails": (proc.stderr or proc.stdout or "").strip()[:400],
-        }
+        except Exception as exc:
+            return {
+                "success": False,
+                "message": "Zone refill failed",
+                "errorDetails": str(exc),
+            }
 
     @staticmethod
     def _parse_unconnected_item_blocks(report_text: str) -> List[Dict[str, Any]]:
@@ -1831,7 +1864,9 @@ class AutorouteCFHACommands:
         return blocks
 
     @staticmethod
-    def _point_near_existing(point: PointMm, candidates: Sequence[PointMm], tolerance_mm: float = 0.3) -> bool:
+    def _point_near_existing(
+        point: PointMm, candidates: Sequence[PointMm], tolerance_mm: float = 0.3
+    ) -> bool:
         return any(_distance_mm(point, candidate) <= tolerance_mm for candidate in candidates)
 
     @staticmethod
@@ -2191,7 +2226,7 @@ class AutorouteCFHACommands:
                 if self._segments_hit_obstacles(path, obstacles):
                     continue
 
-                candidate = {
+                candidate: Dict[str, Any] = {
                     "path": list(reversed(path)) if reversed_path else path,
                     "addedLengthMm": round(_path_length_mm(path) - segment_length, 6),
                     "bumpCount": bump_count,
@@ -2236,7 +2271,7 @@ class AutorouteCFHACommands:
 
             width_mm = float(preferred_width_mm or segment["width_mm"] or 0.25)
             original_item = segment["item"]
-            board.Remove(original_item)
+            delete_board_item(board, original_item)
             route_result = self.routing_commands.route_trace(
                 {
                     "start": {"x": plan["path"][0][0], "y": plan["path"][0][1], "unit": "mm"},
@@ -2245,8 +2280,7 @@ class AutorouteCFHACommands:
                     "width": width_mm,
                     "net": net_name,
                     "waypoints": [
-                        {"x": point[0], "y": point[1], "unit": "mm"}
-                        for point in plan["path"][1:-1]
+                        {"x": point[0], "y": point[1], "unit": "mm"} for point in plan["path"][1:-1]
                     ],
                 }
             )
@@ -2305,7 +2339,9 @@ class AutorouteCFHACommands:
         for group in matched_groups:
             group_type = str(group.get("type", "bus"))
             nets = list(dict.fromkeys(group.get("nets", []) or []))
-            valid_nets = [net for net in nets if net in inventory and inventory[net].get("track_count", 0) > 0]
+            valid_nets = [
+                net for net in nets if net in inventory and inventory[net].get("track_count", 0) > 0
+            ]
             if len(valid_nets) < 2:
                 skipped.append({"group": nets, "reason": "insufficient_routed_nets"})
                 continue
@@ -2313,7 +2349,9 @@ class AutorouteCFHACommands:
                 skipped.append({"group": valid_nets, "reason": "group_too_large"})
                 continue
             if group_type == "diff_pair":
-                skipped.append({"group": valid_nets, "reason": "diff_pair_groups_reserved_for_future_tuning"})
+                skipped.append(
+                    {"group": valid_nets, "reason": "diff_pair_groups_reserved_for_future_tuning"}
+                )
                 continue
 
             raw_max_skew = group.get("maxSkewMm")
@@ -2377,11 +2415,6 @@ class AutorouteCFHACommands:
         except Exception:
             logger.debug("BuildConnectivity failed during matched-length tuning", exc_info=True)
 
-        try:
-            board.Save(str(board_path))
-        except Exception:
-            logger.debug("Board save after matched-length tuning failed", exc_info=True)
-
         return {
             "success": True,
             "message": f"Matched-length tuning adjusted {len(tuned_nets)} net(s)",
@@ -2428,7 +2461,9 @@ class AutorouteCFHACommands:
 
             stem, index = signature
             if interface_prefixes:
-                if not any(stem == prefix or stem.startswith(prefix) for prefix in interface_prefixes):
+                if not any(
+                    stem == prefix or stem.startswith(prefix) for prefix in interface_prefixes
+                ):
                     continue
             else:
                 if intent.get("intent") != "HS_SINGLE" or len(stem) < 2:
@@ -2537,7 +2572,8 @@ class AutorouteCFHACommands:
                     continue
 
                 candidate_items = [
-                    item for item in issue.get("items", [])
+                    item
+                    for item in issue.get("items", [])
                     if item.get("kind") == "Track" and item.get("layer", "").endswith(".Cu")
                 ]
                 if not candidate_items:
@@ -2590,8 +2626,14 @@ class AutorouteCFHACommands:
                                 {
                                     "net": net_name,
                                     "layer": layer,
-                                    "start": {"x": round(start_point[0], 4), "y": round(start_point[1], 4)},
-                                    "end": {"x": round(end_point[0], 4), "y": round(end_point[1], 4)},
+                                    "start": {
+                                        "x": round(start_point[0], 4),
+                                        "y": round(start_point[1], 4),
+                                    },
+                                    "end": {
+                                        "x": round(end_point[0], 4),
+                                        "y": round(end_point[1], 4),
+                                    },
                                     "widthMm": round(width_mm, 4),
                                     "pass": pass_index + 1,
                                     "reason": "same_layer_unconnected_track_bridge",
@@ -2606,7 +2648,9 @@ class AutorouteCFHACommands:
                         break
 
                     item_layer = item["layer"]
-                    target_layer = next((layer for layer in zone_layers if layer != item_layer), None)
+                    target_layer = next(
+                        (layer for layer in zone_layers if layer != item_layer), None
+                    )
                     if not target_layer:
                         continue
 
@@ -2656,11 +2700,6 @@ class AutorouteCFHACommands:
             except Exception:
                 logger.debug("Zone refill failed during support-net healing", exc_info=True)
 
-            try:
-                board.Save(str(board_path))
-            except Exception:
-                logger.debug("Board save after support-net healing failed", exc_info=True)
-
         return {
             "success": True,
             "message": (
@@ -2693,13 +2732,15 @@ class AutorouteCFHACommands:
         zones = self._collect_zones(board)
         backends = self._detect_backends(params)
 
-        dense_refs = [fp.GetReference() for fp in board.GetFootprints() if fp.GetReference().startswith("J")]
+        dense_refs = [
+            fp.GetReference() for fp in board.GetFootprints() if fp.GetReference().startswith("J")
+        ]
+        zone_count_by_layer: Dict[str, int] = {}
+        for zone in zones:
+            layer = str(zone["layer"])
+            zone_count_by_layer[layer] = zone_count_by_layer.get(layer, 0) + 1
         split_risk_layers = sorted(
-            {
-                zone["layer"]
-                for zone in zones
-                if sum(1 for other in zones if other["layer"] == zone["layer"]) > 1
-            }
+            layer for layer, count in zone_count_by_layer.items() if count > 1
         )
         has_ground_plane = any(_best_intent(zone["net"]) == "GROUND" for zone in zones)
 
@@ -2734,8 +2775,7 @@ class AutorouteCFHACommands:
                 "hasGroundPlane": has_ground_plane,
                 "splitRiskLayers": split_risk_layers,
                 "trackPressureByLayer": {
-                    layer: round(value, 4)
-                    for layer, value in track_pressure_by_layer.items()
+                    layer: round(value, 4) for layer, value in track_pressure_by_layer.items()
                 },
                 "edgePressureByLayer": edge_pressure_by_layer,
                 "denseConnectorRefs": dense_refs,
@@ -2767,7 +2807,8 @@ class AutorouteCFHACommands:
             if (
                 net_name not in overrides
                 and diff_partner in inventory
-                and intent_name not in {"GROUND", "POWER_DC", "POWER_SWITCHING", "RF", "ANALOG_SENSITIVE"}
+                and intent_name
+                not in {"GROUND", "POWER_DC", "POWER_SWITCHING", "RF", "ANALOG_SENSITIVE"}
             ):
                 intent_name = "HS_DIFF"
             else:
@@ -2798,11 +2839,7 @@ class AutorouteCFHACommands:
             default_max_skew_mm=float(merged_defaults["hs_diff_skew_mm"]),
             params=params,
         )
-        auto_group_nets = {
-            net_name
-            for group in auto_groups
-            for net_name in group.get("nets", [])
-        }
+        auto_group_nets = {net_name for group in auto_groups for net_name in group.get("nets", [])}
         if auto_group_nets and any(interface in {"DDR4", "DDR5"} for interface in interfaces):
             for intent in intents:
                 if intent.net_name in auto_group_nets and intent.intent == "GENERIC":
@@ -2859,9 +2896,7 @@ class AutorouteCFHACommands:
                 continue
             anchor = str(item.get("anchor") or "").strip()
             members = [
-                str(value).strip()
-                for value in (item.get("members") or [])
-                if str(value).strip()
+                str(value).strip() for value in (item.get("members") or []) if str(value).strip()
             ]
             if anchor and anchor not in members:
                 members.insert(0, anchor)
@@ -3051,7 +3086,9 @@ class AutorouteCFHACommands:
                     "condition": rf_condition,
                     "constraint": "via_count",
                     "max": merged_defaults["rf_via_limit"],
-                    "metadata": {"reason": "RF nets should minimize discontinuities and reference-plane breaks"},
+                    "metadata": {
+                        "reason": "RF nets should minimize discontinuities and reference-plane breaks"
+                    },
                 }
             )
 
@@ -3125,14 +3162,13 @@ class AutorouteCFHACommands:
                         replace=False,
                     )
 
-        for group in (
-            intents_result.get("inferredMatchedLengthGroups")
-            or self._infer_auto_matched_length_groups(
-                intents,
-                interfaces=interfaces,
-                default_max_skew_mm=float(merged_defaults["hs_diff_skew_mm"]),
-                params=params,
-            )
+        for group in intents_result.get(
+            "inferredMatchedLengthGroups"
+        ) or self._infer_auto_matched_length_groups(
+            intents,
+            interfaces=interfaces,
+            default_max_skew_mm=float(merged_defaults["hs_diff_skew_mm"]),
+            params=params,
         ):
             _upsert_matched_group(group, replace=False)
 
@@ -3175,13 +3211,15 @@ class AutorouteCFHACommands:
                 exclude_nets=hs_all_nets + by_intent.get("GROUND", []),
             )
             if hs_condition:
-                compiled_rules.append({
-                    "name": "cfha_crosstalk_guard",
-                    "condition": hs_condition,
-                    "constraint": "clearance",
-                    "min": crosstalk_guard,
-                    "metadata": {"reason": "Crosstalk guard spacing (IPC-2141A)"},
-                })
+                compiled_rules.append(
+                    {
+                        "name": "cfha_crosstalk_guard",
+                        "condition": hs_condition,
+                        "constraint": "clearance",
+                        "min": crosstalk_guard,
+                        "metadata": {"reason": "Crosstalk guard spacing (IPC-2141A)"},
+                    }
+                )
 
         # --- Analog/RF isolation ---
         # Analog-sensitive and RF nets need extra clearance from digital signals.
@@ -3192,26 +3230,32 @@ class AutorouteCFHACommands:
             exclude_nets=by_intent.get("ANALOG_SENSITIVE", []) + by_intent.get("GROUND", []),
         )
         if analog_condition and analog_guard > 0:
-            compiled_rules.append({
-                "name": "cfha_analog_isolation",
-                "condition": analog_condition,
-                "constraint": "clearance",
-                "min": analog_guard,
-                "metadata": {"reason": "Analog isolation from noisy digital or switching nets"},
-            })
+            compiled_rules.append(
+                {
+                    "name": "cfha_analog_isolation",
+                    "condition": analog_condition,
+                    "constraint": "clearance",
+                    "min": analog_guard,
+                    "metadata": {"reason": "Analog isolation from noisy digital or switching nets"},
+                }
+            )
 
         rf_guard = float(merged_defaults.get("rf_guard_mm", analog_guard))
         if rf_condition and rf_guard > 0:
-            compiled_rules.append({
-                "name": "cfha_rf_clearance",
-                "condition": _clearance_condition_for_nets(
-                    by_intent.get("RF", []),
-                    exclude_nets=by_intent.get("RF", []) + by_intent.get("GROUND", []),
-                ),
-                "constraint": "clearance",
-                "min": rf_guard,
-                "metadata": {"reason": "RF keepout / guard corridor to limit coupling and impedance discontinuities"},
-            })
+            compiled_rules.append(
+                {
+                    "name": "cfha_rf_clearance",
+                    "condition": _clearance_condition_for_nets(
+                        by_intent.get("RF", []),
+                        exclude_nets=by_intent.get("RF", []) + by_intent.get("GROUND", []),
+                    ),
+                    "constraint": "clearance",
+                    "min": rf_guard,
+                    "metadata": {
+                        "reason": "RF keepout / guard corridor to limit coupling and impedance discontinuities"
+                    },
+                }
+            )
 
         # --- Power switching noise isolation ---
         # Switching power nets (LX, PHASE, BST) should be kept away from
@@ -3221,19 +3265,19 @@ class AutorouteCFHACommands:
             switching_condition = _clearance_condition_for_nets(
                 switching_nets,
                 exclude_nets=(
-                    switching_nets
-                    + by_intent.get("GROUND", [])
-                    + by_intent.get("POWER_DC", [])
+                    switching_nets + by_intent.get("GROUND", []) + by_intent.get("POWER_DC", [])
                 ),
             )
             if switching_condition:
-                compiled_rules.append({
-                    "name": "cfha_switching_isolation",
-                    "condition": switching_condition,
-                    "constraint": "clearance",
-                    "min": max(analog_guard, rf_guard, 1.5),
-                    "metadata": {"reason": "Switching noise isolation from sensitive nets"},
-                })
+                compiled_rules.append(
+                    {
+                        "name": "cfha_switching_isolation",
+                        "condition": switching_condition,
+                        "constraint": "clearance",
+                        "min": max(analog_guard, rf_guard, 1.5),
+                        "metadata": {"reason": "Switching noise isolation from sensitive nets"},
+                    }
+                )
 
         constraints = {
             "schemaVersion": 1,
@@ -3253,16 +3297,18 @@ class AutorouteCFHACommands:
             "derived": {
                 "powerTargetWidthMm": round(power_target_width_mm, 4),
                 "powerRuleMinWidthMm": round(power_rule_min_width_mm, 4),
-                "observedPowerMinWidthMm": round(min(observed_power_widths), 4)
-                if observed_power_widths
-                else None,
+                "observedPowerMinWidthMm": (
+                    round(min(observed_power_widths), 4) if observed_power_widths else None
+                ),
                 "ipc2221": {
                     "currentA": power_current_a,
                     "copperOz": copper_oz,
                     "tempRiseC": temp_rise_c,
-                    "calculatedWidthMm": round(
-                        ipc2221_trace_width_mm(power_current_a, temp_rise_c, copper_oz), 4
-                    ) if power_current_a > 0 else None,
+                    "calculatedWidthMm": (
+                        round(ipc2221_trace_width_mm(power_current_a, temp_rise_c, copper_oz), 4)
+                        if power_current_a > 0
+                        else None
+                    ),
                 },
             },
             "referencePlanning": reference_planning,
@@ -3336,7 +3382,16 @@ class AutorouteCFHACommands:
         rules_path = Path(params.get("outputPath", board_path.with_suffix(".kicad_dru")))
         rule_text = compile_kicad_dru(constraints)
         _safe_mkdir(rules_path)
-        rules_path.write_text(rule_text, encoding="utf-8")
+        rule_body = rule_text.removeprefix("(version 1)").strip()
+        persistence = persist_managed_rule_block(str(rules_path), rule_body)
+        if not persistence.get("persisted"):
+            return {
+                "success": False,
+                "message": "Could not update KiCad custom rule file",
+                "errorDetails": persistence.get("warning", "Unknown persistence failure"),
+                "boardPath": str(board_path),
+                "rulesPath": str(rules_path),
+            }
 
         return {
             "success": True,
@@ -3349,7 +3404,7 @@ class AutorouteCFHACommands:
     def _estimate_net_congestion(
         self,
         pads: List[Dict[str, Any]],
-        board: pcbnew.BOARD,
+        all_pad_centers: Sequence[PointMm],
     ) -> float:
         """Estimate routing congestion for a net based on pad density.
 
@@ -3364,15 +3419,11 @@ class AutorouteCFHACommands:
         radius_mm = 3.0
         total_nearby = 0
         pad_positions = [(float(p["x"]), float(p["y"])) for p in pads]
-        for fp in board.GetFootprints():
-            for pad in fp.Pads():
-                pos = pad.GetPosition()
-                px = pos.x / 1_000_000
-                py = pos.y / 1_000_000
-                for cx, cy in pad_positions:
-                    if math.hypot(px - cx, py - cy) < radius_mm:
-                        total_nearby += 1
-                        break
+        for px, py in all_pad_centers:
+            for cx, cy in pad_positions:
+                if math.hypot(px - cx, py - cy) < radius_mm:
+                    total_nearby += 1
+                    break
         return float(total_nearby)
 
     def _estimate_escape_complexity(
@@ -3459,9 +3510,7 @@ class AutorouteCFHACommands:
                 )
                 edge_distance = min(
                     edge_distance,
-                    min(
-                        min(float(pad["y"]) - top, bottom - float(pad["y"])) for pad in ref_pads
-                    ),
+                    min(min(float(pad["y"]) - top, bottom - float(pad["y"])) for pad in ref_pads),
                 )
                 if edge_distance <= 2.0:
                     score += 1.5
@@ -3489,11 +3538,13 @@ class AutorouteCFHACommands:
             return 0.0
 
         high_speed_nets = {
-            str(name)
-            for name in reference_planning.get("highSpeedNets", []) or []
-            if name
+            str(name) for name in reference_planning.get("highSpeedNets", []) or [] if name
         }
-        if high_speed_nets and net_name not in high_speed_nets and _diff_partner_name(net_name) not in high_speed_nets:
+        if (
+            high_speed_nets
+            and net_name not in high_speed_nets
+            and _diff_partner_name(net_name) not in high_speed_nets
+        ):
             return 0.0
 
         bounds = self._board_bounds_mm(board)
@@ -3666,13 +3717,15 @@ class AutorouteCFHACommands:
                 track_pressure_by_layer.get(
                     layer,
                     candidate.get("totalPressure", 0.0),
-                ) or 0.0
+                )
+                or 0.0
             )
             bucket_pressure = float(
                 layer_edge_profile.get(
                     bucket,
                     candidate.get("edgePressure", total_pressure),
-                ) or total_pressure
+                )
+                or total_pressure
             )
             corridor_pressure: Optional[float] = None
             corridor_pressure_penalty = 0.0
@@ -3682,21 +3735,17 @@ class AutorouteCFHACommands:
                     layer_edge_profile.get(
                         corridor_bucket,
                         candidate.get("edgePressure", total_pressure),
-                    ) or total_pressure
+                    )
+                    or total_pressure
                 )
                 over_budget_mm = (
-                    max(0.0, corridor_pressure - corridor_budget)
-                    if corridor_budget > 0.0
-                    else 0.0
+                    max(0.0, corridor_pressure - corridor_budget) if corridor_budget > 0.0 else 0.0
                 )
                 over_budget_ratio = (
-                    over_budget_mm / max(corridor_budget, 1.0)
-                    if corridor_budget > 0.0
-                    else 0.0
+                    over_budget_mm / max(corridor_budget, 1.0) if corridor_budget > 0.0 else 0.0
                 )
                 corridor_pressure_penalty = (
-                    corridor_pressure * (1.0 + corridor_priority / 100.0)
-                    + over_budget_ratio * 25.0
+                    corridor_pressure * (1.0 + corridor_priority / 100.0) + over_budget_ratio * 25.0
                 )
                 if corridor_budget > 0.0:
                     corridor_policy = "over_budget" if over_budget_mm > 0.0 else "within_budget"
@@ -3726,7 +3775,9 @@ class AutorouteCFHACommands:
                     estimated_via_count_per_net = float(estimated_via_count_total)
             if endpoint_layers:
                 mismatch_refs = sum(
-                    count for endpoint_layer, count in endpoint_layers.items() if endpoint_layer != layer
+                    count
+                    for endpoint_layer, count in endpoint_layers.items()
+                    if endpoint_layer != layer
                 )
                 if layer.startswith("In"):
                     via_transition_penalty = mismatch_refs * 12.0
@@ -3756,19 +3807,17 @@ class AutorouteCFHACommands:
                     "estimatedViaCountTotal": int(estimated_via_count_total),
                     "estimatedViaCountPerNet": round(estimated_via_count_per_net, 4),
                     "estimatedStitchViaCountTotal": int(estimated_stitch_via_count_total),
-                    "estimatedTransitionCellViaCountTotal": int(estimated_transition_cell_via_count_total),
+                    "estimatedTransitionCellViaCountTotal": int(
+                        estimated_transition_cell_via_count_total
+                    ),
                     "transitionRequired": bool(transition_required),
                     "placementCorridorId": corridor.get("id"),
                     "placementCorridorEdge": corridor_edge or None,
                     "placementCorridorPressure": (
-                        round(corridor_pressure, 4)
-                        if corridor_pressure is not None
-                        else None
+                        round(corridor_pressure, 4) if corridor_pressure is not None else None
                     ),
                     "placementCorridorBudget": (
-                        round(corridor_budget, 4)
-                        if corridor_budget > 0.0
-                        else None
+                        round(corridor_budget, 4) if corridor_budget > 0.0 else None
                     ),
                     "placementCorridorPenalty": round(corridor_pressure_penalty, 4),
                     "placementCorridorPolicy": corridor_policy,
@@ -3876,12 +3925,13 @@ class AutorouteCFHACommands:
                 selected = budget_safe_candidates[0] if budget_safe_candidates else candidates[0]
                 decision["layer"] = selected["layer"]
                 estimated_per_net = float(selected.get("estimatedViaCountPerNet", 0.0))
-                estimated_cell_total = float(selected.get("estimatedTransitionCellViaCountTotal", 0.0))
+                estimated_cell_total = float(
+                    selected.get("estimatedTransitionCellViaCountTotal", 0.0)
+                )
                 if via_limit is not None and estimated_per_net > float(via_limit):
                     transition_policy = "transitions_over_budget"
-                elif (
-                    transition_cell_via_limit is not None
-                    and estimated_cell_total > float(transition_cell_via_limit)
+                elif transition_cell_via_limit is not None and estimated_cell_total > float(
+                    transition_cell_via_limit
                 ):
                     transition_policy = "transition_cell_over_budget"
                 else:
@@ -3889,8 +3939,12 @@ class AutorouteCFHACommands:
             decision["viaBudget"] = via_limit
             decision["transitionCellViaBudget"] = transition_cell_via_limit
             decision["estimatedViaCountTotal"] = int(selected.get("estimatedViaCountTotal", 0))
-            decision["estimatedViaCountPerNet"] = round(float(selected.get("estimatedViaCountPerNet", 0.0)), 4)
-            decision["estimatedStitchViaCountTotal"] = int(selected.get("estimatedStitchViaCountTotal", 0))
+            decision["estimatedViaCountPerNet"] = round(
+                float(selected.get("estimatedViaCountPerNet", 0.0)), 4
+            )
+            decision["estimatedStitchViaCountTotal"] = int(
+                selected.get("estimatedStitchViaCountTotal", 0)
+            )
             decision["estimatedTransitionCellViaCountTotal"] = int(
                 selected.get("estimatedTransitionCellViaCountTotal", 0)
             )
@@ -3943,7 +3997,8 @@ class AutorouteCFHACommands:
                 net=net_name,
             )
             tree_paths = plan_steiner_tree(
-                terminals, obstacles,
+                terminals,
+                obstacles,
                 bend_penalty=max(width_mm * 2, 1.0),
                 pad_repulsion=1.0,
                 pad_centers=self._collect_all_pad_centers(),
@@ -3952,7 +4007,10 @@ class AutorouteCFHACommands:
                 segment_count = 0
                 for path in tree_paths:
                     res = applier.route_path(
-                        path, layer=layer, width_mm=width_mm, net_name=net_name,
+                        path,
+                        layer=layer,
+                        width_mm=width_mm,
+                        net_name=net_name,
                     )
                     if res.get("success"):
                         segment_count += 1
@@ -3990,15 +4048,17 @@ class AutorouteCFHACommands:
 
         routed_edges = 0
         for u, v in mst_edges:
-            result = self.routing_commands.route_pad_to_pad({
-                "fromRef": pads[u]["ref"],
-                "fromPad": pads[u]["pad"],
-                "toRef": pads[v]["ref"],
-                "toPad": pads[v]["pad"],
-                "layer": layer,
-                "width": width_mm,
-                "net": net_name,
-            })
+            result = self.routing_commands.route_pad_to_pad(
+                {
+                    "fromRef": pads[u]["ref"],
+                    "fromPad": pads[u]["pad"],
+                    "toRef": pads[v]["ref"],
+                    "toPad": pads[v]["pad"],
+                    "layer": layer,
+                    "width": width_mm,
+                    "net": net_name,
+                }
+            )
             if result.get("success"):
                 routed_edges += 1
 
@@ -4017,7 +4077,10 @@ class AutorouteCFHACommands:
         centers: List[PointMm] = []
         for fp in self.board.GetFootprints():
             for pad in fp.Pads():
-                pos = pad.GetPosition()
+                try:
+                    pos = pad.GetPosition()
+                except (AttributeError, TypeError):
+                    continue
                 centers.append((pos.x / 1_000_000, pos.y / 1_000_000))
         return centers
 
@@ -4026,7 +4089,10 @@ class AutorouteCFHACommands:
         if len(path_points) < 2:
             return False
         for start, end in zip(path_points, path_points[1:]):
-            if not (math.isclose(start[0], end[0], abs_tol=1e-6) or math.isclose(start[1], end[1], abs_tol=1e-6)):
+            if not (
+                math.isclose(start[0], end[0], abs_tol=1e-6)
+                or math.isclose(start[1], end[1], abs_tol=1e-6)
+            ):
                 return False
         return True
 
@@ -4085,8 +4151,7 @@ class AutorouteCFHACommands:
             )
 
         return all(
-            abs(separation - target_center_spacing) <= tolerance_mm
-            for separation in separations
+            abs(separation - target_center_spacing) <= tolerance_mm for separation in separations
         )
 
     def _route_diff_pair(
@@ -4127,10 +4192,15 @@ class AutorouteCFHACommands:
             (float(end_pos_pad["x"]), float(end_pos_pad["y"])),
             (float(end_neg_pad["x"]), float(end_neg_pad["y"])),
         )
-        target_gap = float(constraints.get("defaults", {}).get("hs_diff_gap_mm", {}).get("opt", 0.2))
+        target_gap = float(
+            constraints.get("defaults", {}).get("hs_diff_gap_mm", {}).get("opt", 0.2)
+        )
         target_center_spacing = round(width_mm + target_gap, 4)
         tolerance = max(0.12, width_mm * 0.75)
-        if abs(start_sep - target_center_spacing) > tolerance or abs(end_sep - target_center_spacing) > tolerance:
+        if (
+            abs(start_sep - target_center_spacing) > tolerance
+            or abs(end_sep - target_center_spacing) > tolerance
+        ):
             return {
                 "success": False,
                 "message": "Endpoint pad pitch does not match coupled diff-pair pitch",
@@ -4148,7 +4218,9 @@ class AutorouteCFHACommands:
         end_layer = layer
         if board is not None:
             try:
-                start_layer = str(board.GetLayerName(footprints[start_site["ref"]].GetLayer()) or layer)
+                start_layer = str(
+                    board.GetLayerName(footprints[start_site["ref"]].GetLayer()) or layer
+                )
             except Exception:
                 start_layer = layer
             try:
@@ -4312,12 +4384,43 @@ class AutorouteCFHACommands:
                 ),
                 "placementCorridorPolicy": intent.get("_placement_corridor_policy"),
             }
+
+        def _diff_pair_route_records(
+            intent: Dict[str, Any],
+            width_mm: float,
+            route_layer: str,
+            *,
+            reroute_pass: Optional[int] = None,
+        ) -> List[Dict[str, Any]]:
+            def record(net_name: str, pair_name: str) -> Dict[str, Any]:
+                route_record = {
+                    "net": net_name,
+                    "intent": intent["intent"],
+                    "widthMm": width_mm,
+                    "layer": route_layer,
+                    "layerSource": intent.get("_route_layer_source"),
+                    **_placement_corridor_fields(intent),
+                    "backend": "diff_pair",
+                    "pairWith": pair_name,
+                    "estimatedViaCountPerNet": intent.get("_estimated_via_count_per_net"),
+                    "estimatedStitchViaCountTotal": intent.get("_estimated_stitch_via_count_total"),
+                    "estimatedTransitionCellViaCountTotal": intent.get(
+                        "_estimated_transition_cell_via_count_total"
+                    ),
+                    "transitionCellViaBudget": intent.get("_transition_cell_via_budget"),
+                    "transitionPolicy": intent.get("_transition_policy"),
+                }
+                if reroute_pass is not None:
+                    route_record["reroutePass"] = reroute_pass
+                return route_record
+
+            return [
+                record(intent["net_name"], intent["diff_partner"]),
+                record(intent["diff_partner"], intent["net_name"]),
+            ]
+
         forced_layer = params.get("criticalLayer")
-        critical_layer = (
-            forced_layer
-            or reference_planning.get("preferredSignalLayer")
-            or "F.Cu"
-        )
+        critical_layer = forced_layer or reference_planning.get("preferredSignalLayer") or "F.Cu"
         applier = HybridRouteApplier(self.routing_commands, self.ipc_board_api)
         inventory = self._collect_inventory(board)
         footprints = {fp.GetReference(): fp for fp in board.GetFootprints()}
@@ -4329,19 +4432,20 @@ class AutorouteCFHACommands:
         # --- Congestion-aware net ordering ---
         # Within each priority level, route congested nets first
         critical_intents = [
-            intent for intent in constraints["intents"]
+            intent
+            for intent in constraints["intents"]
             if intent["intent"] in critical_classes and intent["track_length_mm"] <= 0
         ]
         critical_intents_by_name = {
-            str(intent.get("net_name") or ""): intent
-            for intent in critical_intents
+            str(intent.get("net_name") or ""): intent for intent in critical_intents
         }
+        all_pad_centers = self._collect_all_pad_centers()
         pair_layer_decisions: Dict[Tuple[str, str], Dict[str, Any]] = {}
         for intent in critical_intents:
             net_info = inventory.get(intent["net_name"], {})
             pads = net_info.get("pads", [])
             placement_corridor = _placement_corridor_for_intent(intent, net_info)
-            intent["_congestion"] = self._estimate_net_congestion(pads, board)
+            intent["_congestion"] = self._estimate_net_congestion(pads, all_pad_centers)
             intent["_escape_complexity"] = self._estimate_escape_complexity(
                 intent["net_name"], pads, footprints
             )
@@ -4356,10 +4460,14 @@ class AutorouteCFHACommands:
                 pair_key = tuple(sorted((intent["net_name"], intent["diff_partner"])))
                 layer_decision = pair_layer_decisions.get(pair_key, {})
                 if not layer_decision:
-                    transition_cell_limit_raw = constraints.get("defaults", {}).get("hs_transition_cell_via_limit")
+                    transition_cell_limit_raw = constraints.get("defaults", {}).get(
+                        "hs_transition_cell_via_limit"
+                    )
                     layer_decision = self._select_locked_diff_pair_route_layer(
                         intent=intent,
-                        partner_intent=critical_intents_by_name.get(str(intent["diff_partner"] or "")),
+                        partner_intent=critical_intents_by_name.get(
+                            str(intent["diff_partner"] or "")
+                        ),
                         inventory=inventory,
                         board=board,
                         reference_planning=reference_planning,
@@ -4394,7 +4502,9 @@ class AutorouteCFHACommands:
             intent["_route_layer_centroid_x_mm"] = layer_decision.get("centroidXmm")
             intent["_estimated_via_count_total"] = layer_decision.get("estimatedViaCountTotal")
             intent["_estimated_via_count_per_net"] = layer_decision.get("estimatedViaCountPerNet")
-            intent["_estimated_stitch_via_count_total"] = layer_decision.get("estimatedStitchViaCountTotal")
+            intent["_estimated_stitch_via_count_total"] = layer_decision.get(
+                "estimatedStitchViaCountTotal"
+            )
             intent["_estimated_transition_cell_via_count_total"] = layer_decision.get(
                 "estimatedTransitionCellViaCountTotal"
             )
@@ -4465,11 +4575,13 @@ class AutorouteCFHACommands:
         # Mark already-routed nets
         for intent in constraints["intents"]:
             if intent["intent"] in critical_classes and intent["track_length_mm"] > 0:
-                skipped.append({
-                    "net": intent["net_name"],
-                    "reason": "already_routed",
-                    "intent": intent["intent"],
-                })
+                skipped.append(
+                    {
+                        "net": intent["net_name"],
+                        "reason": "already_routed",
+                        "intent": intent["intent"],
+                    }
+                )
 
         # --- Main routing pass ---
         for intent in critical_intents:
@@ -4482,12 +4594,14 @@ class AutorouteCFHACommands:
                     continue
 
             if len(pads) < 2:
-                skipped.append({
-                    "net": intent["net_name"],
-                    "reason": "insufficient_pads",
-                    "padCount": len(pads),
-                    "intent": intent["intent"],
-                })
+                skipped.append(
+                    {
+                        "net": intent["net_name"],
+                        "reason": "insufficient_pads",
+                        "padCount": len(pads),
+                        "intent": intent["intent"],
+                    }
+                )
                 continue
 
             width_mm = float(params.get("criticalWidthMm") or 0.25)
@@ -4513,40 +4627,7 @@ class AutorouteCFHACommands:
                 )
                 if pair_result.get("success"):
                     handled_diff_pairs.add(pair_key)
-                    routed.append({
-                        "net": intent["net_name"],
-                        "intent": intent["intent"],
-                        "widthMm": width_mm,
-                        "layer": route_layer,
-                        "layerSource": intent.get("_route_layer_source"),
-                        **_placement_corridor_fields(intent),
-                        "backend": "diff_pair",
-                        "pairWith": intent["diff_partner"],
-                        "estimatedViaCountPerNet": intent.get("_estimated_via_count_per_net"),
-                        "estimatedStitchViaCountTotal": intent.get("_estimated_stitch_via_count_total"),
-                        "estimatedTransitionCellViaCountTotal": intent.get(
-                            "_estimated_transition_cell_via_count_total"
-                        ),
-                        "transitionCellViaBudget": intent.get("_transition_cell_via_budget"),
-                        "transitionPolicy": intent.get("_transition_policy"),
-                    })
-                    routed.append({
-                        "net": intent["diff_partner"],
-                        "intent": intent["intent"],
-                        "widthMm": width_mm,
-                        "layer": route_layer,
-                        "layerSource": intent.get("_route_layer_source"),
-                        **_placement_corridor_fields(intent),
-                        "backend": "diff_pair",
-                        "pairWith": intent["net_name"],
-                        "estimatedViaCountPerNet": intent.get("_estimated_via_count_per_net"),
-                        "estimatedStitchViaCountTotal": intent.get("_estimated_stitch_via_count_total"),
-                        "estimatedTransitionCellViaCountTotal": intent.get(
-                            "_estimated_transition_cell_via_count_total"
-                        ),
-                        "transitionCellViaBudget": intent.get("_transition_cell_via_budget"),
-                        "transitionPolicy": intent.get("_transition_policy"),
-                    })
+                    routed.extend(_diff_pair_route_records(intent, width_mm, route_layer))
                     continue
                 failed_for_retry.append(intent)
                 handled_diff_pairs.add(pair_key)
@@ -4555,32 +4636,42 @@ class AutorouteCFHACommands:
             # Multi-pin net routing (>2 pads)
             if len(pads) > 2:
                 result = self._route_multi_pin_net(
-                    pads, route_layer, width_mm, intent["net_name"], footprints, applier,
+                    pads,
+                    route_layer,
+                    width_mm,
+                    intent["net_name"],
+                    footprints,
+                    applier,
                 )
                 if result.get("success"):
-                    routed.append({
-                        "net": intent["net_name"],
-                        "intent": intent["intent"],
-                        "widthMm": width_mm,
-                        "layer": route_layer,
-                        "layerSource": intent.get("_route_layer_source"),
-                        **_placement_corridor_fields(intent),
-                        "backend": result.get("backend", "mst"),
-                        "multiPin": True,
-                        "edgesRouted": result.get("edgesRouted", 0),
-                        "edgesTotal": result.get("edgesTotal", 0),
-                    })
+                    routed.append(
+                        {
+                            "net": intent["net_name"],
+                            "intent": intent["intent"],
+                            "widthMm": width_mm,
+                            "layer": route_layer,
+                            "layerSource": intent.get("_route_layer_source"),
+                            **_placement_corridor_fields(intent),
+                            "backend": result.get("backend", "mst"),
+                            "multiPin": True,
+                            "edgesRouted": result.get("edgesRouted", 0),
+                            "edgesTotal": result.get("edgesTotal", 0),
+                        }
+                    )
                 else:
                     failed_for_retry.append(intent)
                 continue
 
             # 2-pin net routing (original logic with IPC-first)
             same_layer_ipc = False
-            result: Dict[str, Any]
             if self.ipc_board_api and pads[0]["ref"] in footprints and pads[1]["ref"] in footprints:
                 start_layer = board.GetLayerName(footprints[pads[0]["ref"]].GetLayer())
                 end_layer = board.GetLayerName(footprints[pads[1]["ref"]].GetLayer())
-                if start_layer == end_layer and start_layer in {"F.Cu", "B.Cu"} and start_layer == route_layer:
+                if (
+                    start_layer == end_layer
+                    and start_layer in {"F.Cu", "B.Cu"}
+                    and start_layer == route_layer
+                ):
                     start_point = (float(pads[0]["x"]), float(pads[0]["y"]))
                     end_point = (float(pads[1]["x"]), float(pads[1]["y"]))
                     planned = self.routing_commands._plan_trace_points(
@@ -4605,7 +4696,10 @@ class AutorouteCFHACommands:
                             "message": "IPC fast-path skipped for non-orthogonal or unplanned path",
                         }
                 else:
-                    result = {"success": False, "message": "Via-required path kept on SWIG fallback"}
+                    result = {
+                        "success": False,
+                        "message": "Via-required path kept on SWIG fallback",
+                    }
             else:
                 result = {"success": False, "message": "IPC unavailable"}
 
@@ -4622,15 +4716,17 @@ class AutorouteCFHACommands:
                     }
                 )
             if result.get("success"):
-                routed.append({
-                    "net": intent["net_name"],
-                    "intent": intent["intent"],
-                    "widthMm": width_mm,
-                    "layer": route_layer,
-                    "layerSource": intent.get("_route_layer_source"),
-                    **_placement_corridor_fields(intent),
-                    "backend": "ipc" if same_layer_ipc else "swig",
-                })
+                routed.append(
+                    {
+                        "net": intent["net_name"],
+                        "intent": intent["intent"],
+                        "widthMm": width_mm,
+                        "layer": route_layer,
+                        "layerSource": intent.get("_route_layer_source"),
+                        **_placement_corridor_fields(intent),
+                        "backend": "ipc" if same_layer_ipc else "swig",
+                    }
+                )
             else:
                 failed_for_retry.append(intent)
 
@@ -4673,92 +4769,70 @@ class AutorouteCFHACommands:
                     )
                     reroute_handled_diff_pairs.add(pair_key)
                     if result.get("success"):
-                        rerouted.append({
-                            "net": intent["net_name"],
-                            "intent": intent["intent"],
-                            "widthMm": width_mm,
-                            "layer": route_layer,
-                            "layerSource": intent.get("_route_layer_source"),
-                            **_placement_corridor_fields(intent),
-                            "backend": "diff_pair",
-                            "pairWith": intent["diff_partner"],
-                            "estimatedViaCountPerNet": intent.get("_estimated_via_count_per_net"),
-                            "estimatedStitchViaCountTotal": intent.get("_estimated_stitch_via_count_total"),
-                            "estimatedTransitionCellViaCountTotal": intent.get(
-                                "_estimated_transition_cell_via_count_total"
-                            ),
-                            "transitionCellViaBudget": intent.get("_transition_cell_via_budget"),
-                            "transitionPolicy": intent.get("_transition_policy"),
-                            "reroutePass": pass_num + 1,
-                        })
-                        rerouted.append({
-                            "net": intent["diff_partner"],
-                            "intent": intent["intent"],
-                            "widthMm": width_mm,
-                            "layer": route_layer,
-                            "layerSource": intent.get("_route_layer_source"),
-                            **_placement_corridor_fields(intent),
-                            "backend": "diff_pair",
-                            "pairWith": intent["net_name"],
-                            "estimatedViaCountPerNet": intent.get("_estimated_via_count_per_net"),
-                            "estimatedStitchViaCountTotal": intent.get("_estimated_stitch_via_count_total"),
-                            "estimatedTransitionCellViaCountTotal": intent.get(
-                                "_estimated_transition_cell_via_count_total"
-                            ),
-                            "transitionCellViaBudget": intent.get("_transition_cell_via_budget"),
-                            "transitionPolicy": intent.get("_transition_policy"),
-                            "reroutePass": pass_num + 1,
-                        })
+                        rerouted.extend(
+                            _diff_pair_route_records(
+                                intent,
+                                width_mm,
+                                route_layer,
+                                reroute_pass=pass_num + 1,
+                            )
+                        )
                     else:
                         still_failed.append(intent)
                     continue
 
                 if len(pads) > 2:
                     result = self._route_multi_pin_net(
-                        pads, route_layer, width_mm, intent["net_name"], footprints, applier,
+                        pads,
+                        route_layer,
+                        width_mm,
+                        intent["net_name"],
+                        footprints,
+                        applier,
                     )
                 elif len(pads) == 2:
-                    result = self.routing_commands.route_pad_to_pad({
-                        "fromRef": pads[0]["ref"],
-                        "fromPad": pads[0]["pad"],
-                        "toRef": pads[1]["ref"],
-                        "toPad": pads[1]["pad"],
-                        "layer": route_layer,
-                        "width": width_mm,
-                        "net": intent["net_name"],
-                    })
+                    result = self.routing_commands.route_pad_to_pad(
+                        {
+                            "fromRef": pads[0]["ref"],
+                            "fromPad": pads[0]["pad"],
+                            "toRef": pads[1]["ref"],
+                            "toPad": pads[1]["pad"],
+                            "layer": route_layer,
+                            "width": width_mm,
+                            "net": intent["net_name"],
+                        }
+                    )
                 else:
                     result = {"success": False}
 
                 if result.get("success"):
-                    rerouted.append({
-                        "net": intent["net_name"],
-                        "intent": intent["intent"],
-                        "widthMm": width_mm,
-                        "layer": route_layer,
-                        "layerSource": intent.get("_route_layer_source"),
-                        **_placement_corridor_fields(intent),
-                        "reroutePass": pass_num + 1,
-                    })
+                    rerouted.append(
+                        {
+                            "net": intent["net_name"],
+                            "intent": intent["intent"],
+                            "widthMm": width_mm,
+                            "layer": route_layer,
+                            "layerSource": intent.get("_route_layer_source"),
+                            **_placement_corridor_fields(intent),
+                            "reroutePass": pass_num + 1,
+                        }
+                    )
                 else:
                     still_failed.append(intent)
             failed_for_retry = still_failed
 
         # Record final failures
         for intent in failed_for_retry:
-            skipped.append({
-                "net": intent["net_name"],
-                "intent": intent["intent"],
-                "reason": "route_failed_after_retry",
-                "padCount": len(inventory.get(intent["net_name"], {}).get("pads", [])),
-            })
+            skipped.append(
+                {
+                    "net": intent["net_name"],
+                    "intent": intent["intent"],
+                    "reason": "route_failed_after_retry",
+                    "padCount": len(inventory.get(intent["net_name"], {}).get("pads", [])),
+                }
+            )
 
         routed.extend(rerouted)
-
-        try:
-            board.Save(str(board_path))
-        except Exception:
-            logger.debug("Board save after route_critical_nets failed", exc_info=True)
 
         return {
             "success": True,
@@ -4788,7 +4862,7 @@ class AutorouteCFHACommands:
                     "-help"
                 ]
             else:
-                java_exe = shutil.which("java") or "/usr/bin/java"
+                java_exe = _find_java() or "/usr/bin/java"
                 cmd = [java_exe, "-jar", jar_path, "-help"]
 
             proc = subprocess.run(
@@ -4829,88 +4903,71 @@ class AutorouteCFHACommands:
         constraints_result = params.get("constraintsResult")
         if not constraints_result:
             constraints_result = self.generate_routing_constraints(params)
+        if not constraints_result.get("success"):
+            return constraints_result
         constraints = constraints_result.get("constraints", {})
         exclude_nets = params.get("excludeNets") or constraints.get("excludeFromFreeRouting", [])
-
-        export_result = self.freerouting_commands.export_dsn(
-            {
-                "boardPath": str(board_path),
-                "outputPath": params.get("dsnPath") or str(board_path.with_suffix(".dsn")),
-            }
-        )
-        if not export_result.get("success"):
-            return export_result
-
-        dsn_path = export_result["path"]
-        ses_path = params.get("sesPath") or str(board_path.with_suffix(".ses"))
         jar_path = params.get("freeroutingJar", DEFAULT_FREEROUTING_JAR)
-        timeout = int(params.get("timeout", params.get("timeBudgetSec", 300)))
-        max_passes = int(params.get("maxPasses", 20))
         execution_mode = str(check.get("execution_mode", "none"))
-        use_docker = execution_mode == "docker"
-        cmd = _build_freerouting_cmd(jar_path, dsn_path, ses_path, max_passes, use_docker)
         capabilities = self._probe_freerouting_capabilities(jar_path, execution_mode)
 
-        if exclude_nets and capabilities["inc"]:
-            for net_name in exclude_nets:
-                cmd.extend(["-inc", net_name])
-
-        seed = params.get("seed")
-        if seed is not None and capabilities["seed"]:
-            cmd.extend(["-seed", str(int(seed))])
-
-        extra_args = params.get("extraFreeroutingArgs", [])
-        if extra_args:
-            cmd.extend([str(arg) for arg in extra_args])
-
-        start = time.monotonic()
-        try:
-            proc = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                cwd=str(board_path.parent),
+        extra_args = [str(arg) for arg in params.get("extraFreeroutingArgs", []) or []]
+        target_nets = list(params.get("targetNets") or [])
+        if not target_nets:
+            intent_groups = constraints.get("intentGroups", {})
+            target_nets = list(
+                dict.fromkeys(
+                    net_name
+                    for intent in constraints.get("criticalClasses", [])
+                    for net_name in intent_groups.get(intent, [])
+                    if net_name not in exclude_nets
+                )
             )
-        except subprocess.TimeoutExpired:
-            return {
-                "success": False,
-                "message": f"Freerouting timed out after {timeout}s",
-                "dsnPath": dsn_path,
-                "sesPath": ses_path,
-                "excludedNets": exclude_nets,
-                "capabilities": capabilities,
-            }
-        elapsed = round(time.monotonic() - start, 3)
-        if proc.returncode != 0:
-            return {
-                "success": False,
-                "message": f"Freerouting exited with code {proc.returncode}",
-                "errorDetails": proc.stderr or proc.stdout,
-                "dsnPath": dsn_path,
-                "sesPath": ses_path,
-                "elapsedSec": elapsed,
-                "excludedNets": exclude_nets,
-                "capabilities": capabilities,
-            }
 
-        import_result = self.freerouting_commands.import_ses(
-            {
-                "sesPath": ses_path,
-                "boardPath": str(board_path),
-            }
+        # Reuse the production Freerouting runner so the hybrid stage gets the
+        # same isolated artifacts, best-of-N scoring, stale-output protection,
+        # per-attempt pass schedule, and winner import as the standalone tool.
+        self.freerouting_commands.board = board
+        run_params = {
+            **params,
+            "boardPath": str(board_path),
+            "deferSave": True,
+            "protectedNets": list(exclude_nets),
+            "timeout": params.get("timeout", params.get("timeBudgetSec", 300)),
+            "targetNets": target_nets,
+            "extraFreeroutingArgs": extra_args,
+        }
+        if capabilities["seed"] and params.get("seed") is not None:
+            run_params["freeroutingSeedFlag"] = "-seed"
+
+        result = self.freerouting_commands.autoroute(run_params)
+        protection = result.get("net_protection", {})
+        exclusions_applied = bool(
+            not exclude_nets
+            or (
+                protection.get("applied")
+                and set(protection.get("protectedNets", [])) == set(exclude_nets)
+            )
         )
-        import_result.update(
+        result.update(
             {
-                "dsnPath": dsn_path,
-                "sesPath": ses_path,
-                "elapsedSec": elapsed,
-                "excludedNets": exclude_nets,
+                "excludedNets": list(exclude_nets),
+                "exclusionsApplied": exclusions_applied,
+                "exclusionStrategy": "dsn_net_protection",
+                "targetNets": target_nets,
                 "capabilities": capabilities,
-                "mode": execution_mode,
+                "mode": result.get("mode", execution_mode),
             }
         )
-        return import_result
+        if result.get("success") and exclude_nets and not exclusions_applied:
+            result.update(
+                {
+                    "success": False,
+                    "message": "Freerouting did not prove protected-net exclusions",
+                    "errorDetails": protection,
+                }
+            )
+        return result
 
     def post_tune_routes(self, params: Dict[str, Any]) -> Dict[str, Any]:
         board, board_path, error = self._ensure_board(params)
@@ -4923,9 +4980,7 @@ class AutorouteCFHACommands:
         constraints_result = params.get("constraintsResult", {})
         constraints_data = constraints_result.get("constraints", {})
         raw_matched_groups = list(
-            constraints_data.get("matchedLengthGroups")
-            or params.get("matchedLengthGroups")
-            or []
+            constraints_data.get("matchedLengthGroups") or params.get("matchedLengthGroups") or []
         )
         default_group_skew = float(
             constraints_data.get("defaults", {}).get(
@@ -4977,6 +5032,11 @@ class AutorouteCFHACommands:
         if reference_zone_result.get("created"):
             actions.append("reference_ground_zone")
 
+        refill_result: Dict[str, Any] = {
+            "success": True,
+            "message": "Zone refill skipped",
+            "skipped": True,
+        }
         if params.get("refillZones", False):
             refill_result = self._refill_zones(board, board_path)
             if refill_result.get("success"):
@@ -4993,7 +5053,8 @@ class AutorouteCFHACommands:
                 board,
                 board_path,
                 report_path=Path(
-                    params.get("healingReportPath") or board_path.with_suffix(".post_tune_heal.drc.rpt")
+                    params.get("healingReportPath")
+                    or board_path.with_suffix(".post_tune_heal.drc.rpt")
                 ),
                 max_passes=int(params.get("healingPasses", 2)),
                 max_vias_per_net=int(params.get("maxHealingViasPerNet", 4)),
@@ -5003,18 +5064,35 @@ class AutorouteCFHACommands:
                 if params.get("refillZones", False):
                     actions.append("refill_zones_after_healing")
 
-        try:
-            board.Save(str(board_path))
-        except Exception:
-            logger.debug("Board save after post_tune_routes failed", exc_info=True)
+        step_results = {
+            "matchedLengthTuning": matched_length_result,
+            "referenceZone": reference_zone_result,
+            "zoneRefill": refill_result,
+            "healing": healing_result,
+        }
+        failed_steps = [
+            {
+                "step": name,
+                "message": result.get("message"),
+                "errorDetails": result.get("errorDetails"),
+            }
+            for name, result in step_results.items()
+            if not result.get("skipped", False) and not result.get("success", False)
+        ]
 
         return {
-            "success": True,
-            "message": "Post-route tuning hooks completed",
+            "success": not failed_steps,
+            "message": (
+                "Post-route tuning hooks completed"
+                if not failed_steps
+                else "One or more post-route tuning steps failed"
+            ),
             "actions": actions,
+            "failedSteps": failed_steps,
             "boardPath": str(board_path),
             "matchedLengthTuning": matched_length_result,
             "referenceZone": reference_zone_result,
+            "zoneRefill": refill_result,
             "healing": healing_result,
         }
 
@@ -5032,8 +5110,9 @@ class AutorouteCFHACommands:
         if not intents_result.get("success"):
             return intents_result
 
-        routeable_nets = 0
-        completed_nets = 0
+        completion = self._completion_snapshot(board, intents_result, inventory=inventory)
+        routeable_nets = int(completion["routeableNetCount"])
+        completed_nets = int(completion["completedNetCount"])
         wirelength_mm = 0.0
         via_count = 0
         power_misuse_flags: List[Dict[str, Any]] = []
@@ -5042,6 +5121,9 @@ class AutorouteCFHACommands:
         placement_corridor_risk_flags: List[Dict[str, Any]] = []
         copper_layers = self._board_layers(board)
         prefer_power_zones = len(copper_layers) >= 4
+        has_ground_reference_zone = any(
+            _best_intent(zone["net"]) == "GROUND" for zone in self._collect_zones(board)
+        )
 
         for intent in intents_result["intents"]:
             net_name = intent["net_name"]
@@ -5049,12 +5131,7 @@ class AutorouteCFHACommands:
             wirelength_mm += float(info.get("track_length_mm", 0.0))
             via_count += int(info.get("via_count", 0))
 
-            pad_count = len(info.get("pads", []))
             has_copper = bool(info.get("track_length_mm", 0.0) > 0 or info.get("zones"))
-            if pad_count >= 2:
-                routeable_nets += 1
-                if has_copper:
-                    completed_nets += 1
 
             if (
                 prefer_power_zones
@@ -5070,7 +5147,7 @@ class AutorouteCFHACommands:
                 )
 
             if intent["intent"] in {"HS_DIFF", "HS_SINGLE", "RF"}:
-                if not any(_best_intent(zone["net"]) == "GROUND" for zone in self._collect_zones(board)):
+                if not has_ground_reference_zone:
                     return_path_risk_flags.append(
                         {
                             "net": net_name,
@@ -5080,7 +5157,9 @@ class AutorouteCFHACommands:
 
         constraints_result = params.get("constraintsResult", {})
         constraints_data = constraints_result.get("constraints", {})
-        route_critical_result = params.get("routeCriticalResult") or params.get("criticalRouteResult") or {}
+        route_critical_result = (
+            params.get("routeCriticalResult") or params.get("criticalRouteResult") or {}
+        )
         seen_transition_cell_keys: set[Tuple[str, str]] = set()
         for collection_name in ("ordering", "routed", "rerouted"):
             for item in route_critical_result.get(collection_name, []) or []:
@@ -5101,7 +5180,10 @@ class AutorouteCFHACommands:
                     budget_value = None
                     estimated_value = 0.0
                 over_budget = bool(budget_value is not None and estimated_value > budget_value)
-                policy_over_budget = policy in {"transition_cell_over_budget", "transitions_over_budget"}
+                policy_over_budget = policy in {
+                    "transition_cell_over_budget",
+                    "transitions_over_budget",
+                }
                 if not over_budget and not policy_over_budget:
                     continue
                 seen_transition_cell_keys.add(key)
@@ -5111,7 +5193,9 @@ class AutorouteCFHACommands:
                         "pairWith": pair_name if pair_name != net_name else None,
                         "reason": policy or "transition_cell_via_budget_exceeded",
                         "estimatedTransitionCellViaCountTotal": int(estimated_value),
-                        "transitionCellViaBudget": int(budget_value) if budget_value is not None else None,
+                        "transitionCellViaBudget": (
+                            int(budget_value) if budget_value is not None else None
+                        ),
                         "estimatedStitchViaCountTotal": item.get("estimatedStitchViaCountTotal"),
                         "source": collection_name,
                     }
@@ -5125,7 +5209,9 @@ class AutorouteCFHACommands:
                     continue
                 try:
                     pressure_value = float(item.get("placementCorridorEdgePressureMm", 0.0) or 0.0)
-                    budget_value = float(item.get("placementCorridorCongestionBudgetMm", 0.0) or 0.0)
+                    budget_value = float(
+                        item.get("placementCorridorCongestionBudgetMm", 0.0) or 0.0
+                    )
                 except (TypeError, ValueError):
                     continue
                 if budget_value <= 0 or pressure_value <= budget_value:
@@ -5147,9 +5233,7 @@ class AutorouteCFHACommands:
                     }
                 )
         matched_groups = list(
-            constraints_data.get("matchedLengthGroups")
-            or params.get("matchedLengthGroups")
-            or []
+            constraints_data.get("matchedLengthGroups") or params.get("matchedLengthGroups") or []
         )
 
         diff_lengths: Dict[str, float] = {}
@@ -5188,19 +5272,17 @@ class AutorouteCFHACommands:
             skew = max(lengths.values()) - min(lengths.values())
             raw_max_skew = group.get("maxSkewMm")
             if raw_max_skew is None:
-                max_skew = float(
-                    constraints_data.get("defaults", {}).get("hs_diff_skew_mm", 0.25)
-                )
+                max_skew = float(constraints_data.get("defaults", {}).get("hs_diff_skew_mm", 0.25))
             else:
                 max_skew = max(0.0, float(raw_max_skew))
             ratio = skew / max(max_skew, 0.01)
-            key = "|".join(sorted(lengths))
-            matched_group_skews[key] = round(skew, 4)
+            group_key = "|".join(sorted(lengths))
+            matched_group_skews[group_key] = round(skew, 4)
             matched_group_skew_ratios.append(ratio)
             if ratio > 1.0:
                 matched_length_risk_flags.append(
                     {
-                        "group": key,
+                        "group": group_key,
                         "nets": sorted(lengths),
                         "maxSkewMm": round(max_skew, 4),
                         "observedSkewMm": round(skew, 4),
@@ -5216,7 +5298,7 @@ class AutorouteCFHACommands:
             return drc_result
 
         severity = drc_result.get("summary", {}).get("by_severity", {})
-        completion_rate = round(completed_nets / routeable_nets, 4) if routeable_nets else 1.0
+        completion_rate = float(completion["completionRate"])
 
         flat_metrics = {
             "wirelengthMm": round(wirelength_mm, 3),
@@ -5224,6 +5306,10 @@ class AutorouteCFHACommands:
             "routeableNetCount": routeable_nets,
             "completedNetCount": completed_nets,
             "completionRate": completion_rate,
+            "completionVerified": bool(completion["completionVerified"]),
+            "completionSource": completion["completionSource"],
+            "requiredConnectionCount": completion["requiredConnectionCount"],
+            "unconnectedItemCount": completion["unconnectedItemCount"],
             "drcErrors": int(severity.get("error", 0)),
             "drcWarnings": int(severity.get("warning", 0)),
             "maxDiffSkewMm": round(max(diff_lengths.values(), default=0.0), 4),
@@ -5264,9 +5350,16 @@ class AutorouteCFHACommands:
         qor = compute_weighted_qor_score(flat_metrics, flags, qor_weights, constraints_data)
 
         report = {
-            "success": severity.get("error", 0) == 0,
+            "success": bool(
+                severity.get("error", 0) == 0
+                and completion["completionVerified"]
+                and completion_rate >= 1.0
+            ),
             "boardPath": str(board_path),
             "completionRate": completion_rate,
+            "completionVerified": bool(completion["completionVerified"]),
+            "completionSource": completion["completionSource"],
+            "unconnectedItemCount": completion["unconnectedItemCount"],
             "qorScore": qor["score"],
             "qorGrade": qor["grade"],
             "qorDetail": qor,
@@ -5282,7 +5375,9 @@ class AutorouteCFHACommands:
             "matchedGroupSkewMm": matched_group_skews,
         }
 
-        output_path = Path(params.get("qorReportPath", board_path.with_suffix(".autoroute_cfha.json")))
+        output_path = Path(
+            params.get("qorReportPath", board_path.with_suffix(".autoroute_cfha.json"))
+        )
         _safe_mkdir(output_path)
         output_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
         report["reportPath"] = str(output_path)
@@ -5292,25 +5387,68 @@ class AutorouteCFHACommands:
         self,
         board: pcbnew.BOARD,
         intents_result: Dict[str, Any],
+        *,
+        inventory: Optional[Dict[str, Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
-        inventory = self._collect_inventory(board)
+        inventory = inventory if inventory is not None else self._collect_inventory(board)
         routeable_nets = 0
-        completed_nets = 0
+        required_connections = 0
+        seen_nets: set[str] = set()
 
         for intent in intents_result.get("intents", []):
-            info = inventory.get(intent.get("net_name", ""), {})
+            net_name = str(intent.get("net_name", ""))
+            if not net_name or net_name in seen_nets:
+                continue
+            seen_nets.add(net_name)
+            info = inventory.get(net_name, {})
             pad_count = len(info.get("pads", []))
-            has_copper = bool(info.get("track_length_mm", 0.0) > 0 or info.get("zones"))
             if pad_count >= 2:
                 routeable_nets += 1
-                if has_copper:
-                    completed_nets += 1
+                required_connections += pad_count - 1
+
+        unconnected_count: Optional[int] = None
+        if required_connections:
+            try:
+                connectivity = pcbnew.CONNECTIVITY_DATA()
+                connectivity.Build(board)
+                connectivity.RecalculateRatsnest()
+                native_count = connectivity.GetUnconnectedCount(False)
+                # MagicMock and permissive stubs must not accidentally certify
+                # a board as fully connected.
+                if type(native_count) is int and native_count >= 0:
+                    unconnected_count = native_count
+            except Exception:
+                logger.debug("Native connectivity verification failed", exc_info=True)
+
+        if required_connections == 0:
+            completion_verified = True
+            completion_rate = 1.0
+            completed_nets = routeable_nets
+            source = "no_routeable_connections"
+            unconnected_count = 0
+        elif unconnected_count is None:
+            completion_verified = False
+            completion_rate = 0.0
+            completed_nets = 0
+            source = "unavailable"
+        else:
+            completion_verified = True
+            connected_count = max(0, required_connections - unconnected_count)
+            completion_rate = min(1.0, connected_count / required_connections)
+            # Native SWIG exposes a board-wide missing-edge count, not a stable
+            # per-net completion list.  Report a conservative net lower bound.
+            completed_nets = max(0, routeable_nets - min(unconnected_count, routeable_nets))
+            source = "pcbnew.CONNECTIVITY_DATA"
 
         return {
             "inventory": inventory,
             "routeableNetCount": routeable_nets,
             "completedNetCount": completed_nets,
-            "completionRate": round(completed_nets / routeable_nets, 4) if routeable_nets else 1.0,
+            "requiredConnectionCount": required_connections,
+            "unconnectedItemCount": unconnected_count,
+            "completionVerified": completion_verified,
+            "completionSource": source,
+            "completionRate": round(completion_rate, 4),
         }
 
     def autoroute_cfha(self, params: Dict[str, Any]) -> Dict[str, Any]:
@@ -5348,15 +5486,24 @@ class AutorouteCFHACommands:
         if not constraints.get("success"):
             return constraints
 
-        dru = timed(
-            "generate_dru",
-            self.generate_kicad_dru,
-            {**params, "constraintsResult": constraints},
-        )
-        if not dru.get("success"):
-            return dru
-
         strategy = params.get("strategy", "hybrid")
+        if strategy == "analysis_only":
+            stage_times["generate_dru"] = 0.0
+            dru = {
+                "success": True,
+                "skipped": True,
+                "message": "KiCad rule generation skipped for analysis-only strategy",
+                "rulesPath": None,
+            }
+        else:
+            dru = timed(
+                "generate_dru",
+                self.generate_kicad_dru,
+                {**params, "constraintsResult": constraints},
+            )
+            if not dru.get("success"):
+                return dru
+
         effective_params = dict(params)
         reference_planning = constraints.get("constraints", {}).get("referencePlanning", {})
         pre_route_critical_layer = params.get("criticalLayer")
@@ -5394,7 +5541,9 @@ class AutorouteCFHACommands:
             )
             if not pre_route_reference.get("success"):
                 return pre_route_reference
-            if pre_route_reference.get("criticalLayer") and not effective_params.get("criticalLayer"):
+            if pre_route_reference.get("criticalLayer") and not effective_params.get(
+                "criticalLayer"
+            ):
                 effective_params["criticalLayer"] = pre_route_reference["criticalLayer"]
         else:
             stage_times["pre_route_reference"] = 0.0
@@ -5477,16 +5626,39 @@ class AutorouteCFHACommands:
                 "routeCriticalResult": critical,
             },
         )
-        if not verify.get("success", False) and verify.get("drc", {}).get("errors", 0) > 0:
-            success = False
+        stage_results = {
+            "critical": critical,
+            "bulk": bulk,
+            "postTune": post,
+        }
+        stage_failures = [
+            name
+            for name, stage in stage_results.items()
+            if not stage.get("skipped", False) and not stage.get("success", False)
+        ]
+        drc = verify.get("drc")
+        drc_ok = isinstance(drc, dict) and int(drc.get("errors", 0)) == 0
+        completion_verified = bool(
+            verify.get("completionVerified", verify.get("metrics", {}).get("completionVerified"))
+        )
+        completion_rate = float(verify.get("completionRate", 0.0) or 0.0)
+        routing_complete = completion_verified and completion_rate >= 1.0
+        if strategy == "hybrid":
+            success = bool(verify.get("success", False) and drc_ok and routing_complete)
         else:
-            success = bool(verify.get("drc", {}).get("errors", 0) == 0)
+            # analysis_only and critical_only intentionally need not finish all
+            # board nets, but still surface DRC and stage-execution failures.
+            success = drc_ok
+        success = bool(success and not stage_failures)
 
         return {
             "success": success,
             "strategy": strategy,
             "boardPath": str(board_path),
             "completionRate": verify.get("completionRate"),
+            "completionVerified": completion_verified,
+            "routingComplete": routing_complete,
+            "stageFailures": stage_failures,
             "qorScore": verify.get("qorScore"),
             "qorGrade": verify.get("qorGrade"),
             "qorDetail": verify.get("qorDetail"),
@@ -5498,8 +5670,8 @@ class AutorouteCFHACommands:
             "artifacts": {
                 "constraintsPath": constraints.get("constraintsPath"),
                 "rulesPath": dru.get("rulesPath"),
-                "dsnPath": bulk.get("dsnPath"),
-                "sesPath": bulk.get("sesPath"),
+                "dsnPath": bulk.get("dsnPath") or bulk.get("dsn_path"),
+                "sesPath": bulk.get("sesPath") or bulk.get("ses_path"),
                 "reportPath": verify.get("reportPath"),
             },
             "stages": {

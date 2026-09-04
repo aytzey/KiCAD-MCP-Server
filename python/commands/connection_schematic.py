@@ -1,7 +1,7 @@
 import logging
 import os
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from skip import Schematic
 
@@ -10,14 +10,6 @@ logger = logging.getLogger(__name__)
 # Import new wire and pin managers
 try:
     from commands.pin_locator import PinLocator
-    from commands.orthogonal_router import (
-        compress_path,
-        manhattan_path_length,
-        plan_orthogonal_path,
-        segment_direction,
-        segment_intersects_rect,
-        segments_conflict,
-    )
     from commands.wire_manager import WireManager
 
     WIRE_MANAGER_AVAILABLE = True
@@ -33,14 +25,14 @@ class ConnectionManager:
     _pin_locator = None
 
     @classmethod
-    def get_pin_locator(cls):
+    def get_pin_locator(cls) -> Any:
         """Get or create pin locator instance"""
         if cls._pin_locator is None and WIRE_MANAGER_AVAILABLE:
             cls._pin_locator = PinLocator()
         return cls._pin_locator
 
     @staticmethod
-    def add_net_label(schematic: Schematic, net_name: str, position: list):
+    def add_net_label(schematic: Schematic, net_name: str, position: list) -> Any:
         """
         Add a net label to the schematic
 
@@ -65,89 +57,11 @@ class ConnectionManager:
             return None
 
     @staticmethod
-    def _direction_from_angle(angle_degrees: float) -> Tuple[int, int]:
-        """Convert a schematic outward angle to a screen-axis unit vector."""
-        angle = int(round(angle_degrees / 90.0)) % 4
-        mapping = {
-            0: (1, 0),
-            1: (0, -1),
-            2: (-1, 0),
-            3: (0, 1),
-        }
-        return mapping[angle]
-
-    @staticmethod
-    def _perpendicular(direction: Tuple[int, int]) -> Tuple[int, int]:
-        """Return a right-handed perpendicular for an axis-aligned direction."""
-        dx, dy = direction
-        return (-dy, dx)
-
-    @staticmethod
-    def _exit_point_from_bbox(
-        pin_loc: List[float],
-        direction: Tuple[int, int],
-        bbox: Optional[Tuple[float, float, float, float]],
-        margin: float,
-    ) -> Tuple[float, float]:
-        """Return a point just outside the symbol bbox in the pin's outward direction."""
-        if not bbox:
-            return (
-                round(pin_loc[0] + direction[0] * margin, 4),
-                round(pin_loc[1] + direction[1] * margin, 4),
-            )
-
-        min_x, min_y, max_x, max_y = bbox
-        if direction == (1, 0):
-            return (round(max_x + margin, 4), round(pin_loc[1], 4))
-        if direction == (-1, 0):
-            return (round(min_x - margin, 4), round(pin_loc[1], 4))
-        if direction == (0, -1):
-            return (round(pin_loc[0], 4), round(min_y - margin, 4))
-        return (round(pin_loc[0], 4), round(max_y + margin, 4))
-
-    @staticmethod
-    def _point_near_labels(
-        point: Tuple[float, float],
-        labels: List[dict],
-        minimum_spacing: float = 1.5,
-    ) -> bool:
-        """Return True if the candidate label point is too close to an existing label."""
-        for label in labels:
-            dx = point[0] - label["x"]
-            dy = point[1] - label["y"]
-            if (dx * dx + dy * dy) ** 0.5 < minimum_spacing:
-                return True
-        return False
-
-    @staticmethod
-    def _path_crosses_wires(path_points: List[Tuple[float, float]], wires: List[dict]) -> bool:
-        """Reject paths that would create wire-wire crossings or overlaps."""
-        for index in range(len(path_points) - 1):
-            seg_start = path_points[index]
-            seg_end = path_points[index + 1]
-            for wire in wires:
-                if segments_conflict(seg_start, seg_end, wire["start"], wire["end"]):
-                    return True
-        return False
-
-    @staticmethod
-    def _path_hits_symbol_bboxes(
-        path_points: List[Tuple[float, float]],
-        bboxes: List[Tuple[float, float, float, float]],
-    ) -> bool:
-        """Return True if any segment passes through another symbol body."""
-        for index in range(len(path_points) - 1):
-            seg_start = path_points[index]
-            seg_end = path_points[index + 1]
-            for bbox in bboxes:
-                if segment_intersects_rect(seg_start, seg_end, bbox, strict=True):
-                    return True
-        return False
-
-    @staticmethod
-    def connect_to_net(schematic_path: Path, component_ref: str, pin_name: str, net_name: str):
+    def connect_to_net(
+        schematic_path: Path, component_ref: str, pin_name: str, net_name: str
+    ) -> Dict[str, Any]:
         """
-        Connect a component pin to a named net using a wire stub and label
+        Connect a component pin to a named net using a wire stub and label.
 
         Args:
             schematic_path: Path to .kicad_sch file
@@ -156,157 +70,78 @@ class ConnectionManager:
             net_name: Name of the net to connect to (e.g., "VCC", "GND", "SIGNAL_1")
 
         Returns:
-            True if successful, False otherwise
+            Dict with keys:
+              success        – bool
+              pin_location   – [x, y] exact pin endpoint used (present on success)
+              label_location – [x, y] where the net label was placed (present on success)
+              wire_stub      – [[x1,y1],[x2,y2]] the wire segment added (present on success)
+              message        – human-readable status
         """
         try:
             if not WIRE_MANAGER_AVAILABLE:
                 logger.error("WireManager/PinLocator not available")
-                return False
+                return {"success": False, "message": "WireManager/PinLocator not available"}
 
             locator = ConnectionManager.get_pin_locator()
             if not locator:
                 logger.error("Pin locator unavailable")
-                return False
+                return {"success": False, "message": "Pin locator unavailable"}
 
             # Get pin location using PinLocator
             pin_loc = locator.get_pin_location(schematic_path, component_ref, pin_name)
             if not pin_loc:
-                logger.error(f"Could not locate pin {component_ref}/{pin_name}")
-                return False
+                msg = f"Could not locate pin {component_ref}/{pin_name}"
+                logger.error(msg)
+                return {"success": False, "message": msg}
 
-            pin_angle_deg = getattr(locator, "_last_pin_angle", 0)
+            # Add a small wire stub from the pin (2.54mm = 0.1 inch, standard grid spacing)
+            # Stub direction follows the pin's outward angle from the PinLocator
             try:
                 pin_angle_deg = locator.get_pin_angle(schematic_path, component_ref, pin_name) or 0
-            except Exception:
+            except Exception as e:
+                logger.warning(
+                    f"Could not get pin angle for {component_ref}/{pin_name}, defaulting to 0: {e}"
+                )
                 pin_angle_deg = 0
+            import math as _math
 
-            from commands.schematic_analysis import (
-                _compute_symbol_bbox_direct,
-                _extract_lib_symbols,
-                _load_sexp,
-                _parse_labels,
-                _parse_symbols,
-                _parse_wires,
-            )
-
-            sexp_data = _load_sexp(schematic_path)
-            labels = _parse_labels(sexp_data)
-            wires = _parse_wires(sexp_data)
-            symbols = _parse_symbols(sexp_data)
-            lib_defs = _extract_lib_symbols(sexp_data)
-
-            symbol_bboxes = {}
-            for symbol in symbols:
-                reference = symbol.get("reference", "")
-                if not reference or reference.startswith("_TEMPLATE"):
-                    continue
-                lib_data = lib_defs.get(symbol.get("lib_id", ""), {})
-                pin_defs = lib_data.get("pins", {})
-                graphics_points = lib_data.get("graphics_points", [])
-                if not pin_defs:
-                    continue
-                bbox = _compute_symbol_bbox_direct(
-                    symbol,
-                    pin_defs,
-                    graphics_points=graphics_points,
-                )
-                if bbox is not None:
-                    symbol_bboxes[reference] = bbox
-
-            direction = ConnectionManager._direction_from_angle(pin_angle_deg)
-            perpendicular = ConnectionManager._perpendicular(direction)
-            other_bboxes = [
-                bbox for reference, bbox in symbol_bboxes.items() if reference != component_ref
+            angle_rad = _math.radians(pin_angle_deg)
+            stub_end = [
+                round(pin_loc[0] + 2.54 * _math.cos(angle_rad), 4),
+                round(pin_loc[1] - 2.54 * _math.sin(angle_rad), 4),
             ]
-            grid = 2.54
-            anchor_point = (
-                round(pin_loc[0] + direction[0] * grid, 4),
-                round(pin_loc[1] + direction[1] * grid, 4),
-            )
 
-            candidates = []
-            for distance_steps in (0, 1, 2):
-                forward_point = (
-                    round(anchor_point[0] + direction[0] * grid * distance_steps, 4),
-                    round(anchor_point[1] + direction[1] * grid * distance_steps, 4),
-                )
-                for offset_steps in (0, 1, -1, 2, -2):
-                    label_point = (
-                        round(forward_point[0] + perpendicular[0] * grid * offset_steps, 4),
-                        round(forward_point[1] + perpendicular[1] * grid * offset_steps, 4),
-                    )
-                    if ConnectionManager._point_near_labels(label_point, labels):
-                        continue
-
-                    tail_path = plan_orthogonal_path(
-                        anchor_point,
-                        label_point,
-                        other_bboxes,
-                        bend_penalty=1.0,
-                    )
-                    if not tail_path:
-                        continue
-
-                    full_path = compress_path([tuple(pin_loc), anchor_point] + tail_path[1:])
-                    if ConnectionManager._path_hits_symbol_bboxes(full_path, other_bboxes):
-                        continue
-                    if ConnectionManager._path_crosses_wires(full_path, wires):
-                        continue
-
-                    candidates.append(
-                        (
-                            manhattan_path_length(full_path)
-                            + max(len(full_path) - 2, 0)
-                            + abs(offset_steps) * 0.5,
-                            full_path,
-                            label_point,
-                        )
-                    )
-
-            if candidates:
-                _, chosen_path, label_point = min(candidates, key=lambda item: item[0])
-            else:
-                # Conservative fallback: preserve the old simple outward stub.
-                label_point = anchor_point
-                chosen_path = [tuple(pin_loc), anchor_point]
-
-            wire_success = (
-                WireManager.add_polyline_wire(schematic_path, [[p[0], p[1]] for p in chosen_path])
-                if len(chosen_path) > 2
-                else WireManager.add_wire(
-                    schematic_path,
-                    [chosen_path[0][0], chosen_path[0][1]],
-                    [chosen_path[-1][0], chosen_path[-1][1]],
-                )
-            )
+            # Create wire stub using WireManager
+            wire_success = WireManager.add_wire(schematic_path, pin_loc, stub_end)
             if not wire_success:
-                logger.error("Failed to create wire stub for net connection")
-                return False
+                msg = "Failed to create wire stub for net connection"
+                logger.error(msg)
+                return {"success": False, "message": msg}
 
-            last_direction = (
-                segment_direction(chosen_path[-2], chosen_path[-1]) if len(chosen_path) >= 2 else "H"
-            )
-            label_orientation = 90 if last_direction == "V" else 0
+            # Add label at the end of the stub using WireManager
             label_success = WireManager.add_label(
-                schematic_path,
-                net_name,
-                [label_point[0], label_point[1]],
-                label_type="label",
-                orientation=label_orientation,
+                schematic_path, net_name, stub_end, label_type="label"
             )
             if not label_success:
-                logger.error(f"Failed to add net label '{net_name}'")
-                return False
+                msg = f"Failed to add net label '{net_name}'"
+                logger.error(msg)
+                return {"success": False, "message": msg}
 
             logger.info(f"Connected {component_ref}/{pin_name} to net '{net_name}'")
-            return True
+            return {
+                "success": True,
+                "message": f"Connected {component_ref}/{pin_name} to net '{net_name}'",
+                "pin_location": pin_loc,
+                "label_location": stub_end,
+                "wire_stub": [pin_loc, stub_end],
+            }
 
         except Exception as e:
             logger.error(f"Error connecting to net: {e}")
             import traceback
 
             logger.error(traceback.format_exc())
-            return False
+            return {"success": False, "message": str(e)}
 
     @staticmethod
     def connect_passthrough(
@@ -315,7 +150,7 @@ class ConnectionManager:
         target_ref: str,
         net_prefix: str = "PIN",
         pin_offset: int = 0,
-    ):
+    ) -> Dict[str, List[str]]:
         """
         Connect all pins of source_ref to matching pins of target_ref via shared net labels.
         Useful for passthrough adapters: J1 pin N <-> J2 pin N on net {net_prefix}_{N}.
@@ -358,18 +193,18 @@ class ConnectionManager:
                     else f"{net_prefix}_{pin_num}"
                 )
 
-                ok_src = ConnectionManager.connect_to_net(
+                res_src = ConnectionManager.connect_to_net(
                     schematic_path, source_ref, pin_num, net_name
                 )
-                if not ok_src:
+                if not res_src.get("success"):
                     failed.append(f"{source_ref}/{pin_num}")
                     continue
 
                 if pin_num in tgt_pins:
-                    ok_tgt = ConnectionManager.connect_to_net(
+                    res_tgt = ConnectionManager.connect_to_net(
                         schematic_path, target_ref, pin_num, net_name
                     )
-                    if not ok_tgt:
+                    if not res_tgt.get("success"):
                         failed.append(f"{target_ref}/{pin_num}")
                         continue
                 else:
@@ -386,7 +221,7 @@ class ConnectionManager:
     @staticmethod
     def get_net_connections(
         schematic: Schematic, net_name: str, schematic_path: Optional[Path] = None
-    ):
+    ) -> List[Dict]:
         """
         Get all connections for a named net using wire graph analysis
 
@@ -404,7 +239,7 @@ class ConnectionManager:
             connections = []
             tolerance = 0.5  # 0.5mm tolerance for point coincidence (grid spacing consideration)
 
-            def points_coincide(p1, p2):
+            def points_coincide(p1: Any, p2: Any) -> bool:
                 """Check if two points are the same (within tolerance)"""
                 if not p1 or not p2:
                     return False
@@ -430,13 +265,14 @@ class ConnectionManager:
 
             logger.debug(f"Found {len(net_label_positions)} labels for net '{net_name}'")
 
-            # 2. Find all wires connected to these label positions
+            # 2. Find all wires connected to these label positions.
+            # A missing wire attribute is fine — all_match_points will still
+            # include label positions, so label-at-pin connections are detected.
+            connected_wire_points: set[tuple[float, float]] = set()
             if not hasattr(schematic, "wire"):
-                logger.warning("Schematic has no wires")
-                return connections
+                logger.debug("Schematic has no wires — will match labels to pins directly")
 
-            connected_wire_points = set()
-            for wire in schematic.wire:
+            for wire in (schematic.wire if hasattr(schematic, "wire") else []):
                 if hasattr(wire, "pts") and hasattr(wire.pts, "xy"):
                     # Get all points in this wire (polyline)
                     wire_points = []
@@ -459,12 +295,19 @@ class ConnectionManager:
                         for pt in wire_points:
                             connected_wire_points.add((pt[0], pt[1]))
 
-            if not connected_wire_points:
-                logger.debug(f"No wires connected to net '{net_name}' labels")
+            # Build match points: union of wire endpoints AND label positions.
+            # This handles the valid KiCad style where a net label is placed
+            # directly at a pin endpoint with no wire segment in between.
+            all_match_points = connected_wire_points | {(p[0], p[1]) for p in net_label_positions}
+
+            if not all_match_points:
+                logger.debug(f"No connection points found for net '{net_name}'")
                 return connections
 
             logger.debug(
-                f"Found {len(connected_wire_points)} wire connection points for net '{net_name}'"
+                f"Found {len(connected_wire_points)} wire points, "
+                f"{len(net_label_positions)} direct label positions, "
+                f"{len(all_match_points)} total match points for net '{net_name}'"
             )
 
             # 3. Find component pins at wire endpoints
@@ -506,9 +349,9 @@ class ConnectionManager:
                             if not pin_loc:
                                 continue
 
-                            # Check if pin coincides with any wire point
-                            for wire_pt in connected_wire_points:
-                                if points_coincide(pin_loc, list(wire_pt)):
+                            # Check if pin coincides with any match point
+                            for wire_pt_tup in all_match_points:
+                                if points_coincide(pin_loc, list(wire_pt_tup)):
                                     connections.append({"component": ref, "pin": pin_num})
                                     break  # Pin found, no need to check more wire points
 
@@ -526,9 +369,11 @@ class ConnectionManager:
                     symbol_x = float(symbol_pos[0])
                     symbol_y = float(symbol_pos[1])
 
-                    # Check if symbol is near any wire point (within 10mm)
-                    for wire_pt in connected_wire_points:
-                        dist = ((symbol_x - wire_pt[0]) ** 2 + (symbol_y - wire_pt[1]) ** 2) ** 0.5
+                    # Check if symbol is near any match point (within 10mm)
+                    for wire_pt_tup in all_match_points:
+                        dist = (
+                            (symbol_x - wire_pt_tup[0]) ** 2 + (symbol_y - wire_pt_tup[1]) ** 2
+                        ) ** 0.5
                         if dist < 10.0:  # 10mm proximity threshold
                             connections.append({"component": ref, "pin": "unknown"})
                             break  # Only add once per component
@@ -544,7 +389,9 @@ class ConnectionManager:
             return []
 
     @staticmethod
-    def generate_netlist(schematic: Schematic, schematic_path: Optional[Path] = None):
+    def generate_netlist(
+        schematic: Schematic, schematic_path: Optional[Path] = None
+    ) -> Dict[str, Any]:
         """
         Generate a netlist from the schematic
 
@@ -573,7 +420,9 @@ class ConnectionManager:
             }
         """
         try:
-            netlist = {"nets": [], "components": []}
+            from commands.wire_connectivity import get_connections_for_net
+
+            netlist: Dict[str, Any] = {"nets": [], "components": []}
 
             # Gather all components
             if hasattr(schematic, "symbol"):
@@ -591,24 +440,17 @@ class ConnectionManager:
                     }
                     netlist["components"].append(component_info)
 
-            # Gather all nets from both local and global labels.
-            # Power symbols resolve through global labels in many KiCad schematics,
-            # so looking at local labels only drops real board nets.
-            net_names = set()
-            if hasattr(schematic, "label"):
-                for label in schematic.label:
-                    if hasattr(label, "value"):
-                        net_names.add(label.value)
-            if hasattr(schematic, "global_label"):
-                for label in schematic.global_label:
-                    if hasattr(label, "value"):
-                        net_names.add(label.value)
+            # Gather all nets from labels and global labels
+            net_names: set = set()
+            for attr_name in ("label", "global_label"):
+                if hasattr(schematic, attr_name):
+                    for label in getattr(schematic, attr_name):
+                        if hasattr(label, "value"):
+                            net_names.add(label.value)
 
-            # For each net, get connections
-            for net_name in sorted(net_names):
-                connections = ConnectionManager.get_net_connections(
-                    schematic, net_name, schematic_path
-                )
+            sch_path_str = str(schematic_path) if schematic_path else ""
+            for net_name in net_names:
+                connections = get_connections_for_net(schematic, sch_path_str, net_name)
                 if connections:
                     netlist["nets"].append({"name": net_name, "connections": connections})
 

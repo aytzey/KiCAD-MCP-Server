@@ -12,6 +12,9 @@ import re
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+from utils.kicad_roots import kicad_install_roots
+from utils.platform_helper import PlatformHelper
+
 logger = logging.getLogger("kicad_interface")
 
 
@@ -35,7 +38,7 @@ class LibraryManager:
         self.footprint_cache: Dict[str, List[str]] = {}  # library -> [footprint names]
         self._load_libraries()
 
-    def _load_libraries(self):
+    def _load_libraries(self) -> None:
         """Load libraries from fp-lib-table files"""
         # Load global libraries
         global_table = self._get_global_fp_lib_table()
@@ -54,7 +57,10 @@ class LibraryManager:
 
         discovered = self._discover_pretty_libraries()
         if discovered:
-            logger.info(f"Discovered {discovered} footprint libraries from .pretty directories")
+            logger.info(
+                "Discovered %s footprint libraries from .pretty directories",
+                discovered,
+            )
 
         logger.info(f"Loaded {len(self.libraries)} footprint libraries")
 
@@ -82,7 +88,7 @@ class LibraryManager:
 
         return None
 
-    def _parse_fp_lib_table(self, table_path: Path):
+    def _parse_fp_lib_table(self, table_path: Path) -> None:
         """
         Parse fp-lib-table file
 
@@ -95,14 +101,19 @@ class LibraryManager:
             with open(table_path, "r") as f:
                 content = f.read()
 
-            # Simple regex-based parser for lib entries
-            # Pattern: (lib (name "NAME")(type TYPE)(uri "URI")...)
-            lib_pattern = r'\(lib\s+\(name\s+"?([^")\s]+)"?\)\s*\(type\s+"?([^")\s]+)"?\)\s*\(uri\s+"?([^")\s]+)"?'
+            # Simple regex-based parser for lib entries. Name, type, and URI
+            # may be quoted or bare; quoted URIs can contain spaces.
+            lib_pattern = (
+                r"\(lib\s+"
+                r'\(name\s+(?:"([^"]+)"|([^"\)\s]+))\)\s*'
+                r'\(type\s+(?:"([^"]+)"|([^"\)\s]+))\)\s*'
+                r'\(uri\s+(?:"([^"]+)"|([^"\)\s]+))'
+            )
 
             for match in re.finditer(lib_pattern, content, re.IGNORECASE):
-                nickname = match.group(1)
-                lib_type = match.group(2)
-                uri = match.group(3)
+                nickname = match.group(1) or match.group(2)
+                lib_type = match.group(3) or match.group(4)
+                uri = match.group(5) or match.group(6)
 
                 if lib_type.lower() == "table":
                     table_uri = uri
@@ -149,7 +160,11 @@ class LibraryManager:
             "KICAD10_3RD_PARTY": self._find_kicad_3rdparty_dir(),
             "KICAD9_3RD_PARTY": self._find_kicad_3rdparty_dir(),
             "KICAD8_3RD_PARTY": self._find_kicad_3rdparty_dir(),
+            "KICAD_3RD_PARTY": self._find_kicad_3rdparty_dir(),
         }
+
+        # Merge user-defined env vars from kicad_common.json
+        env_vars.update(PlatformHelper.load_kicad_env_vars())
 
         # Project directory
         if self.project_path:
@@ -180,12 +195,18 @@ class LibraryManager:
         possible_paths = [
             "/usr/share/kicad/footprints",
             "/usr/local/share/kicad/footprints",
-            "C:/Program Files/KiCad/9.0/share/kicad/footprints",
-            "C:/Program Files/KiCad/8.0/share/kicad/footprints",
             "/Applications/KiCad/KiCad.app/Contents/SharedSupport/footprints",
         ]
 
+        # Prepend Windows install roots from the shared discovery helper (registry
+        # + Program Files + custom C:\KiCad roots, newest first) so a relocated
+        # install's footprints are found, not just Program Files ones (#286).
+        for root in reversed(kicad_install_roots()):
+            possible_paths.insert(0, str(root / "share" / "kicad" / "footprints"))
+
         # Also check environment variable
+        if "KICAD10_FOOTPRINT_DIR" in os.environ:
+            possible_paths.insert(0, os.environ["KICAD10_FOOTPRINT_DIR"])
         if "KICAD9_FOOTPRINT_DIR" in os.environ:
             possible_paths.insert(0, os.environ["KICAD9_FOOTPRINT_DIR"])
         if "KICAD8_FOOTPRINT_DIR" in os.environ:
@@ -198,12 +219,7 @@ class LibraryManager:
         return None
 
     def _candidate_footprint_roots(self) -> List[Path]:
-        """Return directories that may contain KiCad .pretty libraries.
-
-        Some Linux installations work without a user fp-lib-table. In that
-        case, footprint discovery should still work by scanning the standard
-        KiCad footprint roots directly.
-        """
+        """Return existing directories that may contain ``*.pretty`` libraries."""
         roots: List[Path] = []
         for env_name in (
             "KICAD10_FOOTPRINT_DIR",
@@ -227,38 +243,38 @@ class LibraryManager:
                 Path.home() / "Documents" / "KiCad" / "footprints",
             ]
         )
-
+        roots.extend(root / "share" / "kicad" / "footprints" for root in kicad_install_roots())
         if self.project_path:
             roots.append(self.project_path)
 
-        unique_roots: List[Path] = []
+        unique: List[Path] = []
         seen: set[str] = set()
         for root in roots:
-            key = str(root)
-            if key in seen:
+            try:
+                key = str(root.resolve()).casefold()
+            except OSError:
+                key = str(root).casefold()
+            if key in seen or not root.is_dir():
                 continue
             seen.add(key)
-            if root.is_dir():
-                unique_roots.append(root)
-        return unique_roots
+            unique.append(root)
+        return unique
 
     def _discover_pretty_libraries(self) -> int:
-        """Index .pretty directories when fp-lib-table metadata is unavailable."""
+        """Index footprint directories even when fp-lib-table is missing."""
         discovered = 0
         for root in self._candidate_footprint_roots():
             try:
                 pretty_dirs = sorted(path for path in root.glob("*.pretty") if path.is_dir())
             except OSError:
-                logger.debug(f"Failed to scan footprint root: {root}", exc_info=True)
+                logger.debug("Failed to scan footprint root: %s", root, exc_info=True)
                 continue
-
             for pretty_dir in pretty_dirs:
                 nickname = pretty_dir.stem
                 if nickname in self.libraries:
                     continue
                 self.libraries[nickname] = str(pretty_dir)
                 discovered += 1
-
         return discovered
 
     def _find_kicad_3rdparty_dir(self) -> Optional[str]:
@@ -273,10 +289,11 @@ class LibraryManager:
         import json
 
         # 1. Check shell environment variable first
-        if "KICAD9_3RD_PARTY" in os.environ:
-            path = os.environ["KICAD9_3RD_PARTY"]
-            if os.path.isdir(path):
-                return path
+        for var in ("KICAD10_3RD_PARTY", "KICAD9_3RD_PARTY", "KICAD8_3RD_PARTY", "KICAD_3RD_PARTY"):
+            if var in os.environ:
+                path = os.environ[var]
+                if os.path.isdir(path):
+                    return path
 
         # 2. Check kicad_common.json for user-defined variables
         kicad_common_paths = [

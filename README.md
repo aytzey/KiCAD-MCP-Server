@@ -2,6 +2,17 @@
 
 https://github.com/mixelpixx/KiCAD-MCP-Server/discussions/73
 
+> ## 🚀 Meet Konnect — the next generation
+>
+> **[Konnect](https://github.com/mixelpixx/Konnect)** is this project rebuilt from
+> scratch in Rust as a native KiCAD 10 plugin: a single binary with no runtime
+> dependencies, built on KiCAD's official IPC API instead of SWIG, with 171 tools,
+> bundled Claude skills and agents, design-review audits, and a manufacturing
+> pipeline. It's where new development happens — licensed AGPL-3.0 (free for
+> individuals and open source; commercial licenses available for businesses).
+>
+> This Python/TypeScript server remains fully open (MIT) and maintained.
+
 # KiCAD MCP Server
 
 A Model Context Protocol (MCP) server that enables AI assistants like Claude to interact with KiCAD for PCB design automation. Built on the MCP 2025-06-18 specification, this server provides comprehensive tool schemas and real-time project state access for intelligent PCB design workflows.
@@ -12,8 +23,8 @@ The [Model Context Protocol](https://modelcontextprotocol.io/) is an open standa
 
 **Key Capabilities:**
 
-- 122 tools across 16 categories with JSON Schema validation
-- Smart tool discovery with router pattern (reduces AI context by 70%)
+- 182 tools across 16 categories with JSON Schema validation
+- Keyword tool discovery via `search_tools` / `get_category_tools`
 - 8 dynamic resources exposing project state
 - Complete schematic workflow with 27 tools and dynamic symbol loading (~10,000 symbols)
 - Freerouting autorouter integration (Java, Docker, or Podman)
@@ -28,6 +39,280 @@ The [Model Context Protocol](https://modelcontextprotocol.io/) is an open standa
 ## Try out Arduino MCP - now you can get Claude to help in the IDE, real time!:
 
 https://github.com/mixelpixx/arduino-ide
+
+## What's New in v2.7.0
+
+### The bridge no longer crosses its wires
+
+The Node-Python protocol had no request IDs: after one timeout, the next
+command was silently resolved with the _previous_ command's late result, and
+every response after that was off by one. Tool calls now carry an ID that
+Python echoes back; stale responses are discarded instead of mis-delivered
+(#373). The MCP transport also connects before Python spawns, so clients no
+longer stack up against a silent server for up to two minutes during pcbnew
+warm-up (#377).
+
+### Two file-corruption classes fixed
+
+`add_symbol_property` dropped a closing paren on every call and could splice
+a unit symbol into a top-level sibling (#362, @karu2003). And S-expression
+escaping is now symmetric: reads (#336) and writes (#324) share one
+escape-aware implementation, so a property value containing `\"` survives a
+round-trip — 419 of KiCad's own stock symbol files carry such values.
+
+### 8 new tools
+
+- **Validation**: `validate_schematic`, `validate_symbol_library` — locate
+  structural damage with line/column, confirmed via `kicad-cli` on a copy.
+- **Library tables**: `list_library_table`, `remove_library_table_entry`,
+  `set_library_table_uri` — the missing CRUD around `register_*_library`.
+- **Symbol editing**: `set_symbol_pin_type` (bulk pin type fixes with
+  dry-run), `find_duplicate_symbols` (the same part stored twice).
+- **Back-annotation**: `backannotate_footprints` — PCB footprint choices
+  flow back to the schematic, the reverse of `sync_schematic_to_board`.
+
+All by @karu2003. With #359 (@AmirF194) registering 15 existing symbol tools,
+`search_tools` now indexes 157 routed tools in 16 categories.
+
+### Quality of life
+
+- `autoroute` stages its `.dsn`/`.ses` work files in a temp directory and
+  cleans up on every exit — no more litter next to your board, no stale-SES
+  imports, and a killed run says "terminated externally" instead of
+  `exit code 4294967295` (#249, scoped by @Dewieinns' traces).
+- Placed symbols inherit the library's default Footprint (#300,
+  implementation by @stefangordon).
+- `add_layer` actually adds inner copper layers (#222) — it previously wrote
+  to non-copper layer IDs and renamed F.SilkS.
+- `sync_schematic_to_board` matches by symbol UUID, not just refdes (#250).
+- JLCPCB tools decode the new upstream `source-db-v2` schema (#352,
+  @stefanobaldo) and degrade gracefully when the parts DB is unavailable
+  (#264, @fage2022).
+- `setup-macos.sh --verify` now fails when Python requirements are missing
+  instead of passing on a server that cannot start (#350, @francisrath).
+
+Full details in the [CHANGELOG](CHANGELOG.md).
+
+## What's New in v2.6.0
+
+### A session-killing bug is fixed
+
+Deleting anything from a board — a component, a trace, a board outline —
+worked exactly once. The next operation, even a pure read, failed with a
+`SwigPyObject` error, and only `close_project` then `open_project` recovered.
+`BOARD.Remove()` hands C++ ownership to Python, so dropping the reference ran
+a destructor on an object KiCad still pointed at, corrupting SWIG state
+process-wide. Six call sites were affected; all now use `BOARD.Delete()`.
+
+### 10 new tools
+
+- **Vendor PCB import**: `import_pcb` converts PADS, Altium, Eagle, CADSTAR,
+  Fabmaster, P-CAD, SolidWorks PCB and binary Cadence Allegro `.brd` files via
+  KiCad 10's native importer.
+- **Hierarchical schematics**: `remove_hierarchical_sheet`,
+  `set_sheet_property`, `get_sheet_properties`, and `hierarchical_place` for
+  arranging footprints by schematic hierarchy.
+- **Schematic lint and repair**: `lint_offgrid` finds and safely snaps
+  off-grid geometry that silently breaks junction placement;
+  `repair_flat_symbols` fixes SnapEDA/SamacSys symbols that crash kicad-skip;
+  `lint_schematic_cosmetic` tidies pin names and label orientation.
+- **Board origins**: `set_board_origin` / `get_board_origin`.
+
+### Your `.kicad_pro` net classes stop disappearing
+
+Board saves no longer let pcbnew serialize a stale in-memory project model
+over your hand-edited net classes and `netclass_patterns`. Opening a project
+no longer rewrites the file at all.
+
+### Breaking: schematic tools fail loudly on an unparseable sheet
+
+Tools that used to return partial or empty results now return a structured
+`schematic_load_failed` error naming the offending symbols. Silently skipping
+a broken sheet produced an incomplete pad-to-net map reported as success,
+which is worse. `repair_flat_symbols` fixes the usual cause. See
+[KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md) section 7.
+
+Full details in the [CHANGELOG](CHANGELOG.md).
+
+## What's New in v2.5.0
+
+### 20 new board-lifecycle and geometry tools
+
+- **Lifecycle**: `open_board`, `reload_board`, `save_board`, `save_as`,
+  `is_dirty`, `discard_or_reload`, `create_board_from_schematic`.
+- **Graphics editing**: `clear_board_outline`, `replace_board_outline`,
+  `list_graphics`, `delete_graphic`, `update_graphic`, `move_footprint_text`.
+- **Geometry queries**: `batch_move_components`, `get_component_geometry`,
+  `get_pads`, `get_net_pads`, `get_ratsnest`, `estimate_airwire_lengths`,
+  `check_placement_clearance`.
+
+All of them respect backend session pinning, so a board saved while KiCad's
+GUI owns the session routes to the GUI rather than writing a stale in-memory
+copy — including the awkward case where `save_as` changes the board's
+identity mid-session.
+
+### Formatting is normalized and enforced
+
+- `pre-commit run --all-files` (black, isort, prettier, flake8, mypy, eslint)
+  is now a real CI gate, which is what CONTRIBUTING has always claimed.
+- `npm run lint` used to run `black` in **write** mode against whatever
+  `black` was on `PATH`, silently reformatting your working tree with a
+  version that disagreed with CI. It now checks only; `npm run format:py` is
+  the write path.
+- The README's tool count is pinned to the registry by a test, so it
+  self-corrects instead of drifting.
+
+Full details in the [CHANGELOG](CHANGELOG.md).
+
+## What's New in v2.4.1
+
+### Three tools that were registered but had no backend now work
+
+- `assign_net_to_class`, `check_clearance` and `set_layer_constraints` each had
+  a full schema and a router entry but no dispatch handler, so every call
+  returned `Unknown command`. Found by a documentation-coverage audit.
+- Per-layer constraints are written to a project-scoped `.kicad_dru`
+  custom-rules file, which `kicad-cli pcb drc` and the GUI both pick up — there
+  is no pcbnew API for them.
+
+### Silent failures removed
+
+- `autoroute` was abandoned by the Node bridge at 30 s while Freerouting was
+  still running, reporting failure against a valid `.ses` that existed on disk.
+  Its timeout now derives from the `timeout` and `attempts` you pass.
+- `get_board_2d_view` omitted `--layers` entirely when no layers were given,
+  and KiCad 9+ then refuses the export — producing no file at all.
+- `create_zone` raised `AttributeError` on every call over the IPC backend.
+
+### New part-sourcing tools
+
+- `search_parts_registry` / `get_registry_part` / `download_registry_part`
+  reuse a verified existing footprint or symbol instead of generating one.
+  Downloads are host-allowlisted, extension-checked and size-capped.
+- `get_jlcpcb_part` returns live stock and tiered pricing when JLCPCB Open
+  Platform credentials are configured, falling back to the local snapshot.
+
+### CI now actually runs the test suite
+
+- The Python job had been a no-op in four independent ways, and Actions was
+  disabled repo-wide — 32 failed runs and 0 successes across the project's
+  whole history. All 1551 Python and 63 TypeScript tests now gate every push.
+
+Full details in the [CHANGELOG](CHANGELOG.md).
+
+## What's New in v2.4.0
+
+### Symbol library management
+
+- `import_symbol` / `export_symbol` / `rename_symbol` copy a symbol between
+  `.kicad_sym` libraries, extract one to a standalone file, and rename a
+  symbol including its sub-symbol shards and any `(extends ...)` references
+  from derived symbols in the same library.
+- `add_symbol_property` and `add_library_symbol_property` set custom BOM
+  fields (Manufacturer, MPN, LCSC, ...) on a library symbol or on a
+  schematic's cached definition.
+- `update_symbol_from_library` refreshes cached `lib_symbols` definitions
+  across one schematic, a list, or every project under a directory —
+  the programmatic equivalent of KiCad's Update Symbol from Library.
+- `replace_instance_lib_ids` swaps `lib_id` references per an explicit
+  old-to-new mapping, for migrating a schematic between libraries.
+
+### Faster symbol discovery
+
+- Library directories, resolved paths, extracted symbol blocks, and parsed
+  symbol lists are now cached process-wide instead of being rebuilt for every
+  component add. Staleness guards revalidate paths and track source `mtime_ns`,
+  and the mutating write paths clear the caches explicitly.
+
+### Fixes that restore basic operation
+
+- Every `.kicad_sym` and schematic write raised `TypeError` on Python 3.9, the
+  project's declared floor — `Path.write_text` did not accept `newline` until
+  3.10.
+- JLCPCB part search could not find hyphenated MPNs.
+- Eagle import wrote a KiCad 9 schematic header; it now writes the KiCad 10
+  header, verified against real `kicad-cli` 10.0.
+- Component placement snaps to the 1.27 mm grid, `import_ses` no longer
+  creates phantom slashless nets, and `export_dsn`/`autoroute` keep
+  `.kicad_pro` net classes.
+
+Full details in the [CHANGELOG](CHANGELOG.md).
+
+## What's New in v2.3.1
+
+### Eagle schematic import
+
+- `import_eagle_schematic` converts Eagle `.sch` XML designs to KiCad format
+  with symbol mapping, net wires, multi-gate parts, dangling-wire pruning,
+  and ground-truth ERC reporting via `kicad-cli`.
+
+### 3D model tools and interactive reload
+
+- `add_component_3d_model` / `remove_component_3d_model` for attaching
+  STEP/WRL models to footprints.
+- Opt-in `KICAD_INTERACTIVE_SCHEMATIC=1` auto-confirms KiCad's reload dialog
+  on Windows after schematic writes.
+
+### Scaffolding cluster complete
+
+- New projects start blank (no `_TEMPLATE_*` symbols leaked into user files).
+- `.kicad_pro` files match what KiCad itself writes.
+- Format version `20260101` ensures all KiCad 10.0.x builds can open
+  generated schematics.
+
+### KiCad 10 compatibility
+
+- Derived symbols in `.kicad_symdir` libraries resolve their parent from
+  sibling shards.
+- Unified install discovery finds relocated Windows installs via registry.
+- User env-var placeholders from `kicad_common.json` are resolved in library
+  paths.
+- Phantom cross-unit pin reports in `get_wire_connections` are eliminated.
+
+Full details in the [CHANGELOG](CHANGELOG.md).
+
+## What's New in v2.3.0
+
+### Schematic corruption on KiCad 10 — both mechanisms fixed
+
+- **Complete instance blocks**: placed components now carry the real project
+  name, root-sheet uuid path, per-pin uuid entries (ERC can bind wires to
+  pins), and the full KiCad 10 field set — verified byte-equivalent to what
+  eeschema itself writes. Previously, dragging or editing a placed symbol
+  could crash KiCad.
+- **Canonical multi-line writes**: schematic tools no longer minify the whole
+  file onto one line. Tool writes now match eeschema's "Save" byte-for-byte,
+  with a self-check on every write that can never corrupt data. Already-
+  minified files are repairable with `scripts/kicad_sch_reformat.py`.
+
+### Your edits are protected
+
+- **Backend session pinning**: a loaded project stays on one backend
+  (SWIG or IPC) for its whole lifecycle — saves can no longer silently route
+  to a stale GUI board and lose your edits.
+- **External-edit guard**: `save_project` refuses to overwrite a board file
+  whose contents changed on disk since load (pass `force: true` to override).
+- **`close_project`** (new tool): release the project so files can be edited
+  directly, then reopen — no more restart choreography.
+
+### Works on a stock Windows install
+
+- `kicad-cli` and 7-Zip are resolved from their install locations even when
+  not on PATH — un-breaking exports, ERC/DRC, netlists, board views, and the
+  JLCPCB database download, each with actionable errors when truly missing.
+
+### New layout tools
+
+- `suggest_placement`: connectivity-driven PCB placement optimizer (dry-run
+  by default, deterministic).
+- `suggest_schematic_declutter`: re-orients overlapping net labels without
+  touching connectivity.
+
+Plus KiCad 10 compatibility fixes (sheet renames, sharded `.kicad_symdir`
+libraries, IPC `Box2` board size), correct pin geometry for rotated+mirrored
+and multi-unit symbols, bounded IPC connects with SWIG fallback, and a real
+Vitest suite for the TypeScript layer. Full details in the
+[CHANGELOG](CHANGELOG.md).
 
 ## What's New in v2.2.3
 
@@ -160,7 +445,7 @@ connections = ConnectionManager.get_net_connections(sch, "VCC", sch_path)
 - Net connectivity: 100% accurate (VCC: 2 connections, GND: 4 connections)
 - Netlist generation: Working with accurate pin-level connections
 
-See [Schematic Tools Reference](docs/SCHEMATIC_TOOLS_REFERENCE.md) for the complete schematic tool documentation.
+See [Schematic Tools Reference](docs/SCHEMATIC_TOOLS_REFERENCE.md) for the complete schematic tool documentation, and the [Headless Authoring Guide](docs/HEADLESS_AUTHORING.md) for field-tested practice driving these tools without the KiCad GUI.
 
 ### IPC Backend (Experimental)
 
@@ -169,24 +454,30 @@ We are currently implementing and testing the KiCAD 9.0 IPC API for real-time UI
 - Changes made via MCP tools appear immediately in the KiCAD UI
 - No manual reload required when IPC is active
 - Hybrid backend: uses IPC when available, falls back to SWIG API
+- IPC runtime reconnect: if MCP has fallen back to SWIG, IPC-capable board
+  tools retry IPC after KiCAD launches instead of staying on SWIG for the entire
+  session
 - 20+ commands now support IPC including routing, component placement, and zone operations
 
 Note: IPC features are under active development and testing. Enable IPC in KiCAD via Preferences > Plugins > Enable IPC API Server.
+
+For OpenCode on Windows, the backend can be configured as `auto`, `ipc`, or
+`swig` during setup. See [OpenCode (Windows)](#opencode-windows) for the
+configuration command and backend options.
 
 ### Tool Discovery & Router Pattern
 
 We've implemented an intelligent tool router to keep AI context efficient while maintaining full functionality:
 
-- **18 direct tools** always visible for high-frequency operations
-- **65 routed tools** organized into 8 categories (board, component, export, drc, schematic, library, routing, autoroute)
-- **35 additional tools** always visible (symbol/footprint creators, JLCPCB, datasheet, advanced routing)
+- **22 direct tools** always visible for high-frequency operations
+- **157 routed tools** organized into 16 categories (board, component, export, drc, schematic, library, symbol_library, symbol_pins, schematic_hierarchy, schematic_layout, schematic_batch, routing, manufacturing, autoroute, validation, parts-registry)
 - **4 router tools** for discovery and execution:
   - `list_tool_categories` - Browse all available categories
   - `get_category_tools` - View tools in a specific category
   - `search_tools` - Find tools by keyword
   - `execute_tool` - Run any tool with parameters
 
-**Why this matters:** By organizing tools into discoverable categories, Claude can intelligently find and use the right tool for your task without loading all 122 tool schemas into every conversation. This reduces context consumption while maintaining full access to all functionality.
+**Why this matters:** By organizing tools into discoverable categories, Claude can intelligently find and use the right tool for your task without loading all 182 tool schemas into every conversation. This reduces context consumption while maintaining full access to all functionality.
 
 **Usage is seamless:** Just ask naturally - "export gerber files" or "add mounting holes" - and Claude will discover and execute the appropriate tools automatically.
 
@@ -249,7 +540,7 @@ Access project state without executing tools:
 
 ## Available Tools
 
-The server provides **122 tools** organized into 16 functional categories. With the router pattern, tools are automatically discovered as needed -- just ask Claude what you want to accomplish.
+The server exposes every tool directly, so your assistant can call any of them without a discovery step -- just ask for what you want to accomplish. **157 routed tools** are additionally indexed into 16 functional categories, so `search_tools` and `get_category_tools` can find one by keyword.
 
 For the complete tool reference with access types (direct/routed/additional), see [Tool Inventory](docs/TOOL_INVENTORY.md).
 
@@ -319,8 +610,10 @@ Complete schematic workflow with dynamic symbol loading (~10,000 symbols) and in
 
 - `add_schematic_component` - Place symbols from any KiCad library
 - `delete_schematic_component` - Remove component
-- `edit_schematic_component` - Edit properties and fields
-- `get_schematic_component` - Get component info with field positions
+- `edit_schematic_component` - Edit footprint, value, reference, label positions, and **arbitrary custom properties** (MPN, Manufacturer, DigiKey_PN, LCSC, Voltage, Tolerance, Dielectric, …) in one batched call
+- `set_schematic_component_property` - Add or update a single custom property (BOM/sourcing field) on a component
+- `remove_schematic_component_property` - Delete a single custom property from a component
+- `get_schematic_component` - Inspect every field on a component (built-in + custom) including label positions
 - `list_schematic_components` - List all components
 - `move_schematic_component` - Reposition component
 - `rotate_schematic_component` - Rotate component
@@ -355,7 +648,7 @@ See [Schematic Tools Reference](docs/SCHEMATIC_TOOLS_REFERENCE.md) for details a
 - `set_design_rules` / `get_design_rules` - Configure and inspect rules
 - `run_drc` - Execute design rule check
 - `get_drc_violations` - Get violation list by severity
-- `add_net_class` / `assign_net_to_class` - Net class management
+- `create_netclass` / `assign_net_to_class` - Net class management
 - `set_layer_constraints` / `check_clearance` - Layer and clearance rules
 
 ### Export (8 tools)
@@ -417,7 +710,7 @@ See [Freerouting Guide](docs/FREEROUTING_GUIDE.md) for setup and usage.
 
 ### Required Software
 
-**KiCAD 9.0 or Higher**
+**KiCAD 9.0 or higher**
 
 - Download from [kicad.org/download](https://www.kicad.org/download/)
 - Must include Python module (pcbnew)
@@ -431,9 +724,9 @@ See [Freerouting Guide](docs/FREEROUTING_GUIDE.md) for setup and usage.
 - Download from [nodejs.org](https://nodejs.org/)
 - Verify: `node --version` and `npm --version`
 
-**Python 3.10 or Higher**
+**Python 3.9 or Higher**
 
-- Usually included with KiCAD
+- Comes bundled with KiCAD (macOS builds ship Python 3.9; Linux/Windows builds ship Python 3.11)
 - Required packages (auto-installed):
   - kicad-python (kipy) >= 0.5.0 (IPC API support, optional but recommended)
   - kicad-skip >= 0.1.0 (schematic support)
@@ -450,6 +743,7 @@ Choose one:
 - [Claude Desktop](https://claude.ai/download) - Official Anthropic desktop app
 - [Claude Code](https://docs.claude.com/claude-code) - Official CLI tool
 - [Cline](https://github.com/cline/cline) - VSCode extension
+- [OpenCode](https://opencode.ai/) - Terminal-based AI coding agent with MCP support
 
 ### Supported Platforms
 
@@ -462,7 +756,7 @@ Choose one:
 ### Linux (Ubuntu/Debian)
 
 ```bash
-# Install KiCAD 9.0
+# Install KiCAD 9.0 or higher
 sudo add-apt-repository --yes ppa:kicad/kicad-9.0-releases
 sudo apt-get update
 sudo apt-get install -y kicad kicad-libraries
@@ -494,7 +788,9 @@ cd KiCAD-MCP-Server
 
 The script will:
 
-- Detect KiCAD installation
+- Detect KiCAD installations, including both machine-wide installs under
+  `C:\Program Files\KiCad` and per-user installs under
+  `%LOCALAPPDATA%\Programs\KiCad`
 - Verify prerequisites
 - Install dependencies
 - Build project
@@ -506,7 +802,9 @@ See [Windows Installation Guide](docs/WINDOWS_SETUP.md) for detailed instruction
 
 ### macOS
 
-**Important:** On macOS, use KiCAD's bundled Python to ensure proper access to pcbnew module.
+**Important:** On macOS, use KiCAD's bundled Python to ensure proper access to the `pcbnew` module.
+
+#### Manual Setup
 
 ```bash
 # Install KiCAD 9.0 from kicad.org/download/macos
@@ -530,7 +828,142 @@ pip install -r requirements.txt
 npm run build
 ```
 
-**Note:** The `--system-site-packages` flag is required to access KiCAD's pcbnew module from the virtual environment.
+**Note:** The `--system-site-packages` flag is required to access KiCAD's `pcbnew` module from the virtual environment.
+
+**Note:** If you skip the virtual environment, install the requirements with KiCAD's bundled interpreter — a plain `pip3 install -r requirements.txt` goes to system Python, which the server never uses, and the server then fails to start (the MCP client times out after 30s with no visible error):
+
+```bash
+/Applications/KiCad/KiCad.app/Contents/Frameworks/Python.framework/Versions/Current/bin/python3 \
+  -m pip install --user -r requirements.txt
+```
+
+#### Automated Setup
+
+To simplify configuration with Claude Desktop, this repository provides a macOS setup script:
+
+```bash
+./setup-macos.sh
+```
+
+In case of error `zsh: permission denied: ./setup-macos.sh` you can either:
+
+- always allow the script to be executed by running: `chmod +x setup-macos.sh`.
+- alternatively explicitly run it with bash: `bash setup-macos.sh` so no chmod change needed.
+
+This script does **not replace the manual setup above** — it assumes dependencies are already installed and the project is built. Instead, it automates:
+
+- detection of your environment (Node.js, KiCad Python, `pcbnew`)
+- resolving the correct macOS `PYTHONPATH`
+- generating the correct Claude Desktop MCP configuration
+- safely merging the configuration into your existing Claude config
+- optionally writing the configuration with backup support
+
+##### Basic Usage
+
+###### Verify setup (no changes)
+
+```bash
+./setup-macos.sh --verify
+```
+
+###### Preview configuration (dry run)
+
+```bash
+./setup-macos.sh --dry-run
+```
+
+###### Apply configuration
+
+```bash
+./setup-macos.sh --apply
+```
+
+After applying, restart Claude Desktop.
+
+##### Parameters
+
+###### Required parameters
+
+None. The script works out-of-the-box using sensible defaults.
+
+###### Optional parameters
+
+##### `--name NAME`
+
+Specify the MCP server name in Claude Desktop.
+
+Default:
+
+```text
+kicad
+```
+
+Example:
+
+```bash
+./setup-macos.sh --apply --name kicad-dev
+```
+
+Use this when:
+
+- running multiple MCP configurations
+- testing forks or development versions
+- avoiding overwriting an existing setup
+
+##### `--claude-config PATH`
+
+Specify a custom Claude Desktop configuration file.
+
+Default:
+
+```text
+~/Library/Application Support/Claude/claude_desktop_config.json
+```
+
+Example:
+
+```bash
+./setup-macos.sh --dry-run --claude-config ~/tmp/claude_config.json
+```
+
+Use this when:
+
+- testing configurations safely
+- using non-standard config locations
+- debugging without modifying your main setup
+
+##### `--yes`
+
+Skip confirmation prompt when applying changes.
+
+Example:
+
+```bash
+./setup-macos.sh --apply --yes
+```
+
+##### After Setup
+
+1. Fully quit Claude Desktop
+2. Reopen Claude Desktop
+3. Open a new chat
+4. Click **+ → Connectors**
+5. Verify the server appears (e.g. `kicad` or your custom name)
+
+Test with prompt in Claude Desktop:
+
+```text
+Use the kicad MCP server to run check_kicad_ui.
+```
+
+##### Notes
+
+- The script only modifies the `mcpServers` section and leaves all other configuration untouched
+- Existing configurations are automatically backed up before changes
+- macOS support relies on KiCad’s bundled Python; system Python will not work correctly
+- If KiCad is updated or moved, re-run the script to refresh paths
+
+---
 
 ## Configuration
 
@@ -538,7 +971,8 @@ npm run build
 
 Edit configuration file:
 
-- **Linux/macOS:** `~/.config/Claude/claude_desktop_config.json`
+- **Linux:** `~/.config/Claude/claude_desktop_config.json`
+- **macOS:** `~/Library/Application Support/Claude/claude_desktop_config.json`
 - **Windows:** `%APPDATA%\Claude\claude_desktop_config.json`
 
 **Configuration:**
@@ -561,8 +995,9 @@ Edit configuration file:
 **Platform-specific PYTHONPATH:**
 
 - **Linux:** `/usr/lib/kicad/lib/python3/dist-packages`
-- **Windows:** `C:\Program Files\KiCad\9.0\lib\python3\dist-packages`
-- **macOS:** `/Applications/KiCad/KiCad.app/Contents/Frameworks/Python.framework/Versions/3.11/lib/python3.11/site-packages`
+- **Windows:** `C:\Program Files\KiCad\10.0\lib\python3\dist-packages` or
+  `%LOCALAPPDATA%\Programs\KiCad\10.0\lib\python3\dist-packages`
+- **macOS:** `/Applications/KiCad/KiCad.app/Contents/Frameworks/Python.framework/Versions/3.9/lib/python3.9/site-packages`
 
 #### Linux Python Detection
 
@@ -602,6 +1037,18 @@ which python3  # Example output: /usr/bin/python3
 python3 -c "import pcbnew; print(pcbnew.GetBuildVersion())"  # Verify pcbnew access
 ```
 
+### GitHub Copilot (VS Code)
+
+Copy the template to your workspace:
+
+```bash
+cp config/vscode-mcp.example.json .vscode/mcp.json
+```
+
+VS Code will auto-detect `.vscode/mcp.json` and register the server. The template uses `${workspaceFolder}` so no path editing is needed.
+
+> **Note:** `.vscode/mcp.json` is listed in `.gitignore` — your local configuration won't be committed.
+
 ### Cline (VSCode)
 
 Edit: `~/.config/Code/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json`
@@ -610,7 +1057,191 @@ Use the same configuration format as Claude Desktop above.
 
 ### Claude Code
 
-Claude Code automatically detects MCP servers in the current directory. No additional configuration needed.
+Claude Code does **not** read the Claude Desktop configuration file, and it only auto-detects servers listed in a project's `.mcp.json` (this repository does not ship one). Register the server explicitly with `claude mcp add`:
+
+```bash
+# macOS example — adjust KICAD_PYTHON/PYTHONPATH per platform (see table above)
+claude mcp add --scope user kicad \
+  --env KICAD_PYTHON=/Applications/KiCad/KiCad.app/Contents/Frameworks/Python.framework/Versions/Current/bin/python3 \
+  --env PYTHONPATH=/Applications/KiCad/KiCad.app/Contents/Frameworks/Python.framework/Versions/3.9/lib/python3.9/site-packages \
+  --env LOG_LEVEL=info \
+  -- node /path/to/KiCAD-MCP-Server/dist/index.js
+```
+
+With `--scope user` the server is available in every project; use `--scope project` to write a shareable `.mcp.json` instead. On macOS, `setup-macos.sh` prints this command with the detected paths filled in.
+
+Verify with `claude mcp list` — the server should report ✔ Connected.
+
+### OpenCode (Windows)
+
+OpenCode uses a different MCP configuration schema than Claude Desktop. Use
+`setup-windows-opencode.ps1` to verify the local setup and write the correct
+OpenCode `mcp` entry.
+
+OpenCode project configuration is written to `opencode.json` in the target
+project root. The script keeps the KiCAD MCP server repository separate from the
+target project:
+
+- `McpServerPath` is this repository, where `dist/index.js` is built
+- `ProjectPath` is the project that should receive `opencode.json`
+
+**When this is useful:**
+
+- You use [OpenCode](https://opencode.ai/) as your MCP client on Windows
+- You want a project-local MCP server available only in one project
+- You want a global OpenCode MCP server available from any workspace
+- You need to verify KiCAD Python (`pcbnew`), Node.js, and `dist/index.js`
+  before changing OpenCode configuration
+
+#### Backend selection
+
+The setup script supports three KiCAD backend preferences via `-Backend`:
+
+- `auto` - try IPC first and fall back to SWIG if IPC is unavailable (default)
+- `ipc` - require KiCAD IPC for real-time UI synchronization
+- `swig` - use the file-based `pcbnew` backend
+
+Examples:
+
+```powershell
+.\setup-windows-opencode.ps1 -Apply -Scope project -Backend auto
+.\setup-windows-opencode.ps1 -Apply -Scope project -Backend ipc
+.\setup-windows-opencode.ps1 -Apply -Scope project -Backend swig
+```
+
+For `-Backend ipc`, KiCAD must be running with the IPC API server enabled.
+
+#### Verify setup without changes
+
+Use this first when diagnosing installation or path problems. It detects KiCAD,
+tests `pcbnew`, checks Node.js, and verifies the built MCP entrypoint.
+
+```powershell
+.\setup-windows-opencode.ps1 -Verify -SkipInstall -SkipBuild
+```
+
+#### Preview OpenCode configuration
+
+Use dry run mode when you want to inspect the exact JSON before writing it.
+
+```powershell
+.\setup-windows-opencode.ps1 -DryRun -SkipInstall -SkipBuild
+```
+
+Example generated OpenCode shape:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "kicad": {
+      "type": "local",
+      "command": ["node", "C:\\path\\to\\KiCAD-MCP-Server\\dist\\index.js"],
+      "environment": {
+        "NODE_ENV": "production",
+        "LOG_LEVEL": "info",
+        "KICAD_AUTO_LAUNCH": "false",
+        "KICAD_MCP_DEV": "0",
+        "KICAD_BACKEND": "auto",
+        "PYTHONPATH": "C:\\Program Files\\KiCad\\10.0\\bin\\Lib\\site-packages"
+      },
+      "enabled": true,
+      "timeout": 30000
+    }
+  }
+}
+```
+
+A copyable template is also provided at `config/opencode.json`. Replace the
+placeholder paths before using it directly.
+
+#### Apply project-local configuration
+
+Use this when you only want KiCAD MCP enabled for one project. The script writes
+`opencode.json` in the target project root and backs up an existing file before
+changing it.
+
+```powershell
+.\setup-windows-opencode.ps1 -Apply -Scope project
+```
+
+By default, `ProjectPath` is the current working directory.
+
+To configure another project, pass `-ProjectPath`:
+
+```powershell
+.\setup-windows-opencode.ps1 -Apply -Scope project -ProjectPath "C:\path\to\your-project"
+```
+
+If the setup script is not located in the KiCAD MCP Server repository, pass
+`-McpServerPath` so the generated config points to the correct `dist/index.js`:
+
+```powershell
+.\setup-windows-opencode.ps1 `
+  -Apply `
+  -Scope project `
+  -ProjectPath "C:\path\to\your-project" `
+  -McpServerPath "C:\path\to\KiCAD-MCP-Server"
+```
+
+#### Apply global OpenCode configuration
+
+Use this when you want the KiCAD MCP server available from any OpenCode
+workspace. The script writes `%USERPROFILE%\.config\opencode\opencode.json`.
+
+```powershell
+.\setup-windows-opencode.ps1 -Apply -Scope global
+```
+
+#### Use a custom MCP server name
+
+Use this when testing multiple forks or keeping separate development and stable
+KiCAD MCP entries.
+
+```powershell
+.\setup-windows-opencode.ps1 -Apply -Scope project -Name kicad-dev
+```
+
+#### Use a custom KiCAD installation path
+
+Use this when KiCAD is installed outside the standard Windows locations.
+
+```powershell
+.\setup-windows-opencode.ps1 -Apply -Scope project -KiCadRoot "D:\Apps\KiCad\10.0"
+```
+
+#### Skip install or build steps
+
+Use these flags when dependencies are already installed or the project is
+already built.
+
+```powershell
+.\setup-windows-opencode.ps1 -Apply -Scope project -SkipInstall -SkipBuild
+```
+
+#### After applying configuration
+
+1. Fully quit OpenCode.
+2. Start OpenCode again so it reloads `opencode.json`.
+3. Ask OpenCode to use the `kicad` MCP server and run `check_kicad_ui`.
+
+#### Disable the OpenCode MCP server
+
+To disable the server without removing the full configuration, set the entry to
+`enabled: false` and restart OpenCode.
+
+```json
+{
+  "mcp": {
+    "kicad": {
+      "enabled": false
+    }
+  }
+}
+```
+
+If OpenCode is running, the MCP server process is managed by OpenCode and
+normally stops when OpenCode exits.
 
 ### JLCPCB Integration Setup (Optional)
 
@@ -672,6 +1303,23 @@ For users with JLCPCB enterprise accounts and order history:
 See [JLCPCB Usage Guide](docs/JLCPCB_USAGE_GUIDE.md) for detailed documentation.
 
 ## Usage Examples
+
+### Production-ready two-layer workflow
+
+The recommended production path combines routing-aware initial placement,
+deterministic multi-start placement and pin-facing rotation, constraint-first
+hybrid autorouting, KiCad DRC/QoR, and a gated fabrication package:
+
+```text
+Optimize this two-layer board with five placement starts, keeping connectors
+and mounting-constrained parts fixed. Apply the winning placement, route with
+CFHA using five Freerouting attempts, then run manufacturing readiness in hand
+assembly mode. Generate Gerbers, drill files, BOM, positions, checksums and ZIP
+only if every blocker is cleared. Never use allowUnsafe.
+```
+
+See the [Production-Ready Two-Layer PCB Workflow](docs/MANUFACTURING_READY_2LAYER.md)
+for limits, output structure, hand-vs-SMT behavior, and the release checklist.
 
 ### Basic PCB Design Workflow
 
@@ -806,8 +1454,8 @@ How many Basic parts are available?
 
 - **JSON-RPC 2.0 Transport:** Bi-directional communication via STDIO
 - **Protocol Version:** MCP 2025-06-18
-- **Capabilities:** Tools (122), Resources (8)
-- **Tool Router:** Intelligent discovery system with 8 categories
+- **Capabilities:** Tools (182), Resources (8)
+- **Tool Router:** Intelligent discovery system with 16 categories
 - **Error Handling:** Standard JSON-RPC error codes
 
 ### TypeScript Server (`src/`)
@@ -816,10 +1464,13 @@ How many Basic parts are available?
 - Manages Python subprocess lifecycle
 - Handles message routing and validation
 - Provides logging and error recovery
-- **Router System:**
+- **Discovery catalogue:**
   - `src/tools/registry.ts` - Tool categorization and lookup
-  - `src/tools/router.ts` - Discovery and execution tools
-  - Reduces AI context usage by 70% while maintaining full functionality
+  - `src/tools/router.ts` - `list_tool_categories`, `get_category_tools`, `search_tools`
+  - Search and browse only. It does not gate which tools reach the client, so
+    it saves no context; indirect execution was removed in 963a39c because it
+    caused schema hallucination. See
+    [ROUTER_ARCHITECTURE.md](docs/ROUTER_ARCHITECTURE.md).
 
 ### Python Interface (`python/`)
 
@@ -933,7 +1584,7 @@ npm run format
 **Solutions:**
 
 1. Run automated diagnostics: `.\setup-windows.ps1`
-2. Verify Python path uses double backslashes: `C:\\Program Files\\KiCad\\9.0`
+2. Verify Python path uses double backslashes: `C:\\Program Files\\KiCad\\10.0`
 3. Check Windows Event Viewer for Node.js errors
 4. See [Windows Troubleshooting Guide](docs/WINDOWS_TROUBLESHOOTING.md)
 
@@ -950,11 +1601,11 @@ npm run format
 
 ## Project Status
 
-**Current Version:** 2.2.3
+**Current Version:** 2.5.0
 
 See [STATUS_SUMMARY.md](docs/STATUS_SUMMARY.md) for the complete status matrix and [CHANGELOG.md](CHANGELOG.md) for detailed release notes.
 
-**Working Features (122 tools):**
+**Working Features (148 tools):**
 
 - Project management with snapshot checkpointing
 - Complete board design (outline, layers, zones, mounting holes, text, SVG logos)
@@ -963,10 +1614,12 @@ See [STATUS_SUMMARY.md](docs/STATUS_SUMMARY.md) for the complete status matrix a
 - Complete schematic workflow with dynamic symbol loading (~10,000 symbols)
 - Intelligent wiring system with pin discovery and smart routing
 - FFC/ribbon cable passthrough workflow
-- Schematic-to-board synchronization
+- Schematic-to-board synchronization, plus footprint back-annotation from the board
 - Design rule checking (DRC and ERC)
+- Structural validation of schematics and symbol libraries
 - Export to Gerber, PDF, SVG, 3D, BOM, netlist, position file
 - Custom footprint and symbol creation
+- Library table maintenance (list, remove and repoint symbol/footprint entries)
 - JLCPCB parts integration (2.5M+ parts catalog)
 - Datasheet enrichment via LCSC
 - Freerouting autorouter integration (Java, Docker, Podman)
@@ -975,12 +1628,22 @@ See [STATUS_SUMMARY.md](docs/STATUS_SUMMARY.md) for the complete status matrix a
 
 **IPC Backend (Experimental):**
 
-- Real-time UI synchronization via KiCAD 9.0 IPC API
+- Real-time UI synchronization via the KiCAD IPC API
 - 21 IPC-enabled commands with automatic SWIG fallback
 - Hybrid footprint loading (SWIG for library access, IPC for placement)
 
 **Developer Mode:**
 Set `KICAD_MCP_DEV=1` to capture MCP session logs for debugging. See CHANGELOG v2.2.3 for details.
+
+**Logging (`~/.kicad-mcp/logs/`):**
+Logs default to `INFO` and the file is size-capped so it can't grow without bound. Tune via the MCP server's environment:
+
+| Variable                            | Default            | Purpose                                                                              |
+| ----------------------------------- | ------------------ | ------------------------------------------------------------------------------------ |
+| `LOG_LEVEL` / `KICAD_MCP_LOG_LEVEL` | `info`             | Log verbosity (`error`/`warn`/`info`/`debug`, or `off`). `KICAD_MCP_LOG_LEVEL` wins. |
+| `KICAD_MCP_LOG_MAX_BYTES`           | `10485760` (10 MB) | Max size per log file before it rotates; `0` disables rotation.                      |
+| `KICAD_MCP_LOG_BACKUP_COUNT`        | `3`                | Number of rotated backups to keep.                                                   |
+| `KICAD_MCP_DEBUG_SKIP`              | unset              | Set to `1` to re-enable the verbose kicad-skip parser DEBUG logs (muted by default). |
 
 See [ROADMAP.md](docs/ROADMAP.md) for planned features.
 
@@ -1044,6 +1707,6 @@ If you use this project in your research or publication, please cite:
   author = {mixelpixx},
   year = {2025},
   url = {https://github.com/mixelpixx/KiCAD-MCP-Server},
-  version = {2.2.3}
+  version = {2.3.0}
 }
 ```

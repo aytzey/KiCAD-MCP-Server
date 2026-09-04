@@ -10,8 +10,67 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import pcbnew
 from PIL import Image
+from utils.kicad_cli import kicad_cli_not_found_message, resolve_kicad_cli
 
 logger = logging.getLogger("kicad_interface")
+
+
+def _svg_to_png(svg_path: str, width: int, height: int) -> Optional[bytes]:
+    """Convert SVG to PNG. No cffi dependency.
+
+    Priority:
+      1. pymupdf (fitz) — bundled MuPDF renderer, pure Python, no system deps
+      2. Inkscape CLI — accurate KiCAD SVG rendering
+      3. ImageMagick convert — broad availability fallback
+    Returns PNG bytes or None if all converters fail.
+    """
+    import subprocess
+    import tempfile
+
+    try:
+        import fitz
+
+        doc = fitz.open(svg_path)
+        page = doc[0]
+        mat = fitz.Matrix(width / page.rect.width, height / page.rect.height)
+        return page.get_pixmap(matrix=mat).tobytes("png")
+    except Exception:
+        pass
+
+    out_path = os.path.join(tempfile.mkdtemp(), "out.png")
+
+    try:
+        r = subprocess.run(
+            [
+                "inkscape",
+                svg_path,
+                "--export-type=png",
+                f"--export-width={width}",
+                f"--export-height={height}",
+                f"--export-filename={out_path}",
+            ],
+            capture_output=True,
+            timeout=60,
+        )
+        if r.returncode == 0 and os.path.exists(out_path):
+            with open(out_path, "rb") as f:
+                return f.read()
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+
+    try:
+        r = subprocess.run(
+            ["convert", "-density", "150", svg_path, "-resize", f"{width}x{height}", out_path],
+            capture_output=True,
+            timeout=60,
+        )
+        if r.returncode == 0 and os.path.exists(out_path):
+            with open(out_path, "rb") as f:
+                return f.read()
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+
+    return None
 
 
 class BoardViewCommands:
@@ -73,90 +132,174 @@ class BoardViewCommands:
             }
 
     def get_board_2d_view(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Get a 2D image of the PCB"""
+        """Render PCB to PNG/JPG/SVG via kicad-cli (no pcbnew/cffi dependency).
+
+        responseMode controls how the image is returned:
+        - "inline" (default): image bytes are base64-encoded and returned as ``imageData``.
+        - "file": image is written next to the .kicad_pcb file and ``filePath`` is returned.
+        """
+        import glob
+        import subprocess
+        import tempfile
+
         try:
-            if not self.board:
+            pcb_path = params.get("pcbPath")
+            if not pcb_path:
+                if self.board:
+                    pcb_path = self.board.GetFileName()
+                if not pcb_path:
+                    return {
+                        "success": False,
+                        "message": "pcbPath required",
+                        "errorDetails": "Provide pcbPath or load a board first",
+                    }
+
+            if not os.path.exists(pcb_path):
                 return {
                     "success": False,
-                    "message": "No board is loaded",
-                    "errorDetails": "Load or create a board first",
+                    "message": f"PCB file not found: {pcb_path}",
+                    "errorDetails": pcb_path,
                 }
 
-            # Get parameters
-            width = params.get("width", 800)
-            height = params.get("height", 600)
-            format = params.get("format", "png")
-            layers = params.get("layers", [])
+            width = params.get("width", 1600)
+            height = params.get("height", 1200)
+            fmt = params.get("format", "png")
+            if fmt not in ("png", "jpg", "svg"):
+                return {
+                    "success": False,
+                    "message": f"Unsupported format '{fmt}'. Use 'png', 'jpg', or 'svg'.",
+                    "errorDetails": f"Got: {fmt}",
+                }
+            # `pcb export svg` requires at least one layer on KiCad 9+ — omitting
+            # it fails with "At least one layer must be specified" and no output.
+            # Default to a readable 2D view (copper + silkscreen + board outline)
+            # when the caller doesn't specify layers.
+            layers: List[str] = params.get("layers") or [
+                "F.Cu",
+                "B.Cu",
+                "F.SilkS",
+                "B.SilkS",
+                "Edge.Cuts",
+            ]
+            response_mode = params.get("responseMode", "inline")
 
-            # Create plot controller
-            plotter = pcbnew.PLOT_CONTROLLER(self.board)
+            kicad_cli = resolve_kicad_cli()
+            if not kicad_cli:
+                return {
+                    "success": False,
+                    "message": kicad_cli_not_found_message(),
+                }
 
-            # Set up plot options
-            plot_opts = plotter.GetPlotOptions()
-            plot_opts.SetOutputDirectory(os.path.dirname(self.board.GetFileName()))
-            plot_opts.SetScale(1)
-            plot_opts.SetMirror(False)
-            # Note: SetExcludeEdgeLayer() removed in KiCAD 9.0 - default behavior includes all layers
-            plot_opts.SetPlotFrameRef(False)
-            plot_opts.SetPlotValue(True)
-            plot_opts.SetPlotReference(True)
+            with tempfile.TemporaryDirectory() as tmpdir:
+                # KiCad 10 changed `pcb export svg`:
+                #  - `--output` is now a FILE path, not a directory (a directory
+                #    fails with "Failed to create file '<dir>'").
+                #  - `--mode-single` is required to merge layers into one SVG
+                #    (the default multi-file behavior is deprecated).
+                # These flags also work on KiCad 8/9, so we always pass them.
+                output_svg = os.path.join(tmpdir, "board.svg")
+                cmd = [
+                    kicad_cli,
+                    "pcb",
+                    "export",
+                    "svg",
+                    "--output",
+                    output_svg,
+                    "--mode-single",
+                    "--black-and-white",
+                    # Render the board, not the drawing sheet. kicad-cli's
+                    # default (page-size-mode 0) plots only the area inside the
+                    # sheet, so board geometry past the page edge is left out.
+                    # Mode 2 sizes the output to the board's bounding box;
+                    # --exclude-drawing-sheet drops the title block.
+                    "--exclude-drawing-sheet",
+                    "--page-size-mode",
+                    "2",
+                ]
+                if layers:
+                    cmd += ["--layers", ",".join(layers)]
+                cmd.append(pcb_path)
 
-            # Plot to SVG first (for vector output)
-            # Note: KiCAD 9.0 prepends the project name to the filename, so we use GetPlotFileName() to get the actual path
-            plotter.OpenPlotfile("temp_view", pcbnew.PLOT_FORMAT_SVG, "Temporary View")
+                try:
+                    result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+                except subprocess.TimeoutExpired:
+                    return {
+                        "success": False,
+                        "message": "kicad-cli timed out after 60 s",
+                        "errorDetails": " ".join(cmd),
+                    }
 
-            # Plot specified layers or all enabled layers
-            # Note: In KiCAD 9.0, SetLayer() must be called before PlotLayer()
-            if layers:
-                for layer_name in layers:
-                    layer_id = self.board.GetLayerID(layer_name)
-                    if layer_id >= 0 and self.board.IsLayerEnabled(layer_id):
-                        plotter.SetLayer(layer_id)
-                        plotter.PlotLayer()
-            else:
-                for layer_id in range(pcbnew.PCB_LAYER_ID_COUNT):
-                    if self.board.IsLayerEnabled(layer_id):
-                        plotter.SetLayer(layer_id)
-                        plotter.PlotLayer()
+                # Do NOT gate on the exit code: KiCad 9+/10 returns exit code 2
+                # for a deprecation warning even when the SVG is written
+                # correctly. Use "was an SVG actually produced?" as the success
+                # signal instead — robust across versions and modes.
+                svg_files = (
+                    [output_svg]
+                    if os.path.exists(output_svg)
+                    else glob.glob(os.path.join(tmpdir, "*.svg"))
+                )
+                if not svg_files:
+                    return {
+                        "success": False,
+                        "message": "kicad-cli SVG export failed",
+                        "errorDetails": result.stderr.strip() or result.stdout.strip(),
+                    }
 
-            # Get the actual filename that was created (includes project name prefix)
-            temp_svg = plotter.GetPlotFileName()
+                svg_path = svg_files[0]
 
-            plotter.ClosePlot()
+                # --- Render to bytes (shared for both response modes) ---
+                board_dir = os.path.dirname(pcb_path)
+                board_name = os.path.splitext(os.path.basename(pcb_path))[0]
 
-            # Convert SVG to requested format
-            if format == "svg":
-                with open(temp_svg, "r") as f:
-                    svg_data = f.read()
-                os.remove(temp_svg)
-                return {"success": True, "imageData": svg_data, "format": "svg"}
-            else:
-                # Use PIL to convert SVG to PNG/JPG
-                from cairosvg import svg2png
+                if fmt == "svg":
+                    with open(svg_path, "rb") as f:
+                        image_bytes = f.read()
+                    mime_format = "svg"
+                else:
+                    png_bytes = _svg_to_png(svg_path, width, height)
+                    if png_bytes is None:
+                        # No PNG converter — fall back to SVG inline
+                        with open(svg_path, "r", encoding="utf-8") as f:
+                            return {
+                                "success": True,
+                                "format": "svg",
+                                "imageData": base64.b64encode(f.read().encode()).decode("utf-8"),
+                                "message": "No PNG converter available — returning SVG. Install pymupdf, inkscape, or imagemagick.",
+                            }
+                    if fmt == "jpg":
+                        img = Image.open(io.BytesIO(png_bytes))
+                        buf = io.BytesIO()
+                        img.convert("RGB").save(buf, format="JPEG")
+                        image_bytes = buf.getvalue()
+                    else:
+                        image_bytes = png_bytes
+                    mime_format = fmt
 
-                png_data = svg2png(url=temp_svg, output_width=width, output_height=height)
-                os.remove(temp_svg)
-
-                if format == "jpg":
-                    # Convert PNG to JPG
-                    img = Image.open(io.BytesIO(png_data))
-                    jpg_buffer = io.BytesIO()
-                    img.convert("RGB").save(jpg_buffer, format="JPEG")
-                    jpg_data = jpg_buffer.getvalue()
+                # --- Package response according to responseMode ---
+                if response_mode == "file":
+                    output_path = os.path.join(board_dir, f"{board_name}_2d_view.{mime_format}")
+                    with open(output_path, "wb") as f:
+                        f.write(image_bytes)
                     return {
                         "success": True,
-                        "imageData": base64.b64encode(jpg_data).decode("utf-8"),
-                        "format": "jpg",
+                        "format": mime_format,
+                        "filePath": output_path,
+                        "message": f"2D view saved to {output_path}",
                     }
                 else:
                     return {
                         "success": True,
-                        "imageData": base64.b64encode(png_data).decode("utf-8"),
-                        "format": "png",
+                        "format": mime_format,
+                        "imageData": base64.b64encode(image_bytes).decode("utf-8"),
                     }
 
+        except FileNotFoundError:
+            return {
+                "success": False,
+                "message": kicad_cli_not_found_message(),
+            }
         except Exception as e:
-            logger.error(f"Error getting board 2D view: {str(e)}")
+            logger.error(f"Error getting board 2D view: {e}")
             return {
                 "success": False,
                 "message": "Failed to get board 2D view",
@@ -186,7 +329,9 @@ class BoardViewCommands:
 
             # Get unit preference (default to mm)
             unit = params.get("unit", "mm")
-            scale = 1000000 if unit == "mm" else 25400000  # nm to mm or inch
+            scale = (
+                1000000 if unit == "mm" else (25400 if unit == "mil" else 25400000)
+            )  # mm, mil, or inch to nm
 
             # Get board bounding box
             board_box = self.board.GetBoardEdgesBoundingBox()

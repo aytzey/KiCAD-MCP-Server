@@ -79,12 +79,13 @@ class KiCADBackend(ABC):
         pass
 
     @abstractmethod
-    def save_project(self, path: Optional[Path] = None) -> Dict[str, Any]:
+    def save_project(self, path: Optional[Path] = None, overwrite: bool = False) -> Dict[str, Any]:
         """
         Save the current project
 
         Args:
             path: Optional new path to save to
+            overwrite: Whether an existing destination may be replaced
 
         Returns:
             Dictionary with save status
@@ -127,7 +128,7 @@ class BoardAPI(ABC):
         pass
 
     @abstractmethod
-    def get_size(self) -> Dict[str, float]:
+    def get_size(self) -> Dict[str, Any]:
         """
         Get current board size
 
@@ -169,6 +170,7 @@ class BoardAPI(ABC):
         y: float,
         rotation: float = 0,
         layer: str = "F.Cu",
+        value: str = "",
     ) -> bool:
         """
         Place a component on the board

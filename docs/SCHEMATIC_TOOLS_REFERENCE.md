@@ -3,9 +3,11 @@
 Added in: v2.1.0, expanded in v2.2.0-v2.2.3
 Contributors: @Mehanik (PRs #60, #66), @Kletternaut (PR #57)
 
-This document provides a complete reference for the schematic tools in the KiCAD MCP Server. These tools enable a complete schematic design workflow, from creating projects and adding components to wiring, validation, and synchronization with PCB boards. The dynamic symbol loading feature provides access to approximately 10,000 standard KiCad symbols.
+This document provides a complete reference for the 29 schematic tools in the KiCAD MCP Server. These tools enable a complete schematic design workflow, from creating projects and adding components to wiring, validation, BOM/sourcing metadata, and synchronization with PCB boards. The dynamic symbol loading feature provides access to approximately 10,000 standard KiCad symbols.
 
-## Component Operations (8 tools)
+**Shared error shape — `schematic_load_failed`:** every kicad-skip-based schematic tool returns a structured error when the schematic cannot be parsed (instead of empty/partial results): `{"success": false, "error": "schematic_load_failed", "flatSymbols": ["LIB:PART", ...], "message": "...", "errorDetails": "..."}`. `flatSymbols` names embedded vendor symbols with no sub-units (the SnapEDA/SamacSys pattern that crashes the parser); see KNOWN_ISSUES.md for the repair procedure.
+
+## Component Operations (10 tools)
 
 ### add_schematic_component
 
@@ -26,27 +28,110 @@ Add a component to the schematic. Symbol format is 'Library:SymbolName' (e.g., '
 
 Remove a placed symbol from a KiCAD schematic (.kicad_sch). This removes the symbol instance (the placed component) from the schematic. It does NOT remove the symbol definition from lib_symbols. Note: This tool operates on schematic files (.kicad_sch). To remove a footprint from a PCB, use delete_component instead.
 
-| Parameter     | Type   | Required | Description                                                   |
-| ------------- | ------ | -------- | ------------------------------------------------------------- |
-| schematicPath | string | Yes      | Path to the .kicad_sch file                                   |
-| reference     | string | Yes      | Reference designator of the component to remove (e.g. R1, U3) |
+| Parameter            | Type    | Required | Description                                                                                                    |
+| -------------------- | ------- | -------- | -------------------------------------------------------------------------------------------------------------- |
+| schematicPath        | string  | Yes      | Path to the .kicad_sch file                                                                                    |
+| reference            | string  | Yes      | Reference designator of the component to remove (e.g. R1, U3)                                                  |
+| deleteAttachedLabels | boolean | No       | Also delete net labels sitting on the deleted component's pin positions (default false; see usage notes below) |
+
+**Usage Notes:** `deleteAttachedLabels` removes the labels that `batch_add_and_connect` placed on the component's pins, which otherwise remain as `label_dangling` ERC errors. A label is kept whenever it is still attached to something else: coincident with a remaining component's pin, coincident with a wire endpoint, or lying on a wire segment (0.5 mm tolerance). Deleted labels are reported in the response (`deleted_labels`, `deleted_label_count`). Labels joined to a pin only through a short wire are not chased — that is wire-graph cleanup, out of scope. Recommended when permanently removing a wired part; leave off (default) for delete-then-re-add-in-place workflows.
 
 ### edit_schematic_component
 
-Update properties of a placed symbol in a KiCAD schematic (.kicad_sch) in-place. Use this tool to assign or update a footprint, change the value, or rename the reference of an already-placed component. This is more efficient than delete + re-add because it preserves the component's position and UUID. Note: operates on .kicad_sch files only. To modify a PCB footprint use edit_component.
+Update properties of a placed symbol in a KiCAD schematic (.kicad_sch) in-place.
 
-| Parameter      | Type   | Required | Description                                                                                              |
-| -------------- | ------ | -------- | -------------------------------------------------------------------------------------------------------- |
-| schematicPath  | string | Yes      | Path to the .kicad_sch file                                                                              |
-| reference      | string | Yes      | Current reference designator of the component (e.g. R1, U3)                                              |
-| footprint      | string | No       | New KiCAD footprint string (e.g. Resistor_SMD:R_0603_1608Metric)                                         |
-| value          | string | No       | New value string (e.g. 10k, 100nF)                                                                       |
-| newReference   | string | No       | Rename the reference designator (e.g. R1 → R10)                                                          |
-| fieldPositions | object | No       | Reposition field labels: map of field name to {x, y, angle} (e.g. {"Reference": {"x": 12.5, "y": 17.0}}) |
+Use this tool to:
+
+- assign or update the footprint, value, or reference designator,
+- reposition field labels (Reference / Value text),
+- add, update, or remove **arbitrary custom properties** used by BOM and sourcing
+  workflows (`MPN`, `Manufacturer`, `Manufacturer_PN`, `Distributor`, `DigiKey`,
+  `DigiKey_PN`, `Mouser_PN`, `LCSC`, `JLCPCB_PN`, `Voltage`, `Tolerance`, `Power`,
+  `Dielectric`, `Temperature_Coefficient`, …).
+
+Custom properties are first-class — they survive ERC, are exported by
+`export_bom`, and are picked up by the JLCPCB / Digi-Key sourcing tooling. Newly
+created properties default to hidden so they do not clutter the schematic canvas.
+
+Multiple updates can be batched in a single call: pass any combination of
+`footprint`, `value`, `newReference`, `fieldPositions`, `properties`, and
+`removeProperties` together. This is more efficient than delete + re-add because
+it preserves the component's position and UUID. Operates on .kicad_sch files
+only — to modify a PCB footprint use `edit_component` instead.
+
+| Parameter        | Type     | Required | Description                                                                                                                                                                                                                                                      |
+| ---------------- | -------- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| schematicPath    | string   | Yes      | Path to the .kicad_sch file                                                                                                                                                                                                                                      |
+| reference        | string   | Yes      | Current reference designator of the component (e.g. R1, U3)                                                                                                                                                                                                      |
+| footprint        | string   | No       | New KiCAD footprint string (e.g. Resistor_SMD:R_0603_1608Metric)                                                                                                                                                                                                 |
+| value            | string   | No       | New value string (e.g. 10k, 100nF)                                                                                                                                                                                                                               |
+| newReference     | string   | No       | Rename the reference designator (e.g. R1 → R10)                                                                                                                                                                                                                  |
+| fieldPositions   | object   | No       | Reposition field labels: map of field name to {x, y, angle} (e.g. {"Reference": {"x": 12.5, "y": 17.0}})                                                                                                                                                         |
+| properties       | object   | No       | Add or update component properties. Map of property name to either a string value or `{value, x?, y?, angle?, hide?, fontSize?}`. Built-in fields (Reference/Value/Footprint/Datasheet) can also be set this way but the dedicated parameters above are clearer. |
+| removeProperties | string[] | No       | List of custom property names to delete. Built-in fields (Reference, Value, Footprint, Datasheet) cannot be removed (clear them by setting `value` to `""` instead).                                                                                             |
+
+**Example — attach BOM/sourcing data to a 0603 resistor:**
+
+```json
+{
+  "schematicPath": "/path/to/board.kicad_sch",
+  "reference": "R7",
+  "value": "10k",
+  "footprint": "Resistor_SMD:R_0603_1608Metric",
+  "properties": {
+    "MPN": "RC0603FR-0710KL",
+    "Manufacturer": "Yageo",
+    "DigiKey_PN": "311-10.0KHRCT-ND",
+    "LCSC": "C25804",
+    "Tolerance": "1%",
+    "Power": "0.1W"
+  }
+}
+```
+
+### set_schematic_component_property
+
+Add or update a **single** custom property on a placed schematic symbol. Convenience
+wrapper around `edit_schematic_component` for the common case of attaching one
+BOM / sourcing field at a time. Creates the property if it does not yet exist.
+
+Newly created properties default to hidden — set `hide: false` plus an explicit
+`x`/`y` to display the value on the schematic canvas.
+
+| Parameter     | Type    | Required | Description                                                                                          |
+| ------------- | ------- | -------- | ---------------------------------------------------------------------------------------------------- |
+| schematicPath | string  | Yes      | Path to the .kicad_sch file                                                                          |
+| reference     | string  | Yes      | Reference designator of the component (e.g. R1, U3)                                                  |
+| name          | string  | Yes      | Property name (e.g. 'MPN', 'Manufacturer', 'DigiKey_PN', 'Voltage', 'Dielectric')                    |
+| value         | string  | Yes      | Property value to write (use empty string to clear)                                                  |
+| x             | number  | No       | Label X position in mm (default: component X)                                                        |
+| y             | number  | No       | Label Y position in mm (default: component Y)                                                        |
+| angle         | number  | No       | Label rotation in degrees (default: 0)                                                               |
+| hide          | boolean | No       | Hide the property text on the schematic canvas. Defaults to true for newly created custom properties |
+| fontSize      | number  | No       | Font size in mm for the label (default: 1.27)                                                        |
+
+### remove_schematic_component_property
+
+Remove a single custom property from a placed schematic symbol. Built-in fields
+(Reference, Value, Footprint, Datasheet) cannot be removed — KiCad requires them
+on every symbol. To clear a built-in field, use `edit_schematic_component` and
+set its value to an empty string.
+
+| Parameter     | Type   | Required | Description                                                               |
+| ------------- | ------ | -------- | ------------------------------------------------------------------------- |
+| schematicPath | string | Yes      | Path to the .kicad_sch file                                               |
+| reference     | string | Yes      | Reference designator of the component (e.g. R1, U3)                       |
+| name          | string | Yes      | Custom property name to remove (e.g. 'MPN', 'Distributor_PN', 'OldField') |
 
 ### get_schematic_component
 
-Get full component info from a schematic: position, field values, and each field's label position (at x/y/angle). Use this to inspect or prepare repositioning of Reference/Value labels.
+Get full component info from a schematic: position, every field's value, and each
+field's label position (at x/y/angle). Returns **all** properties — both built-in
+fields (Reference, Value, Footprint, Datasheet) and any custom BOM/sourcing
+properties present on the symbol (MPN, Manufacturer, DigiKey_PN, LCSC, Voltage,
+Tolerance, Dielectric, etc.). Use this before `edit_schematic_component` /
+`set_schematic_component_property` to inspect what is currently set, or to plan
+a label repositioning.
 
 | Parameter     | Type   | Required | Description                                  |
 | ------------- | ------ | -------- | -------------------------------------------- |
@@ -120,15 +205,34 @@ Connect two component pins with a wire. Use this for individual connections betw
 
 Add a net label to the schematic.
 
-| Parameter     | Type   | Required | Description                                |
-| ------------- | ------ | -------- | ------------------------------------------ |
-| schematicPath | string | Yes      | Path to the schematic file                 |
-| netName       | string | Yes      | Name of the net (e.g., VCC, GND, SIGNAL_1) |
-| position      | array  | Yes      | Position [x, y] for the label              |
+**Preferred usage — snap to pin:** supply `componentRef` + `pinNumber` and the label is placed at the exact pin endpoint resolved by `PinLocator`. This guarantees an electrical connection. A 0.01 mm offset is enough to break the connection in KiCad, so this mode eliminates all guesswork.
+
+**Alternative — explicit position:** supply `position [x, y]`. The coordinates must match a pin or wire endpoint exactly; use `get_schematic_pin_locations` first to obtain them.
+
+| Parameter     | Type           | Required | Description                                                            |
+| ------------- | -------------- | -------- | ---------------------------------------------------------------------- |
+| schematicPath | string         | Yes      | Path to the schematic file                                             |
+| netName       | string         | Yes      | Name of the net (e.g., VCC, GND, SIGNAL_1)                             |
+| position      | array [x, y]   | No\*     | Explicit position. Required when `componentRef`/`pinNumber` not given. |
+| componentRef  | string         | No\*     | Component reference to snap to (e.g. U1). Use with `pinNumber`.        |
+| pinNumber     | string\|number | No\*     | Pin number or name (e.g. `"1"`, `"GND"`). Use with `componentRef`.     |
+| labelType     | string         | No       | `label` (default), `global_label`, or `hierarchical_label`             |
+| orientation   | number         | No       | Rotation angle: 0, 90, 180, 270 (default: 0)                           |
+
+\* Either `position` **or** (`componentRef` + `pinNumber`) is required.
+
+**Response fields:**
+
+| Field           | Description                                                  |
+| --------------- | ------------------------------------------------------------ |
+| success         | `true` / `false`                                             |
+| actual_position | `[x, y]` coordinates where the label was actually placed     |
+| snapped_to_pin  | `{component, pin}` — present only when pin-snapping was used |
+| message         | Human-readable status                                        |
 
 ### connect_to_net
 
-Connect a component pin to a named net.
+Connect a component pin to a named net by adding a wire stub from the pin endpoint and placing a net label at the stub's far end. The exact pin coordinates are resolved internally via `PinLocator`.
 
 | Parameter     | Type   | Required | Description                        |
 | ------------- | ------ | -------- | ---------------------------------- |
@@ -137,7 +241,17 @@ Connect a component pin to a named net.
 | pinName       | string | Yes      | Pin name/number to connect         |
 | netName       | string | Yes      | Name of the net to connect to      |
 
-**Usage Notes:** Creates a wire stub from the pin and places a net label at the stub endpoint. The stub direction follows the pin's outward angle. Default stub length is 2.54mm (0.1 inch, standard grid spacing). For compatibility with the JSON schema and older callers, `reference` may be used instead of `componentRef`, and `pinNumber` may be used instead of `pinName`.
+**Response fields:**
+
+| Field          | Description                                |
+| -------------- | ------------------------------------------ |
+| success        | `true` / `false`                           |
+| pin_location   | `[x, y]` exact pin endpoint used           |
+| label_location | `[x, y]` where the net label was placed    |
+| wire_stub      | `[[x1,y1],[x2,y2]]` the wire segment added |
+| message        | Human-readable status                      |
+
+**Usage Notes:** Creates a wire stub from the pin and places a net label at the stub endpoint. The stub direction follows the pin's outward angle. Default stub length is 2.54 mm (0.1 inch, standard grid spacing). Check `pin_location` in the response to confirm the correct pin was found; no separate verification call is needed.
 
 ### connect_passthrough
 
@@ -155,7 +269,7 @@ Connects all pins of a source connector (e.g. J1) to matching pins of a target c
 
 ### get_schematic_pin_locations
 
-Returns the exact x/y coordinates of every pin on a schematic component. Use this before add_schematic_net_label to place labels correctly on pin endpoints.
+Returns the exact x/y coordinates of every pin on a schematic component. Useful for inspection or when building custom placement logic. When the goal is to connect a pin to a net, prefer `add_schematic_net_label` with `componentRef`+`pinNumber` (which calls this internally) or `connect_to_net` — both snap to the exact pin endpoint automatically.
 
 | Parameter     | Type   | Required | Description                                      |
 | ------------- | ------ | -------- | ------------------------------------------------ |
@@ -182,7 +296,7 @@ Remove a net label from the schematic.
 | netName       | string | Yes      | Name of the net label to remove                                                  |
 | position      | object | No       | Position to disambiguate if multiple labels with same name (x and y coordinates) |
 
-## Net Analysis (4 tools)
+## Net Analysis (5 tools)
 
 ### get_net_connections
 
@@ -219,23 +333,66 @@ List all net labels, global labels, and power flags in the schematic.
 | ------------- | ------ | -------- | --------------------------- |
 | schematicPath | string | Yes      | Path to the .kicad_sch file |
 
-### polish_schematic_readability
+### get_net_at_point
 
-Apply a readability-only visual polish pass to a schematic without moving symbols or changing nets.
+Return the net name at a given (x, y) coordinate, or `null` if no net label or wire endpoint is present there.
 
-| Parameter             | Type    | Required | Description                                                                   |
-| --------------------- | ------- | -------- | ----------------------------------------------------------------------------- |
-| schematicPath         | string  | Yes      | Path to the .kicad_sch file                                                   |
-| hideInternalLabels    | boolean | No       | Shrink internal/debug local labels so the schematic reads through wires        |
-| internalLabelNames    | array   | No       | Explicit local label names to shrink; otherwise internal-looking names are used |
-| keepLabelNames        | array   | No       | Labels that must stay readable, such as VREF, GND, +9V                        |
-| internalLabelFontSize | number  | No       | Font size for hidden internal labels, default 0.2 mm                           |
-| junctionDiameter      | number  | No       | Junction dot diameter, default 1.27 mm                                         |
-| blockFrames           | array   | No       | Optional frame rectangles/titles around functional schematic blocks             |
+Checks net label / power symbol positions first (exact IU match), then wire endpoints. Faster than `get_wire_connections` when you only need the net name and not full pin traversal.
 
-**Usage Notes:** This is intended as a final schematic presentation pass. It preserves electrical topology, but improves readability by reducing technical net-label clutter, making real junctions visible, and adding optional block boundaries.
+| Parameter     | Type   | Required | Description                           |
+| ------------- | ------ | -------- | ------------------------------------- |
+| schematicPath | string | Yes      | Path to the .kicad_sch schematic file |
+| x             | number | Yes      | X coordinate in mm                    |
+| y             | number | Yes      | Y coordinate in mm                    |
 
-## Schematic Creation and Export (5 tools)
+**Response fields:**
+
+| Field    | Description                                                             |
+| -------- | ----------------------------------------------------------------------- |
+| net_name | Net label string, or `null` if no net found at this point               |
+| position | `{"x": float, "y": float}` — echoes the query coordinates               |
+| source   | `"net_label"` \| `"wire_endpoint"` \| `null` — how the net was resolved |
+
+## Text Annotations (2 tools)
+
+### add_schematic_text
+
+Add a free-form text annotation (note, heading, documentation string) directly on the schematic canvas. Text annotations have no electrical significance — they are purely visual. For electrically meaningful labels, use `add_schematic_net_label` instead.
+
+| Parameter     | Type         | Required | Description                                      |
+| ------------- | ------------ | -------- | ------------------------------------------------ |
+| schematicPath | string       | Yes      | Path to the .kicad_sch file                      |
+| text          | string       | Yes      | Text content to display                          |
+| position      | array [x, y] | Yes      | Position in schematic mm coordinates             |
+| angle         | number       | No       | Rotation angle in degrees (default: 0)           |
+| fontSize      | number       | No       | Font size in mm (default: 1.27 — KiCad standard) |
+| bold          | boolean      | No       | Bold text (default: false)                       |
+| italic        | boolean      | No       | Italic text (default: false)                     |
+| justify       | string       | No       | `left` \| `center` \| `right` (default: `left`)  |
+
+### list_schematic_texts
+
+List all free-form text annotations in the schematic. Optionally filter by a substring of the text content.
+
+| Parameter     | Type   | Required | Description                                                    |
+| ------------- | ------ | -------- | -------------------------------------------------------------- |
+| schematicPath | string | Yes      | Path to the .kicad_sch file                                    |
+| text          | string | No       | Case-insensitive substring filter — only return matching texts |
+
+**Response fields (per text entry):**
+
+| Field     | Description                         |
+| --------- | ----------------------------------- |
+| text      | Text string content                 |
+| position  | `{"x": float, "y": float}` in mm    |
+| angle     | Rotation angle in degrees           |
+| font_size | Font size in mm                     |
+| bold      | `true` / `false`                    |
+| italic    | `true` / `false`                    |
+| justify   | `"left"` \| `"center"` \| `"right"` |
+| uuid      | KiCad UUID of the element           |
+
+## Schematic Creation and Export (6 tools)
 
 ### create_schematic
 
@@ -279,15 +436,100 @@ Return a rasterized image of the schematic (PNG by default, or SVG). Uses kicad-
 
 ### generate_netlist
 
-Generate a netlist from the schematic.
+Return a structured JSON netlist from the schematic for programmatic use. Uses `kicad-cli` internally — the schematic file must be saved to disk first.
 
-| Parameter     | Type   | Required | Description                |
-| ------------- | ------ | -------- | -------------------------- |
-| schematicPath | string | Yes      | Path to the schematic file |
+| Parameter     | Type   | Required | Description                                    |
+| ------------- | ------ | -------- | ---------------------------------------------- |
+| schematicPath | string | Yes      | Absolute path to the .kicad_sch schematic file |
 
-**Usage Notes:** Returns a complete netlist with component information (reference, value, footprint) and net connections (net name with all connected component/pin pairs).
+**Returns:** `{ components: [{reference, value, footprint}], nets: [{name, connections: [{component, pin}]}] }`
 
-## Validation and Synchronization (3 tools)
+**Usage Notes:** Use this when you need net membership data in the conversation (e.g., to verify connectivity). For writing a netlist to a file or exporting SPICE/Cadstar/OrcadPCB2 format, use `export_netlist` instead.
+
+### export_netlist
+
+Export a netlist to a file in a standard EDA format using `kicad-cli`. Supports SPICE (for simulation), KiCad XML (for archiving/import), Cadstar, and OrcadPCB2.
+
+| Parameter     | Type   | Required | Description                                                  |
+| ------------- | ------ | -------- | ------------------------------------------------------------ |
+| schematicPath | string | Yes      | Absolute path to the .kicad_sch schematic file               |
+| outputPath    | string | Yes      | Absolute path for the output file (e.g. `/tmp/design.spice`) |
+| format        | enum   | No       | `KiCad` (default), `Spice`, `Cadstar`, `OrcadPCB2`           |
+
+**Usage Notes:** The schematic file must be saved before calling this tool. Use `Spice` format to produce a SPICE netlist for simulation or diff against a reference. The output file is created or overwritten at `outputPath`.
+
+## Validation and Synchronization (6 tools)
+
+### list_floating_labels
+
+Return all net labels that are not connected to any component pin.
+
+A label is "floating" when no component pin's coordinate falls on the wire-network reachable from the label's anchor position. Floating labels indicate misplaced or off-grid labels that will cause ERC errors. Does not require the KiCAD UI to be running.
+
+| Parameter     | Type   | Required | Description                           |
+| ------------- | ------ | -------- | ------------------------------------- |
+| schematicPath | string | Yes      | Path to the .kicad_sch schematic file |
+
+**Response fields:** list of `{"name": str, "x": float, "y": float, "type": "label" | "global_label"}`.
+
+### find_orphaned_wires
+
+Find wire segments with at least one dangling endpoint — not connected to a component pin, net label, or another wire. Orphaned wires cause ERC "wire end unconnected" errors. Does not require the KiCAD UI to be running.
+
+| Parameter     | Type   | Required | Description                           |
+| ------------- | ------ | -------- | ------------------------------------- |
+| schematicPath | string | Yes      | Path to the .kicad_sch schematic file |
+
+**Response fields:**
+
+| Field          | Description                                                                  |
+| -------------- | ---------------------------------------------------------------------------- |
+| orphaned_wires | List of `{"start": {x,y}, "end": {x,y}, "dangling_ends": [{x,y}, ...]}` (mm) |
+| count          | Total number of orphaned wire segments                                       |
+
+### snap_to_grid
+
+Snap schematic element coordinates to the nearest grid point. KiCAD uses exact integer matching (10 000 IU/mm) internally, so even a sub-pixel offset makes wires appear connected visually while failing ERC. Run this before `run_erc` to eliminate that class of error. Modifies the `.kicad_sch` file in place. Does not require the KiCAD UI to be running.
+
+| Parameter     | Type            | Required | Description                                                                                                                                                                                                          |
+| ------------- | --------------- | -------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| schematicPath | string          | Yes      | Path to the .kicad_sch schematic file                                                                                                                                                                                |
+| gridSize      | number          | No       | Grid spacing in mm (default: 1.27 = 50 mil, the KiCad connection grid; do NOT use 2.54 — it moves pins off their 50 mil positions)                                                                                   |
+| elements      | array\<string\> | No       | Types to snap: `"wires"`, `"junctions"`, `"labels"`, `"components"`. Default: `["wires", "junctions", "labels"]`. `"components"` is opt-in — moving a component without re-routing its wires creates new mismatches. |
+
+**Response fields:**
+
+| Field           | Description                                               |
+| --------------- | --------------------------------------------------------- |
+| snapped         | Number of elements that had at least one coordinate moved |
+| already_on_grid | Number of elements already on the grid                    |
+| grid_size       | Grid spacing used (mm)                                    |
+
+### lint_schematic_cosmetic
+
+Netlist-safe cosmetic cleanup of a schematic, applied as raw-text edits that never move a symbol, pin, wire, junction, or label anchor — only display attributes change. Two passes: `hide_pin_names` gives every top-level embedded lib_symbol definition a `(pin_names ... (hide yes))` directive (in label-driven schematics the internal pin names duplicate the net label on the same pin); `orient_labels` sets each net/global/hierarchical label's text angle and justify from the sheet-space outward side of the pin it sits on (rotation/mirror aware via PinLocator), so text reads away from the symbol body — labels not sitting on a pin are counted and left untouched. Complements `autoplace_schematic_fields`, which handles Reference/Value field placement.
+
+| Parameter     | Type            | Required | Description                                                                  |
+| ------------- | --------------- | -------- | ---------------------------------------------------------------------------- |
+| schematicPath | string          | Yes      | Path to the .kicad_sch file                                                  |
+| passes        | array\<string\> | No       | Passes to run in order: `"hide_pin_names"`, `"orient_labels"` (default both) |
+| dryRun        | boolean         | No       | Report change counts without writing (default false)                         |
+
+**Response fields:** `changed`, `counts` per pass, `skippedLabels` (labels not on a pin), `message`.
+
+### lint_offgrid
+
+Report every off-grid connection-relevant coordinate in a schematic — wire/bus endpoints, symbol origins, label/junction/no_connect anchors — and optionally snap them (`fix: true`). KiCad's connection grid is fixed at 50 mil (1.27 mm) and junction placement uses exact matching, so one off-grid endpoint can poison junction placement for a whole sheet. Fixes are byte-exact text splices that preserve file formatting (unlike `snap_to_grid`'s whole-file rewrite). `(lib_symbols)` content (local pin definitions) and property field positions (cosmetic) are never flagged or touched. Offenders more than 0.5 mm off-grid are reported as `needsHuman` and never auto-snapped — sub-half-grid offsets round coincident points to the same grid node, preserving connectivity, while larger ones need a human decision.
+
+| Parameter     | Type    | Required | Description                                                      |
+| ------------- | ------- | -------- | ---------------------------------------------------------------- |
+| schematicPath | string  | Yes      | Path to the .kicad_sch schematic file                            |
+| fix           | boolean | No       | Snap offenders in place (default false: report only)             |
+| gridSize      | number  | No       | Grid spacing in mm (default: 1.27 = 50 mil, the connection grid) |
+
+**Response fields:** `offenders` (type, x/y, snappedX/Y, offsetMm, needsHuman, line), `counts` per type, `fixed`, `needsHuman`.
+
+**When to use which:** `lint_offgrid` is the safe default (report first, surgical fix, guardrails); `snap_to_grid` is the legacy bulk tool that rewrites the whole file.
 
 ### run_erc
 
@@ -303,36 +545,12 @@ Runs the KiCAD Electrical Rules Check (ERC) on a schematic and returns all viola
 
 Import the schematic netlist into the PCB board — equivalent to pressing F8 in KiCAD (Tools → Update PCB from Schematic). MUST be called after the schematic is complete and before placing or routing components on the PCB. Without this step, the board has no footprints and no net assignments — place_component and route_pad_to_pad will produce an empty, unroutable board.
 
-| Parameter                 | Type   | Required | Description                                                                                     |
-| ------------------------- | ------ | -------- | ----------------------------------------------------------------------------------------------- |
-| schematicPath             | string | No       | Absolute path to the .kicad_sch schematic file. If omitted, inferred from the board/project.   |
-| boardPath                 | string | No       | Absolute path to the .kicad_pcb board file. If omitted, uses the currently loaded board.       |
-| autoPlaceMissingFootprints | bool  | No       | Auto-place schematic footprints missing from the PCB. Defaults to true only when the board is blank. |
-| placementStrategy         | string | No       | `routing_aware` (default) clusters connected parts and places connectors near edges; `grid` uses the legacy deterministic grid. |
-| placementEdgeMarginMm     | number | No       | Minimum margin from the board edge for routing-aware auto-placement.                            |
-| placementClusterGapMm     | number | No       | Preferred spacing between routing-aware placement clusters.                                     |
-| placementStartXmm         | number | No       | Grid fallback start X in mm, and the fallback origin when routing-aware placement has leftovers. |
-| placementStartYmm         | number | No       | Grid fallback start Y in mm, and the fallback origin when routing-aware placement has leftovers. |
-| placementPitchXmm         | number | No       | Preferred horizontal spacing between auto-placed footprints in mm.                              |
-| placementPitchYmm         | number | No       | Preferred vertical spacing between auto-placed footprints in mm.                                |
-| placementColumns          | number | No       | Column count used by the deterministic grid fallback.                                           |
+| Parameter     | Type   | Required | Description                                    |
+| ------------- | ------ | -------- | ---------------------------------------------- |
+| schematicPath | string | Yes      | Absolute path to the .kicad_sch schematic file |
+| boardPath     | string | Yes      | Absolute path to the .kicad_pcb board file     |
 
-**Usage Notes:** This is the F8 equivalent. It synchronizes the schematic design to the PCB, creating footprints on the board and assigning nets. On blank boards, the default `routing_aware` strategy uses connectivity to keep tightly related parts near each other, biases analog connectors upward, biases power/switching connectors downward, preserves easier breakout/routing channels for high-speed clusters, and performs a final local net-separation legalization pass so analog/RF clusters are not left too close to noisy power-switching regions. The response now also includes `auto_place_clusters`, `auto_place_routing_corridors`, and `auto_place_rules`, so agents can inspect which placement rules were applied before routing. Ground-coupled high-speed or RF connectors now receive a `referenceProfile`-aware edge policy as well: they are prioritized for the quietest side-edge slots near the board midline and get slightly deeper inward breakout corridors so a cleaner future return-path region is left behind them. That edge policy is now also `referenceDomain`-aware: quiet domains such as `AGND` and chassis-earth are favored for the central side corridor, while `PGND`-coupled connectors are pushed toward more peripheral side-edge slots to reduce downstream split-plane and switching-noise risk. If the board already contains ground-domain zones, the placer also becomes zone-aware: it will prefer the left or right edge that actually has the strongest matching reference-plane continuity for that domain, and the returned cluster metadata will expose the chosen edge preference and zone bias. High-speed/RF/reference-sensitive connector clusters now emit numeric breakout corridor reservations with edge, direction, rectangle, priority, and congestion budget; pass those into `generate_routing_constraints` as `placementRoutingCorridors` so critical routing can consume placement intent directly. Use `placementStrategy: "grid"` when you need the previous simple deterministic staging layout. After routing, pair this with `post_tune_routes` so the MCP can first attempt explicit matched-length bus compensation, then synthesize a deterministic ground reference zone when a ground net exists but no plane is present, and finally heal residual ground/power disconnects before final DRC. For full `autoroute_cfha` runs, the constraint artifact now also emits `referencePlanning`, and the orchestrator consumes that plan in a new `preRouteReference` stage before critical routing so the preferred signal layer and any missing ground reference zone are established early instead of being deferred entirely to post-tune. That reference plan is now local-domain-aware: if a high-speed interface is tied more strongly to `AGND` than `GND`, the MCP will prefer `AGND` for plane synthesis and will not let an unrelated `GND` zone suppress creation of the local analog reference. The same plan now also carries `preferredEntryEdge`, `entryEdgeBias`, `referenceContinuityScore`, and `topologyCueSource`, and its `signalLayerCandidates` now expose estimated transition load as well as pressure. Combined with `trackPressureByLayer` and `edgePressureByLayer` from the board analysis, the MCP can prefer the signal layer whose breakout corridor is cleaner on the selected reference side instead of blindly defaulting to `F.Cu`. That decision is no longer just global planning metadata: `route_critical_nets` now applies a per-net layer override for high-speed and RF nets, locks each `HS_DIFF` pair onto one shared layer, records `estimatedViaCountPerNet` and `transitionPolicy` in the routing telemetry, and when the chosen layer is budget-safe it now passes full endpoint geometry into the backend so synchronized paired start/end vias can actually be synthesized instead of being treated as a planner-only fiction. Those synchronized transitions now consume `referencePlanning.groundNet` as `referenceNet` and add fail-soft flanking return-path stitch vias, exposing separate signal `viaCount` and reference `stitchViaCount` telemetry; the planner also estimates total transition-cell cost through `estimatedTransitionCellViaCountTotal` and can enforce `hs_transition_cell_via_limit`. Verification consumes that routing telemetry too: `verify_routing_qor` emits pair-level `transitionCellRisk` flags and includes them in the return-path QoR sub-score even when basic DRC is clean; it now also emits `placementCorridorRisk` when corridor edge pressure exceeds the placement-reserved congestion budget. DDR-style buses can still be inferred automatically from interface-aware net stems such as `DQ` and `ADDR`; override that behavior with `inferMatchedLengthGroups`, `autoMatchedLengthMaxSkewMm`, the min/max auto-group size knobs, and the `autoCreateReferenceZones` / `referenceZone*` controls when needed.
-
-### validate_schematic_pcb_sync
-
-Validate that the PCB is a faithful physical view of the schematic.
-
-| Parameter                  | Type    | Required | Description                                                        |
-| -------------------------- | ------- | -------- | ------------------------------------------------------------------ |
-| schematicPath              | string  | No       | Absolute path to the .kicad_sch file; inferred from board if omitted |
-| boardPath                  | string  | No       | Absolute path to the .kicad_pcb file; current board if omitted      |
-| ignoreMechanicalFootprints | boolean | No       | Ignore PCB-only mechanical items such as mounting holes and fiducials |
-| ignoreReferences           | array   | No       | Specific PCB references to ignore during comparison                 |
-| ignoreReferencePrefixes    | array   | No       | PCB reference prefixes to ignore during comparison                  |
-| compareFootprints          | boolean | No       | Compare schematic footprint IDs against PCB footprint IDs           |
-
-**Usage Notes:** This is the post-F8 guardrail. Run it after `sync_schematic_to_board` and after any PCB edits. It reports missing/extra footprints, footprint ID mismatches, missing pads, pad/net mismatches, and extra assigned pads.
+**Usage Notes:** This is the F8 equivalent. It synchronizes the schematic design to the PCB, creating footprints on the board and assigning nets. This step is critical in the workflow: design in schematic → sync_schematic_to_board → place and route on PCB.
 
 ## Example Workflows
 

@@ -1,24 +1,24 @@
 # KiCAD MCP - Current Status Summary
 
-**Date:** 2026-03-21
-**Version:** 2.2.3 (package.json shows 2.1.0-alpha -- CHANGELOG is authoritative)
+**Date:** 2026-09-04
+**Version:** 2.7.0 + unreleased two-layer production flow
 **Phase:** Active development with community contributions
 
 ---
 
 ## Quick Stats
 
-| Metric               | Value                       |
-| -------------------- | --------------------------- |
-| Total MCP Tools      | 122                         |
-| Tool Categories      | 16                          |
-| KiCAD 9.0 Compatible | Yes (verified)              |
-| Platforms            | Linux, Windows, macOS       |
-| JLCPCB Parts Catalog | 2.5M+ components            |
-| Symbol Access        | ~10,000 via dynamic loading |
-| Footprint Libraries  | 153+ auto-discovered        |
-| Contributors         | 10+                         |
-| MCP Protocol Version | 2025-06-18                  |
+| Metric                | Value                       |
+| --------------------- | --------------------------- |
+| Total MCP Tools       | 182                         |
+| Tool Categories       | 16                          |
+| KiCAD 9/10 Compatible | Yes (test matrix)           |
+| Platforms             | Linux, Windows, macOS       |
+| JLCPCB Parts Catalog  | 2.5M+ components            |
+| Symbol Access         | ~10,000 via dynamic loading |
+| Footprint Libraries   | 153+ auto-discovered        |
+| Contributors          | 10+                         |
+| MCP Protocol Version  | 2025-06-18                  |
 
 ---
 
@@ -90,9 +90,11 @@ The server automatically selects the best backend:
 
 ### macOS -- Community Supported
 
-- Configuration provided
+- Automated setup script (setup-macos.sh)
+- Auto-detects KiCad Python and pcbnew
+- Generates Claude Desktop configuration
 - Process detection implemented
-- Library paths configured
+- Library paths auto-configured
 - Needs community testing
 
 ---
@@ -130,7 +132,7 @@ The server automatically selects the best backend:
 - Complete schematic wiring system
 - Dynamic symbol loading (~10,000 symbols)
 - JLCPCB parts integration
-- Router pattern (70% context reduction)
+- Router pattern (70% context reduction -- later rolled back; see ROUTER_ARCHITECTURE.md)
 
 ---
 
@@ -170,4 +172,4 @@ The server automatically selects the best backend:
 
 ---
 
-_Last Updated: 2026-03-21_
+_Last Updated: 2026-04-11_

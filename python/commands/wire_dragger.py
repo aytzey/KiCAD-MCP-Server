@@ -7,7 +7,7 @@ All methods operate on in-memory sexpdata lists (no disk I/O).
 import logging
 import math
 import uuid
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import sexpdata
 from sexpdata import Symbol
@@ -27,6 +27,9 @@ _K = {
         "xy",
         "wire",
         "junction",
+        "label",
+        "global_label",
+        "hierarchical_label",
         "property",
         "stroke",
         "width",
@@ -55,7 +58,7 @@ class WireDragger:
     """Pure-logic helpers for wire-endpoint dragging during component moves."""
 
     @staticmethod
-    def find_symbol(sch_data: list, reference: str):
+    def find_symbol(sch_data: list, reference: str) -> Any:
         """
         Find a placed symbol by reference designator.
 
@@ -75,14 +78,17 @@ class WireDragger:
             if not (isinstance(item, list) and item and item[0] == sym_k):
                 continue
 
-            # Check Reference property
+            # Check Reference property.
+            # kicad-skip may write a trailing "_" on references (e.g. "R1_") when
+            # cloning symbols; strip it so callers passing the canonical "R1"
+            # still find the symbol. Mirrors the rstrip in PinLocator.get_pin_location.
             ref_val = None
             for sub in item[1:]:
                 if isinstance(sub, list) and len(sub) >= 3 and sub[0] == prop_k:
                     if str(sub[1]).strip('"') == "Reference":
                         ref_val = str(sub[2]).strip('"')
                         break
-            if ref_val != reference:
+            if ref_val is None or ref_val.rstrip("_") != reference:
                 continue
 
             old_x = old_y = rotation = 0.0
@@ -152,15 +158,28 @@ class WireDragger:
         """
         Compute the world coordinate of a pin given the symbol transform.
 
-        Mirrors are expressed in schematic axes:
-        - ``mirror x`` flips schematic Y
-        - ``mirror y`` flips schematic X
-        """
-        from commands.pin_locator import PinLocator
+        Library pins are stored Y-up; the schematic is Y-down. Order matches
+        eeschema: Y-flip to screen → rotate (screen-CCW) → mirror → translate.
 
-        return PinLocator.transform_local_point(
-            px, py, sym_x, sym_y, rotation, mirror_x, mirror_y
-        )
+        eeschema's TRANSFORM matrix for rotation 90 is (0, 1, -1, 0) —
+        i.e. screen-CCW in Y-down: (x, y) → (y, -x). Our `_rotate` helper is
+        standard math (Y-up CCW), so we negate the rotation angle to convert.
+
+        Mirror axis semantics match eeschema's symbol.h:
+          (mirror x) = SYM_MIRROR_X = TRANSFORM(1, 0, 0, -1) → negates Y.
+          (mirror y) = SYM_MIRROR_Y = TRANSFORM(-1, 0, 0, 1) → negates X.
+        """
+        lx, ly = px, -py  # Y-flip: lib Y-up → screen Y-down
+        rx, ry = _rotate(lx, ly, -rotation)  # negate angle: math-CCW → screen-CCW
+        # Mirror reflects the *placed* (already-rotated) symbol — i.e. in screen
+        # space, AFTER the rotation. Applying it before the rotation only agrees
+        # for 0°/180° turns; for 90°/270° it swaps the pins (verified against the
+        # kicad-cli netlist in test_pin_world_xy_eeschema_truth).
+        if mirror_x:
+            ry = -ry  # SYM_MIRROR_X negates screen-Y
+        if mirror_y:
+            rx = -rx  # SYM_MIRROR_Y negates screen-X
+        return sym_x + rx, sym_y + ry
 
     @staticmethod
     def compute_pin_positions(
@@ -197,6 +216,83 @@ class WireDragger:
         return result
 
     @staticmethod
+    def compute_pin_positions_for_rotation(
+        sch_data: list,
+        reference: str,
+        new_rotation: float,
+        new_mirror_x: bool,
+        new_mirror_y: bool,
+    ) -> Dict[str, Tuple[Tuple[float, float], Tuple[float, float]]]:
+        """
+        Compute world pin positions before and after a rotation/mirror change.
+
+        The symbol stays at the same (x, y); only the rotation and mirror state change.
+        Returns {pin_num: (old_world_xy, new_world_xy)}.
+        """
+        found = WireDragger.find_symbol(sch_data, reference)
+        if found is None:
+            return {}
+        _, sym_x, sym_y, old_rotation, lib_id, old_mirror_x, old_mirror_y = found
+
+        pins = WireDragger.get_pin_defs(sch_data, lib_id)
+        result: Dict[str, Tuple] = {}
+        for pin_num, pin in pins.items():
+            px, py = pin["x"], pin["y"]
+            old_wx, old_wy = WireDragger.pin_world_xy(
+                px, py, sym_x, sym_y, old_rotation, old_mirror_x, old_mirror_y
+            )
+            new_wx, new_wy = WireDragger.pin_world_xy(
+                px, py, sym_x, sym_y, new_rotation, new_mirror_x, new_mirror_y
+            )
+            result[pin_num] = (
+                (round(old_wx, 6), round(old_wy, 6)),
+                (round(new_wx, 6), round(new_wy, 6)),
+            )
+        return result
+
+    @staticmethod
+    def update_symbol_rotation_mirror(
+        sch_data: list,
+        reference: str,
+        new_rotation: float,
+        new_mirror: Optional[str],
+    ) -> bool:
+        """
+        Update the rotation in (at x y rot) and the (mirror x/y) token for a symbol.
+
+        new_mirror: "x", "y", or None (removes any existing mirror token).
+        Returns True if the symbol was found and updated.
+        """
+        found = WireDragger.find_symbol(sch_data, reference)
+        if found is None:
+            return False
+        item = found[0]
+        at_k = _K["at"]
+        mirror_k = _K["mirror"]
+
+        # Update rotation in (at x y rot). KiCad writes symbol angles as
+        # integers (0/90/180/270), so normalize integral values to int to
+        # match eeschema's output exactly (avoids a spurious "90.0" token).
+        rot_val = int(new_rotation) if float(new_rotation).is_integer() else new_rotation
+        for sub in item[1:]:
+            if isinstance(sub, list) and sub and sub[0] == at_k and len(sub) >= 4:
+                sub[3] = rot_val
+                break
+
+        # Remove existing (mirror ...) token(s)
+        to_remove = [
+            i for i, sub in enumerate(item) if isinstance(sub, list) and sub and sub[0] == mirror_k
+        ]
+        for i in reversed(to_remove):
+            del item[i]
+
+        # Insert new mirror token if requested
+        if new_mirror in ("x", "y"):
+            item.append([mirror_k, Symbol(new_mirror)])
+
+        return True
+
+    @staticmethod
     def drag_wires(
         sch_data: list,
         old_to_new: Dict[Tuple[float, float], Tuple[float, float]],
@@ -209,21 +305,23 @@ class WireDragger:
 
         old_to_new: {(old_x, old_y): (new_x, new_y)}
 
-        Returns {'endpoints_moved': N, 'wires_removed': M}.
+        Returns {'endpoints_moved': N, 'wires_removed': M, 'labels_moved': L}.
         """
         wire_k = _K["wire"]
         pts_k = _K["pts"]
         xy_k = _K["xy"]
         junction_k = _K["junction"]
         at_k = _K["at"]
+        label_ks = (_K["label"], _K["global_label"], _K["hierarchical_label"])
 
-        def find_new(x: float, y: float):
+        def find_new(x: float, y: float) -> Optional[Tuple[float, float]]:
             for (ox, oy), (nx, ny) in old_to_new.items():
                 if _coords_match(x, y, ox, oy, eps):
                     return nx, ny
             return None
 
         endpoints_moved = 0
+        labels_moved = 0
         zero_length_indices = []
 
         # First pass: update wire endpoints
@@ -272,9 +370,26 @@ class WireDragger:
                         sub[2] = nc[1]
                     break
 
+        # Third pass: drag net labels that sit exactly on a moved pin so they
+        # stay attached to it. Without this, a label coincident with a rotated
+        # pin is left behind while the pin's wiring moves away — silently
+        # re-netting it (e.g. a test-point label merging onto an adjacent rail).
+        for item in sch_data:
+            if not (isinstance(item, list) and item and item[0] in label_ks):
+                continue
+            for sub in item[1:]:
+                if isinstance(sub, list) and sub and sub[0] == at_k and len(sub) >= 3:
+                    nc = find_new(float(sub[1]), float(sub[2]))
+                    if nc is not None:
+                        sub[1] = nc[0]
+                        sub[2] = nc[1]
+                        labels_moved += 1
+                    break
+
         return {
             "endpoints_moved": endpoints_moved,
             "wires_removed": len(zero_length_indices),
+            "labels_moved": labels_moved,
         }
 
     @staticmethod

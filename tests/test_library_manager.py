@@ -21,9 +21,10 @@ def test_library_manager_discovers_pretty_dirs_without_fp_lib_table(tmp_path, mo
     manager = LibraryManager()
 
     assert manager.get_library_path("Connector_PinHeader_2.54mm") == str(pretty_dir)
-    assert manager.find_footprint(
-        "Connector_PinHeader_2.54mm:PinHeader_1x04_P2.54mm_Vertical"
-    ) == (str(pretty_dir), "PinHeader_1x04_P2.54mm_Vertical")
+    assert manager.find_footprint("Connector_PinHeader_2.54mm:PinHeader_1x04_P2.54mm_Vertical") == (
+        str(pretty_dir),
+        "PinHeader_1x04_P2.54mm_Vertical",
+    )
     assert manager.search_footprints("*PinHeader_1x04_P2.54mm_Vertical*", limit=5) == [
         {
             "library": "Connector_PinHeader_2.54mm",

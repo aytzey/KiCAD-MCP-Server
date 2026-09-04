@@ -18,9 +18,31 @@ import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from utils.sexpr_format import escape_sexpr_string
+
 logger = logging.getLogger("kicad_interface")
 
 KICAD9_SYMBOL_LIB_VERSION = "20241209"
+
+
+def _invalidate_symbol_caches() -> None:
+    """Drop the module-level symbol resolution/extraction caches.
+
+    create_symbol / delete_symbol rewrite .kicad_sym files and
+    register_symbol_library rewrites the sym-lib-table; the caches in
+    dynamic_symbol_loader must not outlive those edits. The mtime guards over
+    there cover direct file edits already — this explicit clear additionally
+    covers re-pointing an existing library name at a different path, which a
+    per-file stat cannot see. Lazy import to avoid any import-order coupling;
+    a failed clear must never break the write that just succeeded.
+    """
+    try:
+        from commands.dynamic_symbol_loader import DynamicSymbolLoader
+
+        DynamicSymbolLoader.clear_library_caches()
+    except Exception:  # pragma: no cover - defensive
+        logger.warning("Could not clear symbol library caches", exc_info=True)
+
 
 # Pin electrical types
 PIN_TYPES = {
@@ -57,7 +79,8 @@ def _fmt(v: float) -> str:
 
 
 def _esc(s: str) -> str:
-    return s.replace('"', '\\"')
+    """Escape a value for an S-expression double-quoted token (#336)."""
+    return escape_sexpr_string(s)
 
 
 class SymbolCreator:
@@ -185,6 +208,7 @@ class SymbolCreator:
 
         lib_path.write_text(lib_content, encoding="utf-8")
         logger.info(f"Created symbol '{name}' in {lib_path} ({len(pins)} pins)")
+        _invalidate_symbol_caches()
 
         return {
             "success": True,
@@ -209,6 +233,7 @@ class SymbolCreator:
 
         new_content = self._remove_symbol(content, name)
         lib_path.write_text(new_content, encoding="utf-8")
+        _invalidate_symbol_caches()
         return {"success": True, "library_path": str(lib_path), "deleted": name}
 
     # ------------------------------------------------------------------ #
@@ -316,6 +341,7 @@ class SymbolCreator:
 
         table_path.write_text(content, encoding="utf-8")
         logger.info(f"Registered symbol library '{name}' in {table_path}")
+        _invalidate_symbol_caches()
 
         return {
             "success": True,

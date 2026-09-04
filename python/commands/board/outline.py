@@ -7,6 +7,7 @@ import math
 from typing import Any, Dict, Optional
 
 import pcbnew
+from utils.board_items import delete_board_item
 
 logger = logging.getLogger("kicad_interface")
 
@@ -38,7 +39,7 @@ class BoardOutlineCommands:
             height = inner.get("height")
             radius = inner.get("radius")
             # Accept both "cornerRadius" and "radius" regardless of shape name.
-            # The AI often sends shape="rectangle" with radius=2.5 — we treat that as rounded_rectangle.
+            # The AI often sends shape=”rectangle” with radius=2.5 — we treat that as rounded_rectangle.
             corner_radius = inner.get("cornerRadius", inner.get("radius", 0))
             if shape == "rectangle" and corner_radius > 0:
                 shape = "rounded_rectangle"
@@ -74,7 +75,9 @@ class BoardOutlineCommands:
                 }
 
             # Convert to internal units (nanometers)
-            scale = 1000000 if unit == "mm" else 25400000  # mm or inch to nm
+            scale = (
+                1000000 if unit == "mm" else (25400 if unit == "mil" else 25400000)
+            )  # mm, mil, or inch to nm
 
             # Create drawing for edge cuts
             edge_layer = self.board.GetLayerID("Edge.Cuts")
@@ -202,6 +205,211 @@ class BoardOutlineCommands:
                 "errorDetails": str(e),
             }
 
+    def clear_board_outline(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Delete all Edge.Cuts drawing items from the board."""
+        try:
+            if not self.board:
+                return {
+                    "success": False,
+                    "message": "No board is loaded",
+                    "errorDetails": "Load or create a board first",
+                }
+            edge_layer = self.board.GetLayerID("Edge.Cuts")
+            removed = 0
+            for item in list(self.board.GetDrawings()):
+                try:
+                    if item.GetLayer() == edge_layer:
+                        delete_board_item(self.board, item)
+                        removed += 1
+                except Exception:
+                    continue
+            return {
+                "success": True,
+                "message": f"Removed {removed} Edge.Cuts item(s)",
+                "removed": removed,
+            }
+        except Exception as e:
+            logger.error(f"Error clearing board outline: {str(e)}")
+            return {
+                "success": False,
+                "message": "Failed to clear board outline",
+                "errorDetails": str(e),
+            }
+
+    def replace_board_outline(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Replace the current Edge.Cuts outline with a new shape."""
+        cleared = self.clear_board_outline({})
+        if not cleared.get("success"):
+            return cleared
+        added = self.add_board_outline(params)
+        if added.get("success"):
+            added["cleared"] = cleared.get("removed", 0)
+            added["message"] = (
+                f"Replaced board outline; removed {cleared.get('removed', 0)} old item(s)"
+            )
+        return added
+
+    def list_graphics(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """List board drawing items, optionally filtered by layer."""
+        try:
+            if not self.board:
+                return {
+                    "success": False,
+                    "message": "No board is loaded",
+                    "errorDetails": "Load or create a board first",
+                }
+            layer = params.get("layer")
+            graphics = []
+            for item in self.board.GetDrawings():
+                payload = self._graphic_payload(item)
+                if layer and payload.get("layer") != layer:
+                    continue
+                graphics.append(payload)
+            return {"success": True, "count": len(graphics), "graphics": graphics}
+        except Exception as e:
+            logger.error(f"Error listing graphics: {str(e)}")
+            return {"success": False, "message": "Failed to list graphics", "errorDetails": str(e)}
+
+    def delete_graphic(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Delete a board drawing item by UUID."""
+        try:
+            if not self.board:
+                return {
+                    "success": False,
+                    "message": "No board is loaded",
+                    "errorDetails": "Load or create a board first",
+                }
+            uuid = params.get("uuid")
+            if not uuid:
+                return {"success": False, "message": "uuid is required"}
+            for item in list(self.board.GetDrawings()):
+                if self._item_uuid(item) == uuid:
+                    delete_board_item(self.board, item)
+                    return {"success": True, "message": f"Deleted graphic {uuid}", "uuid": uuid}
+            return {
+                "success": False,
+                "message": "Graphic not found",
+                "errorDetails": f"No board graphic has uuid {uuid}",
+            }
+        except Exception as e:
+            logger.error(f"Error deleting graphic: {str(e)}")
+            return {"success": False, "message": "Failed to delete graphic", "errorDetails": str(e)}
+
+    def update_graphic(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Update a board drawing item by UUID."""
+        try:
+            if not self.board:
+                return {
+                    "success": False,
+                    "message": "No board is loaded",
+                    "errorDetails": "Load or create a board first",
+                }
+            uuid = params.get("uuid")
+            if not uuid:
+                return {"success": False, "message": "uuid is required"}
+            item = None
+            for candidate in self.board.GetDrawings():
+                if self._item_uuid(candidate) == uuid:
+                    item = candidate
+                    break
+            if item is None:
+                return {
+                    "success": False,
+                    "message": "Graphic not found",
+                    "errorDetails": f"No board graphic has uuid {uuid}",
+                }
+
+            unit = params.get("unit", "mm")
+            scale = 1_000_000 if unit == "mm" else (25_400 if unit == "mil" else 25_400_000)
+            if params.get("layer") is not None:
+                item.SetLayer(self.board.GetLayerID(params["layer"]))
+            if params.get("width") is not None and hasattr(item, "SetWidth"):
+                item.SetWidth(int(float(params["width"]) * scale))
+            if params.get("start") and hasattr(item, "SetStart"):
+                item.SetStart(self._vec_from_xy(params["start"], scale))
+            if params.get("end") and hasattr(item, "SetEnd"):
+                item.SetEnd(self._vec_from_xy(params["end"], scale))
+            if params.get("center") and hasattr(item, "SetCenter"):
+                item.SetCenter(self._vec_from_xy(params["center"], scale))
+            if params.get("position") and hasattr(item, "SetPosition"):
+                item.SetPosition(self._vec_from_xy(params["position"], scale))
+            if params.get("text") is not None and hasattr(item, "SetText"):
+                item.SetText(str(params["text"]))
+            return {
+                "success": True,
+                "message": f"Updated graphic {uuid}",
+                "graphic": self._graphic_payload(item),
+            }
+        except Exception as e:
+            logger.error(f"Error updating graphic: {str(e)}")
+            return {"success": False, "message": "Failed to update graphic", "errorDetails": str(e)}
+
+    @staticmethod
+    def _vec_from_xy(data: Dict[str, Any], scale: float):
+        return pcbnew.VECTOR2I(int(float(data["x"]) * scale), int(float(data["y"]) * scale))
+
+    def _item_uuid(self, item) -> str:
+        for attr in ("m_Uuid", "GetUuid"):
+            try:
+                value = getattr(item, attr)
+                uuid_obj = value() if attr == "GetUuid" and callable(value) else value
+                if hasattr(uuid_obj, "AsString"):
+                    return uuid_obj.AsString()
+                return str(uuid_obj)
+            except Exception:
+                continue
+        return ""
+
+    def _graphic_payload(self, item) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {
+            "uuid": self._item_uuid(item),
+            "type": type(item).__name__,
+        }
+        try:
+            payload["layer"] = self.board.GetLayerName(item.GetLayer())
+        except Exception:
+            payload["layer"] = None
+        if hasattr(item, "GetShape"):
+            try:
+                payload["shape"] = str(item.GetShape())
+            except Exception:
+                pass
+        for key, getter in (
+            ("start", "GetStart"),
+            ("end", "GetEnd"),
+            ("center", "GetCenter"),
+            ("position", "GetPosition"),
+        ):
+            if hasattr(item, getter):
+                try:
+                    p = getattr(item, getter)()
+                    payload[key] = {"x": p.x / 1_000_000, "y": p.y / 1_000_000, "unit": "mm"}
+                except Exception:
+                    pass
+        if hasattr(item, "GetText"):
+            try:
+                payload["text"] = item.GetText()
+            except Exception:
+                pass
+        if hasattr(item, "GetWidth"):
+            try:
+                payload["width"] = item.GetWidth() / 1_000_000
+            except Exception:
+                pass
+        if hasattr(item, "GetBoundingBox"):
+            try:
+                bb = item.GetBoundingBox()
+                payload["boundingBox"] = {
+                    "min_x": bb.GetLeft() / 1_000_000,
+                    "min_y": bb.GetTop() / 1_000_000,
+                    "max_x": bb.GetRight() / 1_000_000,
+                    "max_y": bb.GetBottom() / 1_000_000,
+                    "unit": "mm",
+                }
+            except Exception:
+                pass
+        return payload
+
     def add_mounting_hole(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Add a mounting hole to the PCB"""
         try:
@@ -216,6 +424,7 @@ class BoardOutlineCommands:
             diameter = params.get("diameter")
             pad_diameter = params.get("padDiameter")
             plated = params.get("plated", False)
+            footprint_lib_id = params.get("footprintLibId")
 
             if not position or not diameter:
                 return {
@@ -225,7 +434,11 @@ class BoardOutlineCommands:
                 }
 
             # Convert to internal units (nanometers)
-            scale = 1000000 if position.get("unit", "mm") == "mm" else 25400000  # mm or inch to nm
+            scale = (
+                1000000
+                if position.get("unit", "mm") == "mm"
+                else (25400 if position.get("unit", "mm") == "mil" else 25400000)
+            )  # mm, mil, or inch to nm
             x_nm = int(position["x"] * scale)
             y_nm = int(position["y"] * scale)
             diameter_nm = int(diameter * scale)
@@ -247,6 +460,19 @@ class BoardOutlineCommands:
             module.SetReference(f"MH{next_num}")
             module.SetValue(f"MountingHole_{diameter}mm")
 
+            # Set a real library:name FPID. Without this, the footprint is
+            # written as `(footprint "" ...)` and KiCad's GUI Move tool refuses
+            # to select it (no library link → not draggable in the editor).
+            if not footprint_lib_id:
+                # Strip trailing zeros so 3.2 → "3.2" not "3.20"
+                footprint_lib_id = f"MountingHole:MountingHole_{diameter:g}mm"
+            if ":" in footprint_lib_id:
+                lib_name, fp_name = footprint_lib_id.split(":", 1)
+            else:
+                lib_name = "MountingHole"
+                fp_name = footprint_lib_id
+            module.SetFPID(pcbnew.LIB_ID(lib_name, fp_name))
+
             # Create the pad for the hole
             pad = pcbnew.PAD(module)
             pad.SetNumber(1)
@@ -255,6 +481,18 @@ class BoardOutlineCommands:
             pad.SetSize(pcbnew.VECTOR2I(pad_diameter_nm, pad_diameter_nm))
             pad.SetDrillSize(pcbnew.VECTOR2I(diameter_nm, diameter_nm))
             pad.SetPosition(pcbnew.VECTOR2I(0, 0))  # Position relative to module
+
+            if not plated:
+                # NPTH must not include *.Cu in pad layers. The default LSET
+                # for a circular pad is *.Cu + *.Mask; on a NPTH with
+                # padDiameter > diameter that produces phantom copper annular
+                # rings on every Cu layer, which trip clearance DRC against
+                # neighbouring nets.
+                mask_only = pcbnew.LSET()
+                mask_only.AddLayer(pcbnew.F_Mask)
+                mask_only.AddLayer(pcbnew.B_Mask)
+                pad.SetLayerSet(mask_only)
+
             module.Add(pad)
 
             # Position the mounting hole
@@ -271,6 +509,7 @@ class BoardOutlineCommands:
                     "diameter": diameter,
                     "padDiameter": pad_diameter or diameter + 1,
                     "plated": plated,
+                    "footprintLibId": f"{lib_name}:{fp_name}",
                 },
             }
 
@@ -308,7 +547,11 @@ class BoardOutlineCommands:
                 }
 
             # Convert to internal units (nanometers)
-            scale = 1000000 if position.get("unit", "mm") == "mm" else 25400000  # mm or inch to nm
+            scale = (
+                1000000
+                if position.get("unit", "mm") == "mm"
+                else (25400 if position.get("unit", "mm") == "mil" else 25400000)
+            )  # mm, mil, or inch to nm
             x_nm = int(position["x"] * scale)
             y_nm = int(position["y"] * scale)
             size_nm = int(size * scale)

@@ -12,7 +12,9 @@ No API key required.
 import logging
 import re
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
+
+from utils.sexpr_format import QUOTED_VALUE, unescape_sexpr_string
 
 logger = logging.getLogger("kicad_interface")
 
@@ -49,7 +51,7 @@ class DatasheetManager:
         return None
 
     @staticmethod
-    def _find_lib_symbols_range(lines: List[str]):
+    def _find_lib_symbols_range(lines: List[str]) -> Tuple[Optional[int], Optional[int]]:
         """
         Find the line range of the (lib_symbols ...) section.
         Returns (start, end) line indices or (None, None) if not found.
@@ -97,14 +99,14 @@ class DatasheetManager:
         for k in range(block_start, block_end + 1):
             line = lines[k]
 
-            lcsc_match = re.search(r'\(property\s+"LCSC"\s+"([^"]*)"', line)
+            lcsc_match = re.search(r'\(property\s+"LCSC"\s+' + QUOTED_VALUE, line)
             if lcsc_match:
-                lcsc_value = lcsc_match.group(1)
+                lcsc_value = unescape_sexpr_string(lcsc_match.group(1))
 
-            ds_match = re.search(r'\(property\s+"Datasheet"\s+"([^"]*)"', line)
+            ds_match = re.search(r'\(property\s+"Datasheet"\s+' + QUOTED_VALUE, line)
             if ds_match:
                 datasheet_line_idx = k
-                datasheet_current = ds_match.group(1)
+                datasheet_current = unescape_sexpr_string(ds_match.group(1))
 
         return {
             "lcsc": lcsc_value,
